@@ -1,0 +1,13 @@
+## Interface: 120100
+## Title: WowCraft Export
+## Notes: Exports the open profession's recipe schematics to SavedVariables, for the wowcraft margin scanner. Collection only - reads C_TradeSkillUI, touches nothing protected.
+## Author: Zethrel - Argent Dawn EU
+## Version: 0.1
+## SavedVariables: WowCraftExportDB
+## IconTexture: Interface\Icons\Trade_BlackSmithing
+
+# Written by `wowcraft.py scan`. Absent until the first scan with addon_path
+# set, which the client tolerates - prices.lua guards for it either way.
+PriceData.lua
+main.lua
+prices.lua

@@ -1,0 +1,15 @@
+{
+  "_comment": "Copy to config.json and fill in client_id / client_secret from https://develop.battle.net/access/clients . Keys starting with _ are documentation and are ignored. Secrets can instead go in the BNET_CLIENT_ID / BNET_CLIENT_SECRET environment variables, which override this file. config.json itself is gitignored - do not commit it.",
+  "client_id": "",
+  "client_secret": "",
+  "_preset": "Already set for Argent Dawn (EU).",
+  "region": "eu",
+  "locale": "en_GB",
+  "realm_slug": "argent-dawn",
+  "_professions": "Empty list = all of them. Narrowing this is the single biggest speed-up for `init`.",
+  "professions": [],
+  "_skill_tiers": "Substring match on the skill tier name; empty list = every expansion back to Classic. Left empty deliberately: `init` caches the lot once (~15 min) and `scan` is then free to score any slice of it, so narrow a single run with --tier instead of narrowing the cache. Old tiers are also the trustworthy ones - they still publish crafted_item and rarely use reagent slots, unlike Midnight. Verified 2026-08-13 (patch 12.1.0): current tiers are all named 'Midnight <Profession>', so --tier Midnight matches them all.",
+  "skill_tiers": [],
+  "_addon_path": "Where the WowCraftExport addon lives. `scan` writes PriceData.lua here so reagent tooltips and the crafting window show prices in game. /reload to pick up a new one.",
+  "addon_path": ""
+}

@@ -1,0 +1,25 @@
+# Credentials. config.json holds your Battle.net client_id and client_secret;
+# committing it once puts them in history for good. config.example.json is the
+# tracked template - copy it to config.json and fill it in.
+config.json
+
+# The price history database. Deliberately untracked: it is 23 MB and rewrites
+# itself every scan, so committing it would add that much to the repo every
+# hour. It is also the one thing here that cannot be regenerated - past auction
+# snapshots are gone once Blizzard moves on - so back it up separately if the
+# history matters to you.
+wowcraft.sqlite3
+*.sqlite3-journal
+*.sqlite3-wal
+
+# Generated every scan.
+dashboard.html
+scan.log
+scan.log.tmp
+doctor-report.txt
+
+# Written into the addon folder by scan, never edited by hand.
+addon/WowCraftExport/PriceData.lua
+
+__pycache__/
+*.pyc
