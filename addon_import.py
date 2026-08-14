@@ -127,6 +127,50 @@ def merge_exports(paths: list) -> list:
                            .get("professionName", "")))]
 
 
+def load_inventory(paths: list) -> dict:
+    """{character: {item_id: count}} from every SavedVariables file found.
+
+    The addon writes one JSON blob per container group per character. Groups
+    are merged per character, and characters are kept separate so the report
+    can say who is holding what."""
+    out: dict = {}
+    # Each group blob is preceded, somewhere above it, by the character whose
+    # table it sits in. Rather than parse the Lua nesting, walk the file in
+    # order and remember the most recent "Name-Realm" key seen: the blobs that
+    # follow belong to it. Robust to however the client chooses to indent.
+    token = re.compile(
+        r'\["(?P<who>[^"\\]+-[^"\\]+)"\]\s*=\s*\{'
+        r'|\["(?P<group>bags|bank|warband)"\]\s*=\s*"(?P<blob>(?:[^"\\]|\\.)*)"')
+    for path in paths:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        start = text.find('["inventory"]')
+        if start < 0:
+            continue
+        who = None
+        for match in token.finditer(text, start):
+            if match.group("who"):
+                who = match.group("who")
+                out.setdefault(who, {})
+                continue
+            if not who:
+                continue
+            raw = re.sub(r"\\(.)",
+                         lambda m: LUA_UNESCAPE.get(m.group(1), m.group(1)),
+                         match.group("blob"))
+            try:
+                held = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            counts = out[who]
+            for item_id, count in held.items():
+                try:
+                    counts[int(item_id)] = counts.get(int(item_id), 0) + int(count)
+                except (TypeError, ValueError):
+                    continue
+    return out
+
+
 def report_export(data: dict) -> None:
     prof = data.get("profession") or {}
     print(f"  build        : {data.get('build')}  locale {data.get('locale')}")
@@ -619,10 +663,25 @@ def main(argv=None) -> int:
         print("=" * 68)
         summarise_slots(everything)
 
+    held = load_inventory(paths)
+    if held:
+        print()
+        print("your materials:")
+        for who in sorted(held):
+            print(f"  {who:28s} {len(held[who]):5d} distinct items, "
+                  f"{sum(held[who].values()):,} total")
+
     if args.apply:
         print()
         print("applying to the cache:")
         apply_to_cache(exports, args.db)
+        if held:
+            import wowcraft as W
+            store = W.Store(args.db)
+            rows = store.save_inventory(held)
+            print(f"  stored {rows} inventory rows across {len(held)} "
+                  "character(s)")
+            store.close()
 
     if args.names and not args.apply:
         print()

@@ -10,4 +10,5 @@
 # set, which the client tolerates - prices.lua guards for it either way.
 PriceData.lua
 main.lua
+inventory.lua
 prices.lua

@@ -188,6 +188,19 @@ thrashing before you commit to buying it. The in-game tooltip shows the same
 line, and only when the price actually moved — its absence means steady, not
 unknown.
 
+**Cost assumes you buy everything; "buy" is what is left after your own
+materials.** Those are different questions and the tool answers both. The
+headline cost is what the craft is worth doing at, computed as if you owned
+nothing — that is the number that tells you whether the recipe is any good.
+Underneath it, where you already hold some of the reagents, is what finishing
+it would actually cost you today, charged pro rata for a partial stack.
+
+Materials come from the addon: bags, bank, reagent bank and warband bank, per
+character, pooled across every character you have exported. Bank contents are
+only readable while a bank is open, so the addon merges rather than replaces —
+closing the bank does not erase what it just saw. `/wcinv` reports what has
+been recorded, then `addon_import.py --apply` loads it.
+
 **Revenue subtracts the 5% auction house cut.**
 
 **Bid-only auctions are ignored** — you cannot reliably buy them, so letting them
@@ -342,13 +355,14 @@ python3 test_doctor.py      # doctor against a fake API
 python3 test_pipeline.py    # init + scan end-to-end against a fake API
 python3 test_addon.py       # the addon's Lua, against a stubbed client
 python3 test_prices.py      # the in-game price display, against real generated data
+python3 test_inventory.py   # the inventory collector, addon Lua through to owned totals
 ```
 
 `test_addon.py` needs `lupa` (`pip install lupa`) to run the addon's Lua for
 real; without it the file skips rather than failing, so the scanner itself
 still has no third-party dependencies.
 
-267 assertions in total: the supply ladder, percentile pricing,
+285 assertions in total: the supply ladder, percentile pricing,
 troll-listing resistance, stack-price normalisation, the AH cut, every skip
 condition, crafting-rank collapsing, hourly snapshot de-duplication, init
 idempotency, and that the dashboard is genuinely self-contained — plus, for the
@@ -392,6 +406,7 @@ addon only supplies the *crafting model*:
 - reagent slot quantities and the items that legally fill each slot — the fix
   for "cost is a floor"
 - what the recipe actually crafts, so name matching stops being a guess
+- what you already own, so margins can also say what is left to buy
 
 Measured across ten exported professions (5,721 recipes, patch 12.1.0):
 

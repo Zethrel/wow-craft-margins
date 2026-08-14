@@ -382,6 +382,13 @@ CREATE TABLE IF NOT EXISTS recipe (
     slots_json TEXT
 );
 
+CREATE TABLE IF NOT EXISTS inventory (
+    character TEXT NOT NULL,
+    item_id   INTEGER NOT NULL,
+    quantity  INTEGER NOT NULL,
+    PRIMARY KEY (character, item_id)
+);
+
 CREATE TABLE IF NOT EXISTS price_snapshot (
     taken_at INTEGER NOT NULL,
     item_id  INTEGER NOT NULL,
@@ -638,6 +645,26 @@ class Store:
             "INSERT OR REPLACE INTO margin_snapshot VALUES(?,?,?,?,?,?,?)", rows)
         self.db.commit()
 
+    def save_inventory(self, held: dict) -> int:
+        """Replace what each listed character holds. Characters absent from
+        `held` are left alone - an export from one alt must not wipe another."""
+        total = 0
+        for character, counts in held.items():
+            self.db.execute("DELETE FROM inventory WHERE character=?",
+                            (character,))
+            self.db.executemany(
+                "INSERT OR REPLACE INTO inventory(character,item_id,quantity) "
+                "VALUES(?,?,?)",
+                [(character, int(i), int(q)) for i, q in counts.items() if q > 0])
+            total += len(counts)
+        self.db.commit()
+        return total
+
+    def owned(self) -> dict:
+        """{item_id: quantity} pooled across every character we know about."""
+        return {r["item_id"]: r["n"] for r in self.db.execute(
+            "SELECT item_id, SUM(quantity) AS n FROM inventory GROUP BY item_id")}
+
     def price_ranges(self, taken_at: int) -> dict:
         """{item_id: (buy_low, buy_high, sell_low, sell_high)} for one day."""
         return {r["item_id"]: (r["buy_low"], r["buy_high"],
@@ -790,6 +817,10 @@ class MarginResult:
     # item to reach that cost. Nonzero means part of the bill is our assumption
     # about how you would craft it, not something the recipe demands.
     optionals_filled: int = 0
+    # What the reagents you do NOT already own would cost. Equal to `cost`
+    # when you hold nothing, which is also the default when no inventory has
+    # been imported - so the headline never quietly improves on its own.
+    cost_to_finish: float = 0.0
 
 
 def _col(row: Any, key: str, default: Any = None) -> Any:
@@ -802,7 +833,7 @@ def _col(row: Any, key: str, default: Any = None) -> Any:
 
 
 def cost_from_slots(slots: list, prices: dict, item_names: dict,
-                    batch: int) -> tuple:
+                    batch: int, owned: Optional[dict] = None) -> tuple:
     """Cost a craft from the client's reagent slots. -> (cost, bill, fills, missing)
 
     Every slot is filled with the cheapest item that legally goes in it, which
@@ -819,6 +850,7 @@ def cost_from_slots(slots: list, prices: dict, item_names: dict,
     cost = 0.0
     bill = []
     fills = 0
+    to_buy = 0.0
     for slot in slots:
         needed = int(slot.get("quantity") or 0) * batch
         if needed <= 0:
@@ -833,9 +865,16 @@ def cost_from_slots(slots: list, prices: dict, item_names: dict,
                 best_id, best_cost = item_id, option
         if best_cost is None:
             if slot.get("required"):
-                return 0.0, [], 0, True
+                return 0.0, [], 0, True, 0.0
             continue
         cost += best_cost
+        # What you would still have to buy, given what is already in your bags
+        # and bank. The full cost stays the headline - it is the honest answer
+        # to "is this craft worth doing" - but the shortfall answers the
+        # different question of "what does finishing it cost me today".
+        have = (owned or {}).get(best_id, 0)
+        short = max(0, needed - have)
+        to_buy += best_cost * (short / needed) if needed else 0.0
         if not slot.get("required"):
             fills += 1
         bill.append({
@@ -845,13 +884,16 @@ def cost_from_slots(slots: list, prices: dict, item_names: dict,
             "unit": best_cost / needed,
             "total": best_cost,
             "optional": not slot.get("required"),
+            "have": have,
+            "short": short,
         })
-    return cost, bill, fills, False
+    return cost, bill, fills, False, to_buy
 
 
 def compute_margins(recipes: list, prices: dict, item_names: dict,
                     batch: int = 1, min_supply: int = 1,
-                    min_listings: int = 1) -> tuple:
+                    min_listings: int = 1,
+                    owned: Optional[dict] = None) -> tuple:
     """Return (results, skipped) for every recipe we can fully price.
 
     `batch` = how many crafts you would do, which matters because buying 200
@@ -889,8 +931,8 @@ def compute_margins(recipes: list, prices: dict, item_names: dict,
 
         slots = json.loads(_col(r, "slots_json", "") or "null")
         if slots:
-            cost, breakdown, optionals, missing = cost_from_slots(
-                slots, prices, item_names, batch)
+            cost, breakdown, optionals, missing, to_buy = cost_from_slots(
+                slots, prices, item_names, batch, owned)
             if missing:
                 skipped["no_reagent_price"] += 1
                 continue
@@ -916,6 +958,7 @@ def compute_margins(recipes: list, prices: dict, item_names: dict,
                 crafted_source=_col(r, "crafted_source", CRAFTED_API),
                 cost_complete=True,
                 optionals_filled=optionals,
+                cost_to_finish=to_buy,
             ))
             continue
 
@@ -923,6 +966,7 @@ def compute_margins(recipes: list, prices: dict, item_names: dict,
         cost = 0.0
         breakdown = []
         missing = False
+        to_buy = 0.0
         for reg in reagents:
             rid, rqty = reg["id"], reg["quantity"]
             if rqty <= 0:
@@ -940,12 +984,17 @@ def compute_margins(recipes: list, prices: dict, item_names: dict,
                 missing = True
                 break
             cost += c
+            have = (owned or {}).get(rid, 0)
+            short = max(0, needed - have)
+            to_buy += c * (short / needed) if needed else 0.0
             breakdown.append({
                 "id": rid,
                 "name": item_names.get(rid, f"item {rid}"),
                 "qty": needed,
                 "unit": c / needed,
                 "total": c,
+                "have": have,
+                "short": short,
             })
         if missing:
             skipped["no_reagent_price"] += 1
@@ -975,6 +1024,7 @@ def compute_margins(recipes: list, prices: dict, item_names: dict,
             output_listings=out_price.listing_count,
             crafted_source=_col(r, "crafted_source", CRAFTED_API),
             cost_complete=not _col(r, "uses_slots", 0),
+            cost_to_finish=to_buy,
         ))
 
     # Several recipes can share one crafted_item id - Blizzard's recipe
@@ -1327,8 +1377,12 @@ def cmd_scan(client: BlizzardClient, store: Store, cfg: dict, out_path: str,
             f"({time.strftime('%Y-%m-%d', time.localtime(taken_at))}) rather "
             "than adding a new one -- history is one row per day.")
     names = store.item_names()
+    owned = store.owned()
+    if owned:
+        log(f"{len(owned):,} distinct items in your bags and banks -- margins "
+            "also show what is left to buy")
     results, skipped = compute_margins(recipes, prices, names, batch=batch,
-                                       min_listings=min_listings)
+                                       min_listings=min_listings, owned=owned)
 
     collapsed = store.collapse_to_days()
     if collapsed:
@@ -1908,6 +1962,8 @@ def render_dashboard(results: list, cfg: dict, taken_at: int, skipped: dict,
         reagent_bill = "".join(
             f'<span>{esc(b["name"])} &times;{b["qty"]} '
             f'<em>{copper_to_gold_str(b["total"])}</em>'
+            + (f' <span class="meta">have {b["have"]}, buy {b["short"]}</span>'
+               if b.get("have") else '')
             + (' <span class="meta">(optional)</span>' if b.get("optional") else '')
             + '</span>'
             for b in r.reagent_breakdown) or "<span>no reagents listed</span>"

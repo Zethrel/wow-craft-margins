@@ -133,7 +133,7 @@ slots = [
     {"type": 1, "required": True, "quantity": 2, "items": [12, 11]},
     {"type": 2, "required": False, "quantity": 1, "items": [13]},
 ]
-cost, bill, fills, missing = cost_from_slots(slots, sp, {}, batch=1)
+cost, bill, fills, missing, to_buy = cost_from_slots(slots, sp, {}, batch=1)
 check("slots price without error", missing, False)
 # cheapest legal fill for the required slot is 2x1000, not 2x9000
 check("required slot takes the cheapest legal item", cost, 2000.0 + 2000.0)
@@ -143,17 +143,17 @@ check("optional marked in the bill", bill[1]["optional"], True)
 check("required not marked optional", bill[0]["optional"], False)
 
 # Batch scales every slot.
-cost10, _b, _f, _m = cost_from_slots(slots, sp, {}, batch=10)
+cost10, _b, _f, _m, _t = cost_from_slots(slots, sp, {}, batch=10)
 check("slot cost scales with batch", cost10, 20000.0 + 20000.0)
 
 # An unpriceable REQUIRED slot kills the recipe; an unpriceable optional does
 # not, it is simply left out of the bill.
 dead_req = [{"type": 1, "required": True, "quantity": 1, "items": [999]}]
-_c, _b, _f, miss = cost_from_slots(dead_req, sp, {}, batch=1)
+_c, _b, _f, miss, _t = cost_from_slots(dead_req, sp, {}, batch=1)
 check("unpriceable required slot skips the recipe", miss, True)
 dead_opt = [{"type": 1, "required": True, "quantity": 1, "items": [11]},
             {"type": 2, "required": False, "quantity": 1, "items": [999]}]
-c2, b2, f2, miss2 = cost_from_slots(dead_opt, sp, {}, batch=1)
+c2, b2, f2, miss2, _t2 = cost_from_slots(dead_opt, sp, {}, batch=1)
 check("unpriceable optional slot is skipped, not fatal", miss2, False)
 check("unpriceable optional adds nothing", c2, 1000.0)
 check("unpriceable optional is not counted as filled", f2, 0)
@@ -175,6 +175,22 @@ check("slotted recipe priced", len(res_s), 1)
 check("cost came from the slots, not the API reagents", res_s[0].cost, 4000.0)
 check("slotted recipe counts as fully costed", res_s[0].cost_complete, True)
 check("optional fills reported on the result", res_s[0].optionals_filled, 1)
+
+# Owning the reagents does not change the craft's cost, it changes what is
+# left to buy - two different questions, both worth answering.
+own_none = cost_from_slots(slots, sp, {}, batch=1)
+must_eq = lambda a, b: a == b
+check("with nothing owned, buying costs the full amount",
+      own_none[4], own_none[0])
+own_some = cost_from_slots(slots, sp, {}, batch=1, owned={11: 2})
+check("owning a required reagent lowers what is left to buy",
+      own_some[4], 2000.0)
+check("owning it does not change the craft's cost", own_some[0], own_none[0])
+own_all = cost_from_slots(slots, sp, {}, batch=1, owned={11: 99, 13: 99})
+check("owning everything leaves nothing to buy", own_all[4], 0.0)
+own_part = cost_from_slots(slots, sp, {}, batch=10, owned={11: 10})
+# needs 20 of item 11; half owned, so half its cost remains
+check("a partial stack is charged pro rata", round(own_part[4]), 30000)
 
 # ---- 7. CLI scope helpers --------------------------------------------
 from wowcraft import _split_list, expansion_of
