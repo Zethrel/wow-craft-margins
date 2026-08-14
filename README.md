@@ -170,6 +170,15 @@ that expansion use it, so staples come first rather than whatever is dearest,
 with supply, listing count and a price sparkline. Required reagents only:
 optional slots are a choice, not a shopping list.
 
+**History is one row per item per day, kept for a week.** Scanning hourly does
+not give you a hundred and sixty-eight points; it gives you seven, each refined
+through the day. A scan in the morning and another in the evening of the 20th
+both write the 20th's entry — the later one simply carries the newer values.
+The day boundary is local midnight, so "the 20th" means the 20th where you are.
+`history_days` in `config.json` sets the window (0 keeps everything, and grows
+the database indefinitely). Days that fall outside it are pruned on each scan
+and the file is vacuumed, so it does not creep upward.
+
 **Revenue subtracts the 5% auction house cut.**
 
 **Bid-only auctions are ignored** — you cannot reliably buy them, so letting them
@@ -330,7 +339,7 @@ python3 test_prices.py      # the in-game price display, against real generated 
 real; without it the file skips rather than failing, so the scanner itself
 still has no third-party dependencies.
 
-236 assertions in total: the supply ladder, percentile pricing,
+254 assertions in total: the supply ladder, percentile pricing,
 troll-listing resistance, stack-price normalisation, the AH cut, every skip
 condition, crafting-rank collapsing, hourly snapshot de-duplication, init
 idempotency, and that the dashboard is genuinely self-contained — plus, for the

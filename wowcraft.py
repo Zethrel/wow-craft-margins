@@ -102,6 +102,21 @@ def copper_to_gold_str(copper: float) -> str:
     return f"{sign}{g:.2f}"
 
 
+def day_bucket(ts: int) -> int:
+    """Local midnight of the day `ts` falls in.
+
+    History is kept one row per item per day. Several scans on the same day
+    update that day's row rather than adding points, so a week of hourly
+    scanning is seven readings, not a hundred and sixty-eight.
+
+    Local rather than UTC on purpose: "the 20th" should mean the 20th where
+    you are, so an evening scan does not land on the next day's row.
+    """
+    lt = time.localtime(ts)
+    return int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday,
+                            0, 0, 0, 0, 0, -1)))
+
+
 def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
 
@@ -467,6 +482,64 @@ class Store:
     def item_names(self) -> dict:
         return {r["id"]: r["name"]
                 for r in self.db.execute("SELECT id,name FROM item")}
+
+    def prune_history(self, days: int) -> int:
+        """Drop snapshots older than `days` days. Returns days removed.
+
+        History is one row per item per day, so a week is seven points - enough
+        to see a trend, small enough that the database does not grow without
+        anyone noticing. Zero or less keeps everything."""
+        if days <= 0:
+            return 0
+        cutoff = day_bucket(int(time.time())) - (days - 1) * 86400
+        before = self.snapshot_count()
+        self.db.execute("DELETE FROM price_snapshot WHERE taken_at < ?", (cutoff,))
+        self.db.execute("DELETE FROM margin_snapshot WHERE taken_at < ?", (cutoff,))
+        self.db.commit()
+        removed = before - self.snapshot_count()
+        if removed:
+            # SQLite keeps deleted pages for reuse, so the file never shrinks
+            # on its own. Only worth doing when something actually went.
+            self.db.execute("VACUUM")
+        return removed
+
+    def collapse_to_days(self) -> int:
+        """One-off: fold pre-existing hourly snapshots into daily ones.
+
+        Databases written before history went daily hold several rows per item
+        per day. Left alone they would sit alongside the new daily rows as
+        extra points on every sparkline, so rebuild them keyed on the day,
+        keeping the latest reading of each."""
+        stamps = [r[0] for r in self.db.execute(
+            "SELECT DISTINCT taken_at FROM price_snapshot")]
+        if not stamps or all(s == day_bucket(s) for s in stamps):
+            return 0
+        # Rebuilt in Python rather than SQL so the day boundary is the same
+        # local midnight that day_bucket uses. Doing it with integer division
+        # in SQL would bucket on UTC and put an evening scan on the wrong day
+        # for anyone east of Greenwich.
+        for table, cols, keys in (
+                ("price_snapshot",
+                 "taken_at,item_id,source,sell_unit_price,min_unit_price,"
+                 "total_quantity,listing_count", (1, 2)),
+                ("margin_snapshot",
+                 "taken_at,recipe_id,cost,revenue,margin,margin_pct,"
+                 "craftable_units", (1,))):
+            latest: dict = {}
+            for row in self.db.execute(f"SELECT {cols} FROM {table}"):
+                bucket = day_bucket(row[0])
+                key = (bucket,) + tuple(row[i] for i in keys)
+                previous = latest.get(key)
+                if previous is None or row[0] >= previous[0]:
+                    latest[key] = row
+            rebuilt = [(day_bucket(r[0]),) + tuple(r[1:]) for r in latest.values()]
+            self.db.execute(f"DELETE FROM {table}")
+            placeholders = ",".join("?" * len(cols.split(",")))
+            self.db.executemany(
+                f"INSERT INTO {table}({cols}) VALUES({placeholders})", rebuilt)
+        self.db.commit()
+        self.db.execute("VACUUM")
+        return len(stamps)
 
     def save_prices(self, taken_at: int, prices: dict) -> None:
         rows = [(taken_at, iid, p.source, p.sell_unit_price, p.min_unit_price,
@@ -1167,19 +1240,38 @@ def cmd_scan(client: BlizzardClient, store: Store, cfg: dict, out_path: str,
     prices.update(build_price_index(commodity, "commodity"))
     log(f"priced {len(prices):,} distinct items")
 
-    # Prefer the server's own data timestamp so history points map 1:1 to
-    # real hourly refreshes rather than to how often we happened to run.
-    taken_at = data_time or int(time.time())
-    if store.has_snapshot(taken_at):
+    # Two different clocks here. Blizzard's Last-Modified says whether this is
+    # data we have already seen; the day bucket says where to store it. Keying
+    # storage on the day means repeated scans refine one row per day instead
+    # of stacking up points nobody asked for.
+    data_stamp = data_time or int(time.time())
+    taken_at = day_bucket(data_stamp)
+    if store.get_meta("last_data_time") == str(data_stamp):
         log("note: this is the same auction data as the last scan "
-            "(Blizzard refreshes hourly) -- the snapshot will be replaced, "
-            "not duplicated.")
+            "(Blizzard refreshes hourly) -- today's entry will be rewritten "
+            "with it, not duplicated.")
+    elif store.has_snapshot(taken_at):
+        log(f"note: updating today's entry "
+            f"({time.strftime('%Y-%m-%d', time.localtime(taken_at))}) rather "
+            "than adding a new one -- history is one row per day.")
     names = store.item_names()
     results, skipped = compute_margins(recipes, prices, names, batch=batch,
                                        min_listings=min_listings)
 
+    collapsed = store.collapse_to_days()
+    if collapsed:
+        log(f"note: folded {collapsed} older hourly snapshots into daily ones "
+            "-- history is now one row per day.")
+
+    store.set_meta("last_data_time", str(data_stamp))
     store.save_prices(taken_at, prices)
     store.save_margins(taken_at, results, considered=[r["id"] for r in recipes])
+
+    keep_days = int(cfg.get("history_days", 7) or 0)
+    dropped = store.prune_history(keep_days)
+    if dropped:
+        log(f"pruned {dropped} day(s) of history beyond the "
+            f"{keep_days}-day window")
 
     firm = [r for r in results if r.cost_complete]
     profitable = [r for r in firm if r.margin > 0]
@@ -2283,6 +2375,10 @@ DEFAULT_CONFIG = {
     # PriceData.lua there, putting prices and margins on your in-game
     # tooltips. Empty = do not write.
     "addon_path": "",
+    # Days of price history to keep. History is one row per item per day, so
+    # 7 means a week of daily readings. 0 keeps everything, which grows the
+    # database indefinitely.
+    "history_days": 7,
 }
 
 

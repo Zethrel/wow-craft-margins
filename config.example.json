@@ -11,5 +11,7 @@
   "_skill_tiers": "Substring match on the skill tier name; empty list = every expansion back to Classic. Left empty deliberately: `init` caches the lot once (~15 min) and `scan` is then free to score any slice of it, so narrow a single run with --tier instead of narrowing the cache. Old tiers are also the trustworthy ones - they still publish crafted_item and rarely use reagent slots, unlike Midnight. Verified 2026-08-13 (patch 12.1.0): current tiers are all named 'Midnight <Profession>', so --tier Midnight matches them all.",
   "skill_tiers": [],
   "_addon_path": "Where the WowCraftExport addon lives. `scan` writes PriceData.lua here so reagent tooltips and the crafting window show prices in game. /reload to pick up a new one.",
-  "addon_path": ""
+  "addon_path": "",
+  "_history_days": "Days of price history to keep. One row per item per day; several scans on the same day update that day's row. 0 keeps everything.",
+  "history_days": 7
 }

@@ -53,7 +53,11 @@ tmp = tempfile.mkdtemp()
 db = os.path.join(tmp, "p.sqlite3")
 out = os.path.join(tmp, "dash.html")
 cfg = {"region": "eu", "realm_slug": "argent-dawn", "locale": "en_GB",
-       "professions": [], "skill_tiers": []}
+       "professions": [], "skill_tiers": [],
+       # 0 = keep everything. These fixtures are dated 2023, and the default
+       # seven-day window would prune them the moment they were written.
+       # Retention is covered on its own further down, on today's buckets.
+       "history_days": 0}
 
 fails = []
 def must(l, c):
@@ -76,9 +80,18 @@ for _ in range(2):
     with contextlib.redirect_stdout(buf):
         W.cmd_scan(c, store, cfg, out, batch=5, top=50)
 must("same data = one snapshot", store.snapshot_count() == 1)
+# Six hours earlier, because 1_700_000_000 is 23:13 local and "an hour
+# later" would genuinely be the next day - which is correct behaviour, just
+# not what this assertion is about.
+c_sameday = FullClient(); c_sameday.stamp = 1_700_000_000 - 6 * 3600
+with contextlib.redirect_stdout(buf):
+    W.cmd_scan(c_sameday, store, cfg, out, batch=5, top=50)
+must("an hour later is the same day, so still one snapshot",
+     store.snapshot_count() == 1)
 
-# A later refresh -> a second, genuine snapshot.
-c2 = FullClient(); c2.stamp = 1_700_003_600
+# A later day -> a second, genuine snapshot. An hour later would now land in
+# the same daily entry, which is the point of the change.
+c2 = FullClient(); c2.stamp = 1_700_000_000 + 86400
 with contextlib.redirect_stdout(buf):
     W.cmd_scan(c2, store, cfg, out, batch=5, top=50)
 
@@ -276,7 +289,7 @@ def rows_at(store, taken_at):
 
 with contextlib.redirect_stderr(io.StringIO()):
     W.cmd_scan(TieredClient(), store4, cfg, out4, batch=5, top=50)
-stamp = TieredClient().commodities_with_time()[1]
+stamp = W.day_bucket(TieredClient().commodities_with_time()[1])
 must("full scan stored every recipe", len(rows_at(store4, stamp)) == 8)
 
 with contextlib.redirect_stderr(io.StringIO()):
@@ -415,6 +428,107 @@ html7 = W.render_reagents(reag)
 must("reagent table renders rows", html7.count('class="rrow"') == 3)
 must("reagent rows carry an expansion for filtering", 'data-exp="Midnight"' in html7)
 must("empty reagent list handled", "No reagents priced" in W.render_reagents([]))
+
+# ---------------------------------------------------------------------------
+# History is one row per item per day: scanning again the same day refines
+# that day's entry instead of adding another point.
+# ---------------------------------------------------------------------------
+import time as _time
+
+DAY = 86400
+morning = W.day_bucket(int(_time.time())) + 9 * 3600
+evening = W.day_bucket(int(_time.time())) + 21 * 3600
+tomorrow = morning + DAY
+
+must("bucket collapses times on one day",
+     W.day_bucket(morning) == W.day_bucket(evening))
+must("bucket separates different days",
+     W.day_bucket(tomorrow) != W.day_bucket(morning))
+must("bucket lands on local midnight",
+     _time.localtime(W.day_bucket(evening)).tm_hour == 0)
+
+store8 = W.Store(os.path.join(tmp, "daily.sqlite3"))
+
+
+class Clock(FullClient):
+    stamp = morning
+
+
+with contextlib.redirect_stdout(buf):
+    W.cmd_init(Clock(), store8, cfg)
+    W.cmd_scan(Clock(), store8, cfg, out, batch=5, top=50)
+must("first scan of the day makes one entry", store8.snapshot_count() == 1)
+
+c_evening = Clock(); c_evening.stamp = evening
+with contextlib.redirect_stdout(buf):
+    W.cmd_scan(c_evening, store8, cfg, out, batch=5, top=50)
+must("second scan the same day does not add an entry",
+     store8.snapshot_count() == 1)
+stored = store8.db.execute(
+    "SELECT DISTINCT taken_at FROM price_snapshot").fetchall()
+must("the entry is stamped at midnight, not the scan time",
+     stored[0][0] == W.day_bucket(morning))
+
+# ...but the values are the evening's, not the morning's.
+c_evening2 = Clock(); c_evening2.stamp = evening
+
+class Dearer(Clock):
+    stamp = evening
+    def commodities(self):
+        out = []
+        for iid in (2001, 2002):
+            for k in range(5):
+                out.append({"item": {"id": iid}, "quantity": 100,
+                            "unit_price": 99000 * (k + 1)})
+        for rid in (1, 2, 3):
+            for k in range(4):
+                out.append({"item": {"id": 9000 + rid}, "quantity": 10,
+                            "unit_price": 90000 * (k + 1) * rid})
+        return out
+
+with contextlib.redirect_stdout(buf):
+    W.cmd_scan(Dearer(), store8, cfg, out, batch=5, top=50)
+price = store8.db.execute(
+    "SELECT min_unit_price FROM price_snapshot WHERE item_id=2001").fetchone()
+must("the day's entry carries the newest values", price[0] == 99000.0)
+must("still exactly one entry for the day", store8.snapshot_count() == 1)
+
+c_next = Clock(); c_next.stamp = tomorrow
+with contextlib.redirect_stdout(buf):
+    W.cmd_scan(c_next, store8, cfg, out, batch=5, top=50)
+must("a new day makes a new entry", store8.snapshot_count() == 2)
+
+# Retention keeps the window and drops what falls out of it.
+old = W.day_bucket(int(_time.time())) - 30 * DAY
+store8.db.execute("INSERT OR REPLACE INTO price_snapshot VALUES(?,?,?,?,?,?,?)",
+                  (old, 2001, "commodity", 1.0, 1.0, 1, 1))
+store8.db.commit()
+def price_days(store):
+    return store.db.execute(
+        "SELECT COUNT(DISTINCT taken_at) FROM price_snapshot").fetchone()[0]
+
+
+must("stale day present before pruning", price_days(store8) == 3)
+store8.prune_history(7)
+must("pruning drops days outside the window", price_days(store8) == 2)
+must("pruning keeps days inside it",
+     store8.db.execute("SELECT COUNT(*) FROM price_snapshot WHERE taken_at=?",
+                       (old,)).fetchone()[0] == 0)
+must("history_days=0 keeps everything", store8.prune_history(0) == 0)
+
+# A database of hourly rows folds down to one per day.
+store9 = W.Store(os.path.join(tmp, "hourly.sqlite3"))
+for hour in (8, 12, 20):
+    store9.db.execute("INSERT OR REPLACE INTO price_snapshot VALUES(?,?,?,?,?,?,?)",
+                      (W.day_bucket(morning) + hour * 3600, 2001, "commodity",
+                       float(hour), float(hour), hour, 1))
+store9.db.commit()
+must("hourly rows present before collapsing", price_days(store9) == 3)
+store9.collapse_to_days()
+must("collapsed to one row for the day", price_days(store9) == 1)
+kept = store9.db.execute("SELECT sell_unit_price FROM price_snapshot").fetchone()
+must("collapsing keeps the latest reading of the day", kept[0] == 20.0)
+must("collapsing is idempotent", store9.collapse_to_days() == 0)
 
 # A database created before crafted_source existed must still open and scan.
 db3 = os.path.join(tmp, "old.sqlite3")
