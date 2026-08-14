@@ -59,6 +59,17 @@ local function addItemLines(tooltip, itemID)
         tooltip:AddDoubleLine("Auction (realistic sale)", money(sell),
                               0.6, 0.8, 1, 1, 1, 1)
     end
+    local span = d.range and d.range[itemID]
+    if span then
+        -- Only present when the price actually moved today, so its absence
+        -- means steady rather than unknown.
+        local low, high = span[1], span[2]
+        local pct = (low and low > 0) and ((high - low) / low * 100) or 0
+        tooltip:AddDoubleLine("Today's range",
+                              string.format("%s - %s (%+d%%)",
+                                            money(low), money(high), pct),
+                              0.6, 0.8, 1, 0.9, 0.8, 0.4)
+    end
     if margin then
         -- {cost, revenue, marginPct, costComplete, optionalsFilled}
         local cost, revenue, pct, complete, optionals = margin[1], margin[2],

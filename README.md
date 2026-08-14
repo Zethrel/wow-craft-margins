@@ -179,6 +179,15 @@ The day boundary is local midnight, so "the 20th" means the 20th where you are.
 the database indefinitely). Days that fall outside it are pruned on each scan
 and the file is vacuumed, so it does not creep upward.
 
+**Each day's row keeps that day's range, not just its last reading.** The
+headline price is the newest one, but `sell_low`/`sell_high` and
+`buy_low`/`buy_high` widen across every scan of the day, so a daily row can
+still answer "was this steady, or did it swing?". The reagent table shows it as
+**Today's range** and it is sortable, which is how you spot a mat that is
+thrashing before you commit to buying it. The in-game tooltip shows the same
+line, and only when the price actually moved — its absence means steady, not
+unknown.
+
 **Revenue subtracts the 5% auction house cut.**
 
 **Bid-only auctions are ignored** — you cannot reliably buy them, so letting them
@@ -339,7 +348,7 @@ python3 test_prices.py      # the in-game price display, against real generated 
 real; without it the file skips rather than failing, so the scanner itself
 still has no third-party dependencies.
 
-254 assertions in total: the supply ladder, percentile pricing,
+267 assertions in total: the supply ladder, percentile pricing,
 troll-listing resistance, stack-price normalisation, the AH cut, every skip
 condition, crafting-rank collapsing, hourly snapshot de-duplication, init
 idempotency, and that the dashboard is genuinely self-contained — plus, for the

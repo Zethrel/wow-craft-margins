@@ -500,7 +500,7 @@ must("a new day makes a new entry", store8.snapshot_count() == 2)
 
 # Retention keeps the window and drops what falls out of it.
 old = W.day_bucket(int(_time.time())) - 30 * DAY
-store8.db.execute("INSERT OR REPLACE INTO price_snapshot VALUES(?,?,?,?,?,?,?)",
+store8.db.execute("INSERT OR REPLACE INTO price_snapshot(taken_at,item_id,source,sell_unit_price,min_unit_price,total_quantity,listing_count) VALUES(?,?,?,?,?,?,?)",
                   (old, 2001, "commodity", 1.0, 1.0, 1, 1))
 store8.db.commit()
 def price_days(store):
@@ -519,7 +519,7 @@ must("history_days=0 keeps everything", store8.prune_history(0) == 0)
 # A database of hourly rows folds down to one per day.
 store9 = W.Store(os.path.join(tmp, "hourly.sqlite3"))
 for hour in (8, 12, 20):
-    store9.db.execute("INSERT OR REPLACE INTO price_snapshot VALUES(?,?,?,?,?,?,?)",
+    store9.db.execute("INSERT OR REPLACE INTO price_snapshot(taken_at,item_id,source,sell_unit_price,min_unit_price,total_quantity,listing_count) VALUES(?,?,?,?,?,?,?)",
                       (W.day_bucket(morning) + hour * 3600, 2001, "commodity",
                        float(hour), float(hour), hour, 1))
 store9.db.commit()
@@ -529,6 +529,68 @@ must("collapsed to one row for the day", price_days(store9) == 1)
 kept = store9.db.execute("SELECT sell_unit_price FROM price_snapshot").fetchone()
 must("collapsing keeps the latest reading of the day", kept[0] == 20.0)
 must("collapsing is idempotent", store9.collapse_to_days() == 0)
+
+# ---------------------------------------------------------------------------
+# A daily row keeps the day's range, not just its last reading.
+# ---------------------------------------------------------------------------
+storeR = W.Store(os.path.join(tmp, "range.sqlite3"))
+
+
+def px(sell, buy, source="commodity"):
+    class P:
+        pass
+    p = P()
+    p.source, p.sell_unit_price, p.min_unit_price = source, sell, buy
+    p.total_quantity, p.listing_count = 10, 3
+    return p
+
+
+day = W.day_bucket(int(_time.time()))
+storeR.save_prices(day, {50: px(1000.0, 900.0)})
+row = storeR.db.execute("SELECT * FROM price_snapshot WHERE item_id=50").fetchone()
+must("first reading sets a zero-width range",
+     row["sell_low"] == 1000.0 and row["sell_high"] == 1000.0)
+
+storeR.save_prices(day, {50: px(1400.0, 1200.0)})     # price rose
+storeR.save_prices(day, {50: px(800.0, 700.0)})       # then fell below the open
+row = storeR.db.execute("SELECT * FROM price_snapshot WHERE item_id=50").fetchone()
+must("latest reading is what the row reports", row["sell_unit_price"] == 800.0)
+must("the day's high is remembered", row["sell_high"] == 1400.0)
+must("the day's low is remembered", row["sell_low"] == 800.0)
+must("buy side tracks its own range",
+     row["buy_low"] == 700.0 and row["buy_high"] == 1200.0)
+must("still one row for the day",
+     storeR.db.execute("SELECT COUNT(*) FROM price_snapshot").fetchone()[0] == 1)
+
+storeR.save_prices(day + 86400, {50: px(1000.0, 900.0)})
+rows = storeR.db.execute(
+    "SELECT taken_at, sell_low, sell_high FROM price_snapshot "
+    "ORDER BY taken_at").fetchall()
+must("a new day starts a fresh range",
+     len(rows) == 2 and rows[1]["sell_low"] == 1000.0
+     and rows[1]["sell_high"] == 1000.0)
+
+must("steady prices report no spread", W.spread_text(500.0, 500.0)[0] == "steady")
+must("a spread is reported as a percentage",
+     round(W.spread_text(1000.0, 1500.0)[1]) == 50)
+must("missing range degrades to a dash", W.spread_text(None, None)[0] == "-")
+
+# Folding hourly rows away must recover the range they held between them.
+storeH = W.Store(os.path.join(tmp, "hourly_range.sqlite3"))
+for hour, sell in ((8, 500.0), (13, 1500.0), (20, 900.0)):
+    storeH.db.execute(
+        "INSERT OR REPLACE INTO price_snapshot(taken_at,item_id,source,"
+        "sell_unit_price,min_unit_price,total_quantity,listing_count) "
+        "VALUES(?,?,?,?,?,?,?)",
+        (day + hour * 3600, 60, "commodity", sell, sell, 5, 2))
+storeH.db.commit()
+storeH.collapse_to_days()
+row = storeH.db.execute("SELECT * FROM price_snapshot WHERE item_id=60").fetchone()
+must("collapsing keeps the last reading", row["sell_unit_price"] == 900.0)
+must("collapsing recovers the day's low from the folded rows",
+     row["sell_low"] == 500.0)
+must("collapsing recovers the day's high from the folded rows",
+     row["sell_high"] == 1500.0)
 
 # A database created before crafted_source existed must still open and scan.
 db3 = os.path.join(tmp, "old.sqlite3")

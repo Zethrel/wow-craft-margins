@@ -390,6 +390,13 @@ CREATE TABLE IF NOT EXISTS price_snapshot (
     min_unit_price  REAL,
     total_quantity  INTEGER,
     listing_count   INTEGER,
+    -- The day's range. sell_unit_price above is the latest reading; these are
+    -- the lowest and highest seen across every scan that day, so a daily row
+    -- can still answer "was this steady, or did it swing?".
+    sell_low   REAL,
+    sell_high  REAL,
+    buy_low    REAL,
+    buy_high   REAL,
     PRIMARY KEY (taken_at, item_id, source)
 );
 
@@ -427,6 +434,19 @@ class Store:
             self.db.execute("ALTER TABLE recipe ADD COLUMN uses_slots INTEGER")
         if "slots_json" not in have:
             self.db.execute("ALTER TABLE recipe ADD COLUMN slots_json TEXT")
+        price_cols = {r["name"] for r in
+                      self.db.execute("PRAGMA table_info(price_snapshot)")}
+        for column in ("sell_low", "sell_high", "buy_low", "buy_high"):
+            if column not in price_cols:
+                self.db.execute(
+                    f"ALTER TABLE price_snapshot ADD COLUMN {column} REAL")
+        if "sell_low" not in price_cols:
+            # Seed the range from what is already stored: one reading is a
+            # range of zero width, which is honest until the day's next scan.
+            self.db.execute(
+                "UPDATE price_snapshot SET sell_low=sell_unit_price, "
+                "sell_high=sell_unit_price, buy_low=min_unit_price, "
+                "buy_high=min_unit_price")
 
     def close(self) -> None:
         self.db.close()
@@ -521,18 +541,36 @@ class Store:
         for table, cols, keys in (
                 ("price_snapshot",
                  "taken_at,item_id,source,sell_unit_price,min_unit_price,"
-                 "total_quantity,listing_count", (1, 2)),
+                 "total_quantity,listing_count,sell_low,sell_high,"
+                 "buy_low,buy_high", (1, 2)),
                 ("margin_snapshot",
                  "taken_at,recipe_id,cost,revenue,margin,margin_pct,"
                  "craftable_units", (1,))):
             latest: dict = {}
+            spans: dict = {}
             for row in self.db.execute(f"SELECT {cols} FROM {table}"):
                 bucket = day_bucket(row[0])
                 key = (bucket,) + tuple(row[i] for i in keys)
                 previous = latest.get(key)
                 if previous is None or row[0] >= previous[0]:
                     latest[key] = row
-            rebuilt = [(day_bucket(r[0]),) + tuple(r[1:]) for r in latest.values()]
+                if table == "price_snapshot":
+                    # The hourly rows being folded away are exactly the day's
+                    # readings, so they give a real range rather than a
+                    # zero-width placeholder.
+                    lo_s, hi_s, lo_b, hi_b = spans.get(key, (None,) * 4)
+                    sell, buy = row[3], row[4]
+                    spans[key] = (
+                        sell if lo_s is None else min(lo_s, sell or lo_s),
+                        sell if hi_s is None else max(hi_s, sell or hi_s),
+                        buy if lo_b is None else min(lo_b, buy or lo_b),
+                        buy if hi_b is None else max(hi_b, buy or hi_b))
+            rebuilt = []
+            for key, r in latest.items():
+                row = (day_bucket(r[0]),) + tuple(r[1:])
+                if table == "price_snapshot":
+                    row = row[:7] + spans.get(key, (None,) * 4)
+                rebuilt.append(row)
             self.db.execute(f"DELETE FROM {table}")
             placeholders = ",".join("?" * len(cols.split(",")))
             self.db.executemany(
@@ -542,10 +580,36 @@ class Store:
         return len(stamps)
 
     def save_prices(self, taken_at: int, prices: dict) -> None:
+        """Write today's readings, widening the day's range as it goes.
+
+        The headline columns hold the latest reading; sell_low/high and
+        buy_low/high accumulate across every scan of that day. Written as an
+        upsert rather than a replace so an evening scan cannot forget what the
+        morning saw."""
         rows = [(taken_at, iid, p.source, p.sell_unit_price, p.min_unit_price,
-                 p.total_quantity, p.listing_count) for iid, p in prices.items()]
-        self.db.executemany(
-            "INSERT OR REPLACE INTO price_snapshot VALUES(?,?,?,?,?,?,?)", rows)
+                 p.total_quantity, p.listing_count,
+                 p.sell_unit_price, p.sell_unit_price,
+                 p.min_unit_price, p.min_unit_price)
+                for iid, p in prices.items()]
+        self.db.executemany("""
+            INSERT INTO price_snapshot(taken_at,item_id,source,sell_unit_price,
+                min_unit_price,total_quantity,listing_count,
+                sell_low,sell_high,buy_low,buy_high)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(taken_at,item_id,source) DO UPDATE SET
+                sell_unit_price=excluded.sell_unit_price,
+                min_unit_price=excluded.min_unit_price,
+                total_quantity=excluded.total_quantity,
+                listing_count=excluded.listing_count,
+                sell_low=MIN(COALESCE(price_snapshot.sell_low, excluded.sell_low),
+                             COALESCE(excluded.sell_low, price_snapshot.sell_low)),
+                sell_high=MAX(COALESCE(price_snapshot.sell_high, excluded.sell_high),
+                              COALESCE(excluded.sell_high, price_snapshot.sell_high)),
+                buy_low=MIN(COALESCE(price_snapshot.buy_low, excluded.buy_low),
+                            COALESCE(excluded.buy_low, price_snapshot.buy_low)),
+                buy_high=MAX(COALESCE(price_snapshot.buy_high, excluded.buy_high),
+                             COALESCE(excluded.buy_high, price_snapshot.buy_high))
+            """, rows)
         self.db.commit()
 
     def save_margins(self, taken_at: int, results: list,
@@ -573,6 +637,14 @@ class Store:
         self.db.executemany(
             "INSERT OR REPLACE INTO margin_snapshot VALUES(?,?,?,?,?,?,?)", rows)
         self.db.commit()
+
+    def price_ranges(self, taken_at: int) -> dict:
+        """{item_id: (buy_low, buy_high, sell_low, sell_high)} for one day."""
+        return {r["item_id"]: (r["buy_low"], r["buy_high"],
+                               r["sell_low"], r["sell_high"])
+                for r in self.db.execute(
+                    "SELECT item_id, buy_low, buy_high, sell_low, sell_high "
+                    "FROM price_snapshot WHERE taken_at=?", (taken_at,))}
 
     def price_history(self, item_id: int, limit: int = 60) -> list:
         rows = self.db.execute(
@@ -1290,14 +1362,16 @@ def cmd_scan(client: BlizzardClient, store: Store, cfg: dict, out_path: str,
         try:
             target = os.path.join(addon_path, "PriceData.lua")
             size = write_addon_prices(target, results, prices, recipes,
-                                      taken_at, cfg, batch)
+                                      taken_at, cfg, batch,
+                                      store.price_ranges(taken_at))
             log(f"wrote {target} ({size // 1024} KB) -- /reload in game to "
                 "pick it up")
         except OSError as exc:
             log(f"warn: could not write addon prices: {exc}")
 
     history = {r.recipe_id: store.margin_history(r.recipe_id) for r in results[:top]}
-    reagents = collect_reagents(recipes, prices, names, store)
+    reagents = collect_reagents(recipes, prices, names, store,
+                                ranges=store.price_ranges(taken_at))
     html = render_dashboard(results, cfg, taken_at, skipped, history, top, batch,
                             store.snapshot_count(), reagents)
     with open(out_path, "w", encoding="utf-8") as fh:
@@ -1570,8 +1644,19 @@ def expansion_of(skill_tier: str, profession: str) -> str:
     return label or skill_tier or "?"
 
 
+def spread_text(low, high) -> tuple:
+    """A day's range as (text, percent). Zero width until a second scan."""
+    if not low or not high or high <= 0:
+        return "-", 0.0
+    if abs(high - low) < 1:
+        return "steady", 0.0
+    return (f"{copper_to_gold_str(low)}&ndash;{copper_to_gold_str(high)}",
+            (high - low) / low * 100.0 if low else 0.0)
+
+
 def collect_reagents(recipes: list, prices: dict, item_names: dict,
-                     store: "Store", per_expansion: int = 60) -> list:
+                     store: "Store", per_expansion: int = 60,
+                     ranges: Optional[dict] = None) -> list:
     """What every expansion's crafts buy, and what it currently costs.
 
     The margin table answers "what should I make"; this answers the question
@@ -1619,6 +1704,7 @@ def collect_reagents(recipes: list, prices: dict, item_names: dict,
                 "sell": price.sell_unit_price or 0.0,
                 "supply": price.total_quantity,
                 "listings": price.listing_count,
+                "range": (ranges or {}).get(item_id),
                 "history": store.price_history(item_id),
             })
     out.sort(key=lambda r: (r["expansion"], -r["recipes"]))
@@ -1630,10 +1716,18 @@ def render_reagents(reagents: list) -> str:
         return '<p class="cap">No reagents priced.</p>'
     rows = []
     for r in reagents:
+        low, high = (r.get("range") or (None, None, None, None))[:2]
+        swing, pct = spread_text(low, high)
+        swing_tip = (f"Cheapest seen today {copper_to_gold_str(low)}, "
+                     f"highest {copper_to_gold_str(high)} &mdash; {pct:+.0f}% "
+                     f"across the day." if pct else
+                     "No movement seen yet today. Widens as the day's scans "
+                     "come in.")
         rows.append(
             f'<tr class="rrow" data-name="{esc(r["name"].lower())}" '
             f'data-exp="{esc(r["expansion"])}" data-buy="{r["buy"]:.0f}" '
-            f'data-supply="{r["supply"]}" data-uses="{r["recipes"]}">'
+            f'data-supply="{r["supply"]}" data-uses="{r["recipes"]}" '
+            f'data-swing="{pct:.1f}">'
             f'<td><div class="name">{esc(r["name"])}</div>'
             f'<div class="meta">{esc(r["expansion"])} &middot; '
             f'{esc(r["professions"])}</div></td>'
@@ -1641,19 +1735,21 @@ def render_reagents(reagents: list) -> str:
             f'<td class="num">{copper_to_gold_str(r["buy"])}</td>'
             f'<td class="num">{copper_to_gold_str(r["sell"])}</td>'
             f'<td class="num meta">{r["supply"]:,}</td>'
-            f'<td class="num meta">{r["listings"]:,}</td>'
+            f'<td class="num" data-tip="{esc(swing_tip)}">{swing}</td>'
             f'<td>{render_spark(r["history"])}</td></tr>')
     return ("<table><thead><tr><th data-rkey=\"name\">Reagent</th>"
             "<th class=\"num\" data-rkey=\"uses\">Recipes</th>"
             "<th class=\"num\" data-rkey=\"buy\">Cheapest (g)</th>"
             "<th class=\"num\">Realistic (g)</th>"
             "<th class=\"num\" data-rkey=\"supply\">Supply</th>"
-            "<th class=\"num\">Listings</th><th>Price history</th>"
+            "<th class=\"num\" data-rkey=\"swing\">Today's range</th>"
+            "<th>Price history</th>"
             "</tr></thead><tbody id=\"rrows\">" + "".join(rows) + "</tbody></table>")
 
 
 def write_addon_prices(path: str, results: list, prices: dict, recipes: list,
-                       taken_at: int, cfg: dict, batch: int) -> int:
+                       taken_at: int, cfg: dict, batch: int,
+                       ranges: Optional[dict] = None) -> int:
     """Write PriceData.lua into the addon folder so prices show up in game.
 
     The return leg of the addon bridge. Addons cannot fetch anything at
@@ -1697,6 +1793,19 @@ def write_addon_prices(path: str, results: list, prices: dict, recipes: list,
             sell.append(f"[{item_id}]={int(price.sell_unit_price)}")
     lines.append("buy = {" + ",".join(buy) + "},")
     lines.append("sell = {" + ",".join(sell) + "},")
+
+    # The day's low and high, so a tooltip can say whether the price it shows
+    # is a settled one or the last reading of something that moved.
+    swings = []
+    for item_id in sorted(wanted):
+        span = (ranges or {}).get(item_id)
+        if not span:
+            continue
+        buy_low, buy_high = span[0], span[1]
+        if not buy_low or not buy_high or abs(buy_high - buy_low) < 1:
+            continue
+        swings.append(f"[{item_id}]={{{int(buy_low)},{int(buy_high)}}}")
+    lines.append("range = {" + ",".join(swings) + "},")
 
     # Per single craft, so the number means something regardless of --batch.
     margins = []
