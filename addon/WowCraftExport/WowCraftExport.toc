@@ -11,4 +11,5 @@
 PriceData.lua
 main.lua
 inventory.lua
+trade.lua
 prices.lua
