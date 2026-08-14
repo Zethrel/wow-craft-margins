@@ -493,5 +493,33 @@ entirely — it is detectable and bannable, and nothing here does it.
 
 ---
 
+## Working on the addon
+
+The addon's source of truth is `addon/WowCraftExport/` in this repo. The copy
+under `Interface/AddOns/` is what the game runs, which makes it the tempting
+one to edit — and a plain copy in the other direction would destroy those
+edits silently.
+
+```bash
+sync-addon.cmd          # install repo -> game
+sync-addon.cmd back     # bring game-side edits back into the repo
+```
+
+Installing **refuses** to overwrite an installed file that differs from the
+repo's and is newer, and tells you to pull it back instead. Exit code 2 means
+something was refused.
+
+`config.json` is gitignored: it holds your Battle.net client id and secret, and
+committing it once would put them in the history permanently. `config.example.json`
+is the tracked template. `wowcraft.sqlite3` is untracked too — 23 MB that
+rewrites itself every scan — but note it holds your price history, which is the
+one thing here that cannot be regenerated, so back it up separately if that
+matters to you.
+
+This is private code. There is no licence file, and that is deliberate: with no
+licence, default copyright applies and nobody has any right to use it.
+
+---
+
 Data © Blizzard Entertainment, retrieved through the public Battle.net Game Data
 API. This tool is unofficial and not affiliated with Blizzard.
