@@ -21,5 +21,11 @@ doctor-report.txt
 # Written into the addon folder by scan, never edited by hand.
 addon/WowCraftExport/PriceData.lua
 
+# PyInstaller output. The exe is a build artefact - 12 MB that changes with
+# every code change, rebuildable in twenty seconds with build-exe.cmd.
+build/
+dist/
+*.spec
+
 __pycache__/
 *.pyc

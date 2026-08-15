@@ -27,6 +27,40 @@ from tkinter import ttk
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import wowcraft as W          # for expansion_of, so the two agree on names
 
+
+def app_dir() -> str:
+    """Where the program lives, as the user thinks of it.
+
+    Packaged with --onefile, the script is unpacked into a temporary folder
+    that is deleted on exit, so __file__ points somewhere useless and the
+    database would never be found. Frozen, the answer is the folder holding
+    the .exe."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def find_db(explicit: str = "") -> str:
+    """The database to read, and a clear account of the search if there is
+    none - "file not found" with no path is the least useful error there is."""
+    if explicit:
+        return explicit
+    tried = []
+    for folder in (app_dir(), os.getcwd()):
+        candidate = os.path.join(folder, "wowcraft.sqlite3")
+        if candidate in tried:
+            # Run from its own folder these are the same place, and listing it
+            # twice reads as a bug in the message rather than a missing file.
+            continue
+        tried.append(candidate)
+        if os.path.exists(candidate):
+            return candidate
+    raise SystemExit(
+        "Could not find wowcraft.sqlite3.\n\nLooked in:\n  "
+        + "\n  ".join(tried)
+        + "\n\nPut the program beside the database, or start it with"
+          " --db <path>.")
+
 GOLD = 10000
 
 
@@ -446,21 +480,41 @@ class App:
 
 
 def main(argv=None) -> int:
-    here = os.path.dirname(os.path.abspath(__file__))
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("-d", "--db", default=os.path.join(here, "wowcraft.sqlite3"))
+    ap.add_argument("-d", "--db", default="",
+                    help="database to read (default: wowcraft.sqlite3 beside "
+                         "the program, then the working directory)")
     ap.add_argument("-n", "--limit", type=int, default=300,
                     help="rows drawn at once (default 300); searching narrows "
                          "to what you want long before this matters")
     args = ap.parse_args(argv)
 
-    data = Prices(args.db)
+    data = Prices(find_db(args.db))
     root = tk.Tk()
     App(root, data, args.limit)
     root.mainloop()
     return 0
 
 
+def _fatal(message: str) -> None:
+    """Frozen, there is no console for a traceback to land in, so a failure to
+    start would just be a program that does not appear. Say it in a box."""
+    try:
+        import tkinter.messagebox as mb
+        hidden = tk.Tk()
+        hidden.withdraw()
+        mb.showerror("wowcraft - price lookup", message)
+        hidden.destroy()
+    except Exception:
+        print(message)
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except SystemExit as exc:
+        if isinstance(exc.code, str):
+            _fatal(exc.code)
+            sys.exit(1)
+        raise

@@ -383,6 +383,31 @@ This deliberately is not part of the dashboard. That is a report you glance at;
 eight thousand searchable rows made it a four megabyte page that would not
 load.
 
+### Building it as an .exe
+
+```
+build-exe.cmd
+```
+
+Produces `dist\pricecheck.exe`, about 12 MB, needing no Python installed.
+PyInstaller is the only third-party dependency in the project and it is a
+**build** dependency only — nothing that runs needs it, and the scanner still
+has none. `python -m pip install pyinstaller` if the script says it is missing.
+
+The exe looks for `wowcraft.sqlite3` **beside itself**, then in the working
+directory, and names both paths if it finds neither. That matters more than it
+sounds: packed with `--onefile` the script is unpacked into a temporary folder
+that is deleted on exit, so anything resolved relative to the source file would
+point somewhere meaningless. Keep the exe next to the database, or pass
+`--db <path>`.
+
+Being a windowed build it has no console, so a failure to start would otherwise
+be a program that simply never appears; startup errors are shown in a message
+box instead.
+
+`build/`, `dist/` and `*.spec` are gitignored — the exe is a build artefact
+that changes with every commit and rebuilds in twenty seconds.
+
 Useful flags: `--batch N` (crafts per batch, default 20), `--top N` (dashboard rows,
 default 200), `--min-listings N` (optional liquidity floor, default 1 = price
 everything), `--out FILE`,
