@@ -204,6 +204,14 @@ been recorded, then `addon_import.py --apply` loads it.
 
 **Revenue subtracts the 5% auction house cut.**
 
+**The listing deposit is deliberately not subtracted.** It is refunded when the
+item sells, and margin is the answer to "what do I make if this sells", so
+taking it off would understate every successful craft. It is only ever lost on
+an auction that expires unsold — the case this tool already declines to predict
+— and it is small next to the cut: on a 3g15s commodity listing the deposit is
+2s, about 0.6% against the 5% the cut takes. It does tie up capital if you list
+in bulk, which is worth knowing but is not a margin.
+
 **Bid-only auctions are ignored** — you cannot reliably buy them, so letting them
 drag the market price down would be misleading.
 
