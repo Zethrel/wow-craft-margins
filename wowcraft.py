@@ -2280,6 +2280,53 @@ def _sample(obj: Any, limit: int = 3) -> Any:
     return obj
 
 
+def cmd_names(client: BlizzardClient, store: Store, cfg: dict) -> None:
+    """Look up names for every priced item we cannot name.
+
+    `init` only names what recipes reference, so most of the auction house
+    arrives as bare ids - fine on the dashboard, which hides them, but the
+    lookup window shows everything and "item 274470" is not an answer to
+    anything.
+
+    Names never change, so this is a one-off per item: a second run has
+    nothing left to do. No scraping involved - Blizzard publishes the names,
+    and we are already authenticated for them."""
+    named = {r["id"] for r in store.db.execute(
+        "SELECT id FROM item WHERE name IS NOT NULL AND name <> ''")}
+    priced = {r["item_id"] for r in store.db.execute(
+        "SELECT DISTINCT item_id FROM price_snapshot")}
+    missing = sorted(priced - named)
+    if not missing:
+        log("every priced item already has a name")
+        return
+
+    log(f"{len(priced):,} priced items, {len(named):,} already named")
+    log(f"looking up {len(missing):,} names "
+        f"(~{len(missing) / RATE_LIMIT_PER_SEC / 60:.0f} min, one time -- "
+        "names do not change)")
+    payloads = client.get_many(
+        ((i, f"/data/wow/item/{i}") for i in missing), "static")
+
+    rows = []
+    for item_id, payload in payloads.items():
+        name = (payload or {}).get("name")
+        if isinstance(name, str) and name:
+            rows.append((item_id, name,
+                         (payload.get("quality") or {}).get("type"),
+                         payload.get("level")))
+    store.db.executemany(
+        "INSERT INTO item(id,name,quality,level) VALUES(?,?,?,?) "
+        "ON CONFLICT(id) DO UPDATE SET name=excluded.name, "
+        "quality=excluded.quality, level=excluded.level", rows)
+    store.db.commit()
+    log(f"named {len(rows):,} items")
+    absent = len(missing) - len(rows)
+    if absent:
+        log(f"note: {absent:,} returned nothing at all -- items removed from "
+            "the game whose ids linger on old listings. Left as raw ids "
+            "rather than given an invented label.")
+
+
 def cmd_doctor(client: BlizzardClient, store: Store, cfg: dict,
                out_path: str = "doctor-report.txt") -> None:
     """Probe every endpoint the tool depends on and write a shareable report.
@@ -2729,13 +2776,16 @@ def main(argv: Optional[list] = None) -> int:
         prog="wowcraft",
         description="Crafting margin scanner using Blizzard's official API.")
     ap.add_argument("command",
-                    choices=["init", "scan", "demo", "config", "doctor"],
+                    choices=["init", "scan", "demo", "config", "doctor",
+                             "names"],
                     help="init: cache recipes (run once per patch). "
                          "scan: fetch auctions and build the dashboard. "
                          "demo: run on synthetic data, no credentials needed. "
                          "config: write a starter config.json. "
                          "doctor: probe every endpoint and write a shareable "
-                         "diagnostic report.")
+                         "diagnostic report. "
+                         "names: look up names for every priced item that has "
+                         "none (one-off, ~10 min).")
     ap.add_argument("-c", "--config", default="config.json")
     ap.add_argument("-d", "--db", default="wowcraft.sqlite3")
     ap.add_argument("-o", "--out", default="dashboard.html")
@@ -2804,6 +2854,8 @@ def main(argv: Optional[list] = None) -> int:
             cmd_doctor(client, store, cfg)
         elif args.command == "init":
             cmd_init(client, store, run_cfg)
+        elif args.command == "names":
+            cmd_names(client, store, run_cfg)
         else:
             cmd_scan(client, store, run_cfg, args.out, args.batch, args.top,
                      args.min_listings)

@@ -315,6 +315,7 @@ Run `doctor` first.
 | `scan` | Fetch auctions, compute margins, write the dashboard |
 | `demo` | Run the whole pipeline on synthetic data, no credentials |
 | `doctor` | Probe every endpoint, write a shareable diagnostic report |
+| `names` | Look up names for every priced item that has none (one-off, ~6 min) |
 
 ## Price lookup (`pricecheck.py`)
 
@@ -329,6 +330,13 @@ or double-click `pricecheck.cmd` on Windows, which launches it with `pythonw`
 so no console sits behind it. It reads `wowcraft.sqlite3` directly, so it shows
 whatever the last scan wrote — **Refresh** picks up a newer one without
 restarting.
+
+Run `python3 wowcraft.py names` once after your first scan. `init` only names
+what recipes reference, which leaves most of the auction house showing as bare
+ids — fine on the dashboard, which hides them, but this window shows everything
+and "item 274470" answers nothing. It looks up only what is missing, so a
+second run costs nothing, and the names come from Blizzard's own item endpoint
+rather than from scraping a database site.
 
 All 29,000-odd priced items, searchable by name or item id, sortable, with
 today's range and the trend across the stored history. The dropdown narrows to
