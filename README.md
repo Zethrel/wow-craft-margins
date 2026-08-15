@@ -423,7 +423,7 @@ python3 test_undercut.py    # the undercut helper, including that it never posts
 real; without it the file skips rather than failing, so the scanner itself
 still has no third-party dependencies.
 
-319 assertions in total: the supply ladder, percentile pricing,
+321 assertions in total: the supply ladder, percentile pricing,
 troll-listing resistance, stack-price normalisation, the AH cut, every skip
 condition, crafting-rank collapsing, hourly snapshot de-duplication, init
 idempotency, and that the dashboard is genuinely self-contained — plus, for the
@@ -524,6 +524,16 @@ and that is where taint and "Interface action failed" come from. The test suite
 fails if a posting function is ever called.
 
 An item nobody has listed says so rather than inventing a price.
+
+The suggestion is **rounded down to whole silver**, because the auction house
+price box has no copper field — a price with copper in it is not one you can
+post. Rounded down rather than to nearest, so the result is still an undercut.
+
+Setting the box also fires its change events. The sell frame validates on those,
+so a value written behind its back leaves *Create Auction* refusing to work — it
+looks like the price took when it did not. `/wcundercut debug` reports which
+setter worked and what the frame exposes, if it ever stops matching a future
+client.
 
 ### Trade requests you can fill
 

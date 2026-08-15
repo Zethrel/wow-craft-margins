@@ -78,7 +78,8 @@ lua.eval("function(s) return assert(load(s,'undercut.lua')) end")(
     open(ADDON, encoding="utf-8").read())()
 lua.eval("FireEvent")("AUCTION_HOUSE_SHOW")
 
-# 32200 copper = 3g 22s. A 5% undercut is 30590 = 3g 5s.
+# 32200 copper = 3g 22s. A 5% undercut is 30590, rounded DOWN to whole silver
+# because the auction house cannot express copper - 30500 = 3g 5s.
 def texts():
     """Font strings live in their own list; frames only holds real frames."""
     out = [f["txt"] for f in lua.eval("strings").values() if f["txt"]]
@@ -102,7 +103,9 @@ for f in lua.eval("frames").values():
 must("there is a Use price button", button is not None)
 if button is not None:
     button["OnClick"](button)
-must("pressing it fills the price box", lua.eval("boxValue") == 30590)
+must("pressing it fills the price box", lua.eval("boxValue") == 30500)
+must("the price it fills has no copper in it",
+     lua.eval("boxValue") % 100 == 0)
 must("it still never posts", len(list(lua.eval("posted").values())) == 0)
 
 # Percentage is configurable and persists.
@@ -113,6 +116,7 @@ must("the new percentage is stored",
      lua.eval("WowCraftExportDB.undercut.undercut") == 3)
 blob = " ".join(t for t in texts() if t)
 must("the suggestion follows the new percentage", "3g 12s" in blob)
+must("no suggestion ever carries copper", " 0c" not in blob and "c|r" not in blob)
 
 lua.eval("SlashCmdList")["WCUNDERCUT"]("150")
 must("a nonsense percentage is refused",

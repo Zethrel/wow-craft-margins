@@ -39,9 +39,21 @@ local function money(copper)
     local g = math.floor(copper / 10000)
     local s = math.floor((copper % 10000) / 100)
     local c = copper % 100
-    if g > 0 then return string.format("%dg %ds", g, s) end
-    if s > 0 then return string.format("%ds %dc", s, c) end
+    if g > 0 then
+        return c > 0 and string.format("%dg %ds %dc", g, s, c)
+                      or string.format("%dg %ds", g, s)
+    end
+    if s > 0 then
+        return c > 0 and string.format("%ds %dc", s, c) or string.format("%ds", s)
+    end
     return string.format("%dc", c)
+end
+
+-- The auction house takes gold and silver only; a price with copper in it
+-- cannot be entered, so it is not a price you can actually post. Rounded DOWN
+-- so the result is still an undercut rather than a penny over.
+local function toSilver(copper)
+    return math.max(100, math.floor(copper / 100) * 100)
 end
 
 -- -- what is it selling for right now ---------------------------------------
@@ -113,29 +125,84 @@ end
 
 -- -- the panel --------------------------------------------------------------
 
+-- Writing a value is not enough on its own: the sell frame validates on the
+-- edit box's own change events, so a price set behind its back can leave
+-- Create Auction disabled or posting the number that was there before. After
+-- setting, nudge the boxes we touched so it revalidates as if you had typed.
+local function poke(box)
+    if type(box) ~= "table" then return end
+    for _, key in ipairs({ "gold", "silver", "copper", "GoldBox", "SilverBox",
+                           "CopperBox" }) do
+        local child = box[key]
+        if type(child) == "table" then
+            pcall(function()
+                local handler = child.GetScript and child:GetScript("OnTextChanged")
+                if handler then handler(child, true) end
+                if child.ClearFocus then child:ClearFocus() end
+            end)
+        end
+    end
+    pcall(function()
+        local handler = box.GetScript and box:GetScript("OnTextChanged")
+        if handler then handler(box, true) end
+    end)
+end
+
+local lastMethod = "none"
+
 local function apply()
     if not suggested or suggested <= 0 then return end
     local box = priceBox()
     if not box then
         print("|cffff4444WowCraft|r: could not find the price box on this "
-              .. "auction house frame.")
+              .. "auction house frame. |cffffff00/wcundercut debug|r reports "
+              .. "what it did find.")
         return
     end
+
     -- Setting an edit box value is not a protected action. Posting is, and
-    -- this deliberately stops short of it.
-    local ok = pcall(function()
-        if box.SetAmount then
-            box:SetAmount(suggested)
-        elseif MoneyInputFrame_SetCopper then
-            MoneyInputFrame_SetCopper(box, suggested)
-        else
-            error("no setter")
-        end
-    end)
-    if not ok then
-        print("|cffff4444WowCraft|r: this build's price box did not accept a "
-              .. "value; type " .. money(suggested) .. " manually.")
+    -- this deliberately stops short of it. Several shapes of money input have
+    -- shipped, so try each and confirm by reading the value back rather than
+    -- trusting a call that did not error to have done anything.
+    local attempts = {
+        { "SetAmount", function() box:SetAmount(suggested) end },
+        { "MoneyInputFrame_SetCopper",
+          function() MoneyInputFrame_SetCopper(box, suggested) end },
+        { "gold/silver boxes", function()
+            local g = box.gold or box.GoldBox
+            local s = box.silver or box.SilverBox
+            if not g or not s then error("no gold/silver boxes") end
+            g:SetText(tostring(math.floor(suggested / 10000)))
+            s:SetText(tostring(math.floor((suggested % 10000) / 100)))
+        end },
+    }
+
+    local function readBack()
+        local value
+        pcall(function()
+            if box.GetAmount then
+                value = box:GetAmount()
+            elseif MoneyInputFrame_GetCopper then
+                value = MoneyInputFrame_GetCopper(box)
+            end
+        end)
+        return value
     end
+
+    for _, attempt in ipairs(attempts) do
+        if pcall(attempt[2]) then
+            poke(box)
+            local got = readBack()
+            if got == nil or got == suggested then
+                lastMethod = attempt[1]
+                return
+            end
+        end
+    end
+    lastMethod = "none worked"
+    print("|cffff4444WowCraft|r: could not set the price box on this build. "
+          .. "Type " .. money(suggested) .. " manually, and please run "
+          .. "|cffffff00/wcundercut debug|r so it can be fixed.")
 end
 
 local function refresh()
@@ -169,7 +236,7 @@ local function refresh()
     end
 
     local pct = settings().undercut
-    suggested = math.max(1, math.floor(lowest * (1 - pct / 100)))
+    suggested = toSilver(lowest * (1 - pct / 100))
     lowestText:SetText(string.format(
         "lowest listed: |cffffd100%s|r%s", money(lowest),
         (kind == "commodity" and qty) and string.format(" (%d up)", qty) or ""))
@@ -268,6 +335,27 @@ SlashCmdList["WCUNDERCUT"] = function(arg)
         s.undercut = pct
         print(string.format("|cff44ff44WowCraft|r: undercutting by %.1f%%.", pct))
         refresh()
+        return
+    end
+    if arg == "debug" then
+        local box, page = priceBox()
+        print("|cff44ff44WowCraft|r debug:")
+        print("  AuctionHouseFrame   : " .. tostring(AuctionHouseFrame ~= nil))
+        print("  sell page found     : " .. tostring(page ~= nil))
+        print("  price box found     : " .. tostring(box ~= nil))
+        if box then
+            local kinds = {}
+            for _, key in ipairs({ "SetAmount", "GetAmount", "gold", "silver",
+                                   "GoldBox", "SilverBox" }) do
+                if box[key] ~= nil then kinds[#kinds + 1] = key end
+            end
+            print("  box exposes         : " .. table.concat(kinds, ", "))
+        end
+        print("  MoneyInputFrame_SetCopper: "
+              .. tostring(type(MoneyInputFrame_SetCopper) == "function"))
+        print("  last method used    : " .. lastMethod)
+        print("  suggested           : " .. tostring(suggested)
+              .. " (" .. money(suggested or 0) .. ")")
         return
     end
     print(string.format("|cff44ff44WowCraft|r: undercut %.1f%%, auto-fill %s.",
