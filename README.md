@@ -347,6 +347,13 @@ reloads if so, and says which scan it picked up. Leave it open on a second
 monitor and the numbers stay live without you touching anything. **Refresh**
 forces it early.
 
+It is dark on purpose: it sits open beside a game that is dark, and a white
+grid at 11pm is why a tool like this gets closed. Direction is shown with an
+arrow rather than by tinting the row, because a Treeview can only colour whole
+rows and colouring by trend turned every line red or green - which is worse
+than no colour at all. Rows are banded so the eye can follow one across seven
+columns.
+
 Your search, expansion and sort survive a refresh, a database locked by a scan
 mid-write is ridden out rather than blanking the window, and the "prices from"
 age is redrawn on the same timer — an age that freezes is worse than no age at

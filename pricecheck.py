@@ -184,6 +184,68 @@ class Prices:
         self.rows = sorted(best.values(), key=lambda x: -x["supply"])
 
 
+# A dark palette, because this sits open beside a game that is dark, and a
+# white grid at 11pm is the reason people close a tool like this. Colours are
+# assigned to meaning rather than to rows: gold is money, green and red are
+# direction, grey is context you can ignore.
+THEME = {
+    "bg":      "#1b1b19",
+    "panel":   "#232321",
+    "row":     "#1c1c1a",
+    "row_alt": "#242422",
+    "sel":     "#34506e",
+    "text":    "#e6e4df",
+    "muted":   "#8c8a83",
+    "gold":    "#d8b45a",
+    "pos":     "#6cc06c",
+    "neg":     "#e06c6c",
+    "line":    "#33332f",
+}
+
+
+def style_window(root: tk.Tk) -> None:
+    """Dark theme over ttk. Built on `clam` because it is the only stock theme
+    that lets the Treeview's colours actually be set - the native Windows
+    themes draw their own and ignore most of this."""
+    root.configure(bg=THEME["bg"])
+    style = ttk.Style()
+    try:
+        style.theme_use("clam")
+    except tk.TclError:
+        return
+    style.configure(".", background=THEME["bg"], foreground=THEME["text"],
+                    fieldbackground=THEME["panel"], borderwidth=0)
+    style.configure("TFrame", background=THEME["bg"])
+    style.configure("TLabel", background=THEME["bg"], foreground=THEME["muted"])
+    style.configure("Status.TLabel", foreground=THEME["muted"])
+    style.configure("TEntry", fieldbackground=THEME["panel"],
+                    foreground=THEME["text"], insertcolor=THEME["text"],
+                    bordercolor=THEME["line"], lightcolor=THEME["line"],
+                    darkcolor=THEME["line"], padding=5)
+    style.configure("TCombobox", fieldbackground=THEME["panel"],
+                    background=THEME["panel"], foreground=THEME["text"],
+                    arrowcolor=THEME["muted"], bordercolor=THEME["line"],
+                    padding=4)
+    style.map("TCombobox",
+              fieldbackground=[("readonly", THEME["panel"])],
+              foreground=[("readonly", THEME["text"])])
+    style.configure("TButton", background=THEME["panel"],
+                    foreground=THEME["text"], bordercolor=THEME["line"],
+                    padding=(10, 4))
+    style.map("TButton", background=[("active", THEME["sel"])])
+    style.configure("Treeview", background=THEME["row"],
+                    fieldbackground=THEME["row"], foreground=THEME["text"],
+                    rowheight=22, borderwidth=0)
+    style.configure("Treeview.Heading", background=THEME["panel"],
+                    foreground=THEME["muted"], relief="flat", padding=(6, 5))
+    style.map("Treeview.Heading", background=[("active", THEME["line"])])
+    style.map("Treeview", background=[("selected", THEME["sel"])],
+              foreground=[("selected", THEME["text"])])
+    style.configure("Vertical.TScrollbar", background=THEME["panel"],
+                    troughcolor=THEME["bg"], bordercolor=THEME["bg"],
+                    arrowcolor=THEME["muted"])
+
+
 COLUMNS = (
     ("name", "Item", 240, "w"),
     # Shown because quality tiers are separate items with identical names -
@@ -203,22 +265,23 @@ class App:
     def __init__(self, root: tk.Tk, data: Prices, limit: int = 300):
         self.root, self.data, self.limit = root, data, limit
         self.sort_key, self.sort_desc = "supply", True
-        root.title("wowcraft - price lookup")
-        root.geometry("860x560")
-        root.minsize(620, 360)
+        root.title("wowcraft — price lookup")
+        root.geometry("900x600")
+        root.minsize(660, 380)
+        style_window(root)
 
-        top = ttk.Frame(root, padding=(8, 8, 8, 4))
+        top = ttk.Frame(root, padding=(12, 12, 12, 8))
         top.pack(fill="x")
-        ttk.Label(top, text="Search").pack(side="left")
+        ttk.Label(top, text="Search").pack(side="left", padx=(0, 8))
         self.query = tk.StringVar()
         entry = ttk.Entry(top, textvariable=self.query)
-        entry.pack(side="left", fill="x", expand=True, padx=(6, 6))
+        entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
         entry.focus_set()
         self.expansion = tk.StringVar()
         choices = ["All expansions"] + data.expansions + ["Not in any recipe"]
         picker = ttk.Combobox(top, textvariable=self.expansion, values=choices,
                               state="readonly", width=20)
-        picker.pack(side="left", padx=(0, 6))
+        picker.pack(side="left", padx=(0, 8))
         # Default to whatever the newest skill tier belongs to - Midnight now,
         # and whatever follows it later without anyone editing this.
         self.expansion.set(data.newest_expansion or "All expansions")
@@ -234,16 +297,21 @@ class App:
                              stretch=(key == "name"))
         bar = ttk.Scrollbar(root, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=bar.set)
-        self.tree.pack(side="left", fill="both", expand=True, padx=(8, 0),
-                       pady=(0, 4))
-        bar.pack(side="left", fill="y", padx=(0, 8), pady=(0, 4))
-
         self.status = tk.StringVar()
         ttk.Label(root, textvariable=self.status, anchor="w",
-                  padding=(8, 2, 8, 6)).pack(side="bottom", fill="x")
+                  style="Status.TLabel",
+                  padding=(12, 6, 12, 10)).pack(side="bottom", fill="x")
+        self.tree.pack(side="left", fill="both", expand=True, padx=(12, 0),
+                       pady=(0, 4))
+        bar.pack(side="left", fill="y", padx=(0, 12), pady=(0, 4))
 
-        self.tree.tag_configure("up", foreground="#2a8a2a")
-        self.tree.tag_configure("down", foreground="#c03030")
+        # A Treeview colours whole rows, never single cells - so tinting by
+        # trend turned every line red or green and made the table unreadable.
+        # Direction is carried by an arrow in the trend column instead, and
+        # colour is spent on the banding that lets the eye track one row
+        # across seven columns.
+        self.tree.tag_configure("odd", background=THEME["row_alt"])
+        self.tree.tag_configure("even", background=THEME["row"])
 
         # Typing filters as you go; the whole set is in memory so there is no
         # need to debounce.
@@ -326,19 +394,20 @@ class App:
     def render(self) -> None:
         rows = self.matching()
         self.tree.delete(*self.tree.get_children())
-        for r in rows[:self.limit]:
+        for index, r in enumerate(rows[:self.limit]):
             today = "-"
             if r["low"] and r["high"]:
                 today = ("steady" if abs(r["high"] - r["low"]) < 1
                          else f"{gold(r['low'])} - {gold(r['high'])}")
-            trend, tag = "-", ""
+            trend = "-"
             if r["trend"] is not None:
                 if abs(r["trend"]) < 0.5:
                     trend = "flat"
                 else:
-                    trend = f"{r['trend']:+.0f}%"
-                    tag = "up" if r["trend"] > 0 else "down"
-            self.tree.insert("", "end", iid=str(r["id"]), tags=(tag,), values=(
+                    arrow = "▲" if r["trend"] > 0 else "▼"
+                    trend = f"{arrow} {abs(r['trend']):.0f}%"
+            band = "odd" if index % 2 else "even"
+            self.tree.insert("", "end", iid=str(r["id"]), tags=(band,), values=(
                 r["name"], r["id"], gold(r["buy"]), gold(r["sell"]),
                 f"{r['supply']:,}", f"{r['listings']:,}", today, trend))
 
@@ -388,10 +457,6 @@ def main(argv=None) -> int:
 
     data = Prices(args.db)
     root = tk.Tk()
-    try:
-        ttk.Style().theme_use("vista")
-    except tk.TclError:
-        pass
     App(root, data, args.limit)
     root.mainloop()
     return 0
