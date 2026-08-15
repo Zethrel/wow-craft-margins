@@ -163,6 +163,13 @@ supply and listing counts are on the dashboard so you can judge. If you would ra
 not see them at all, `--min-listings 3` drops them (on a full scan that is about 417
 crafts).
 
+**Look up any price without opening the game.** The dashboard carries a
+searchable table of every priced item we have a name for — about 8,300 of them,
+not just the ones that appear in a craft. It opens on the deepest markets and
+searching reaches the rest, with today's range and the change across the stored
+history beside each price. That is the answer to "what is X going for" when you
+are nowhere near an auctioneer.
+
 **A reagent shopping list per expansion.** The margin table answers *what should
 I make*; the **Reagents to buy** table answers the question before it — what you
 will have to buy and whether it is cheap today. Ranked by how many recipes in

@@ -673,6 +673,26 @@ class Store:
                     "SELECT item_id, buy_low, buy_high, sell_low, sell_high "
                     "FROM price_snapshot WHERE taken_at=?", (taken_at,))}
 
+    def price_trend(self, days: int = 7) -> dict:
+        """{item_id: percent change} across the stored window.
+
+        One pass over the whole table rather than a query per item: with eight
+        thousand items on the page, per-item history lookups would take longer
+        than the scan that produced them."""
+        cutoff = day_bucket(int(time.time())) - max(0, days - 1) * 86400
+        first: dict = {}
+        last: dict = {}
+        for row in self.db.execute(
+                "SELECT item_id, taken_at, sell_unit_price FROM price_snapshot "
+                "WHERE taken_at >= ? AND sell_unit_price > 0 "
+                "ORDER BY item_id, taken_at", (cutoff,)):
+            item_id, price = row["item_id"], row["sell_unit_price"]
+            if item_id not in first:
+                first[item_id] = price
+            last[item_id] = price
+        return {i: (last[i] - first[i]) / first[i] * 100.0
+                for i in first if first[i]}
+
     def price_history(self, item_id: int, limit: int = 60) -> list:
         rows = self.db.execute(
             "SELECT taken_at, sell_unit_price FROM price_snapshot "
@@ -1424,10 +1444,13 @@ def cmd_scan(client: BlizzardClient, store: Store, cfg: dict, out_path: str,
             log(f"warn: could not write addon prices: {exc}")
 
     history = {r.recipe_id: store.margin_history(r.recipe_id) for r in results[:top]}
-    reagents = collect_reagents(recipes, prices, names, store,
-                                ranges=store.price_ranges(taken_at))
+    ranges = store.price_ranges(taken_at)
+    reagents = collect_reagents(recipes, prices, names, store, ranges=ranges)
+    item_prices = collect_item_prices(prices, names, ranges,
+                                      store.price_trend(
+                                          int(cfg.get("history_days", 7) or 7)))
     html = render_dashboard(results, cfg, taken_at, skipped, history, top, batch,
-                            store.snapshot_count(), reagents)
+                            store.snapshot_count(), reagents, item_prices)
     with open(out_path, "w", encoding="utf-8") as fh:
         fh.write(html)
     log(f"wrote {out_path}")
@@ -1570,6 +1593,46 @@ function applyFilters() {
 [search, profSel, expSel].forEach(el => el.addEventListener('input', applyFilters));
 [onlyPos, onlyFirm].forEach(el => el.addEventListener('change', applyFilters));
 
+const iSearch = document.getElementById('iq');
+const iBody = document.querySelector('#irows');
+const iRows = iBody ? Array.from(iBody.querySelectorAll('tr.irow')) : [];
+const iCount = document.getElementById('icount');
+const IPREVIEW = 150;
+function applyItemFilter() {
+  const q = iSearch.value.trim().toLowerCase();
+  let shown = 0;
+  iRows.forEach(tr => {
+    const hit = q ? tr.dataset.name.includes(q)
+                  : parseInt(tr.dataset.rank, 10) < IPREVIEW;
+    tr.hidden = !hit;
+    if (hit) shown++;
+  });
+  iCount.textContent = q
+    ? shown + ' of ' + iRows.length + ' items match'
+    : 'showing the ' + Math.min(IPREVIEW, iRows.length) + ' deepest markets of '
+      + iRows.length + ' — search to reach the rest';
+}
+if (iSearch) {
+  iSearch.addEventListener('input', applyItemFilter);
+  applyItemFilter();
+  let iDir = {};
+  document.querySelectorAll('th[data-ikey]').forEach(th => {
+    th.addEventListener('click', () => {
+      const k = th.dataset.ikey;
+      const dir = iDir[k] = -(iDir[k] || 1);
+      const sorted = iRows.slice().sort((a, b) => {
+        const x = a.dataset[k], y = b.dataset[k];
+        const nx = parseFloat(x), ny = parseFloat(y);
+        const cmp = (!isNaN(nx) && !isNaN(ny)) ? nx - ny : String(x).localeCompare(y);
+        return cmp * dir;
+      });
+      // Re-rank so the preview follows the new sort rather than the old one.
+      sorted.forEach((r, i) => { r.dataset.rank = i; iBody.appendChild(r); });
+      applyItemFilter();
+    });
+  });
+}
+
 const rSearch = document.getElementById('rq');
 const rExp = document.getElementById('rexp');
 const rBody = document.querySelector('#rrows');
@@ -1706,6 +1769,74 @@ def spread_text(low, high) -> tuple:
         return "steady", 0.0
     return (f"{copper_to_gold_str(low)}&ndash;{copper_to_gold_str(high)}",
             (high - low) / low * 100.0 if low else 0.0)
+
+
+def collect_item_prices(prices: dict, item_names: dict, ranges: dict,
+                        trend: dict) -> list:
+    """Every priced item we can name, for the searchable table.
+
+    Unnamed items are left out deliberately: eight thousand rows you can search
+    by name is a tool, and twenty thousand more reading "item 214553" is
+    padding that makes the useful ones harder to find."""
+    out = []
+    for item_id, price in prices.items():
+        name = item_names.get(item_id)
+        if not name:
+            continue
+        span = ranges.get(item_id) or (None, None, None, None)
+        out.append({
+            "item_id": item_id,
+            "name": name,
+            "buy": price.min_unit_price or 0.0,
+            "sell": price.sell_unit_price or 0.0,
+            "supply": price.total_quantity,
+            "listings": price.listing_count,
+            "range": span[:2],
+            "trend": trend.get(item_id),
+        })
+    # Deepest markets first, so the default view is the things actually traded.
+    out.sort(key=lambda r: -r["supply"])
+    return out
+
+
+def render_item_prices(items: list, preview: int = 150) -> str:
+    """The searchable price table. Rows past `preview` start hidden so the page
+    opens on the busiest markets rather than eight thousand rows; searching
+    reveals anything that matches."""
+    if not items:
+        return '<p class="cap">No prices yet. Run a scan.</p>'
+    rows = []
+    for rank, r in enumerate(items):
+        low, high = r["range"]
+        swing, pct = spread_text(low, high)
+        trend = r["trend"]
+        trend_cell = "&ndash;"
+        if trend is not None and abs(trend) >= 0.5:
+            cls = "pos" if trend > 0 else "neg"
+            trend_cell = f'<span class="{cls}">{trend:+.0f}%</span>'
+        elif trend is not None:
+            trend_cell = '<span class="meta">flat</span>'
+        rows.append(
+            f'<tr class="irow"{" hidden" if rank >= preview else ""} '
+            f'data-name="{esc(r["name"].lower())}" data-buy="{r["buy"]:.0f}" '
+            f'data-sell="{r["sell"]:.0f}" data-supply="{r["supply"]}" '
+            f'data-swing="{pct:.1f}" data-trend="{trend or 0:.1f}" '
+            f'data-rank="{rank}">'
+            f'<td>{esc(r["name"])}</td>'
+            f'<td class="num">{copper_to_gold_str(r["buy"])}</td>'
+            f'<td class="num">{copper_to_gold_str(r["sell"])}</td>'
+            f'<td class="num meta">{r["supply"]:,}</td>'
+            f'<td class="num meta">{r["listings"]:,}</td>'
+            f'<td class="num">{swing}</td>'
+            f'<td class="num">{trend_cell}</td></tr>')
+    return ('<table><thead><tr><th data-ikey="name">Item</th>'
+            '<th class="num" data-ikey="buy">Cheapest (g)</th>'
+            '<th class="num" data-ikey="sell">Realistic (g)</th>'
+            '<th class="num" data-ikey="supply">Supply</th>'
+            '<th class="num">Listings</th>'
+            '<th class="num" data-ikey="swing">Today</th>'
+            '<th class="num" data-ikey="trend">7 days</th>'
+            '</tr></thead><tbody id="irows">' + "".join(rows) + "</tbody></table>")
 
 
 def collect_reagents(recipes: list, prices: dict, item_names: dict,
@@ -1881,7 +2012,8 @@ def write_addon_prices(path: str, results: list, prices: dict, recipes: list,
 
 def render_dashboard(results: list, cfg: dict, taken_at: int, skipped: dict,
                      history: dict, top: int, batch: int,
-                     snapshots: int, reagents: Optional[list] = None) -> str:
+                     snapshots: int, reagents: Optional[list] = None,
+                     item_prices: Optional[list] = None) -> str:
     # Every headline number comes from crafts whose cost we actually know.
     # Floor-cost crafts still get a table row, but letting them set the
     # "best margin" would put a number on the page that nobody can achieve.
@@ -1998,6 +2130,8 @@ def render_dashboard(results: list, cfg: dict, taken_at: int, skipped: dict,
                    if r.skill_tier})
     reagents = reagents or []
     reagent_table = render_reagents(reagents)
+    item_prices = item_prices or []
+    item_table = render_item_prices(item_prices)
     rexp_opts = "".join(
         f'<option value="{esc(e)}">{esc(e)}</option>'
         for e in sorted({r["expansion"] for r in reagents}))
@@ -2079,6 +2213,18 @@ as leads to check in-game, not as gold in the bank. Skipped this run:
 <em>k</em> = thousand gold, <em>M</em> = million. Crafts with reagent slots are
 excluded here because their cost is only a floor{floor_chart_note}.</p>
 {render_bars(firm)}
+</div>
+<div class="card">
+<h2>Look up any price</h2>
+<p class="cap">Every one of the {len(item_prices):,} priced items we have a name
+for, from the last scan &mdash; not just the ones that appear in a craft. Type to
+search; the table opens on the busiest markets. <em>Today</em> is the range seen
+since midnight, <em>7 days</em> the change across the stored history.</p>
+<div class="controls">
+<input id="iq" type="search" placeholder="Search any item&hellip;" style="min-width:260px">
+<span class="meta" id="icount"></span>
+</div>
+{item_table}
 </div>
 <div class="card">
 <h2>Reagents to buy</h2>
