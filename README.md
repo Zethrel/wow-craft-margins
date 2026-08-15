@@ -416,13 +416,14 @@ python3 test_addon.py       # the addon's Lua, against a stubbed client
 python3 test_prices.py      # the in-game price display, against real generated data
 python3 test_inventory.py   # the inventory collector, addon Lua through to owned totals
 python3 test_trade.py       # the trade-channel watcher, including that it never sends
+python3 test_undercut.py    # the undercut helper, including that it never posts
 ```
 
 `test_addon.py` needs `lupa` (`pip install lupa`) to run the addon's Lua for
 real; without it the file skips rather than failing, so the scanner itself
 still has no third-party dependencies.
 
-304 assertions in total: the supply ladder, percentile pricing,
+319 assertions in total: the supply ladder, percentile pricing,
 troll-listing resistance, stack-price normalisation, the AH cut, every skip
 condition, crafting-rank collapsing, hourly snapshot de-duplication, init
 idempotency, and that the dashboard is genuinely self-contained — plus, for the
@@ -501,6 +502,28 @@ API-only:
 returns distinct per-quality items for gear (53 Blacksmithing and 28
 Leatherworking recipes) but the same id for every quality on consumables, so
 Alchemy and Cooking show none. Not yet modelled either way.
+
+### Undercutting at the auction house
+
+Open something to sell and a small panel appears beside the auction house
+showing what it is currently going for and what your undercut would be. **Use
+price** writes that number into the price box; you press Create Auction
+yourself.
+
+```
+/wcundercut        what it is set to
+/wcundercut 3      undercut by 3% instead of the default 5%
+/wcundercut auto   fill the box automatically, no button
+```
+
+Two deliberate limits. It reads **live listings**, not the hourly scan —
+undercutting a fifty-minute-old price is how you end up undercutting nobody,
+and the client already holds current listings for whatever you have open. And
+it **never posts**: setting an edit box is unprotected, driving the post is not,
+and that is where taint and "Interface action failed" come from. The test suite
+fails if a posting function is ever called.
+
+An item nobody has listed says so rather than inventing a price.
 
 ### Trade requests you can fill
 

@@ -12,4 +12,5 @@ PriceData.lua
 main.lua
 inventory.lua
 trade.lua
+undercut.lua
 prices.lua
