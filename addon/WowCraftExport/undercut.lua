@@ -164,6 +164,11 @@ local function apply()
     -- this deliberately stops short of it. Several shapes of money input have
     -- shipped, so try each and confirm by reading the value back rather than
     -- trusting a call that did not error to have done anything.
+    --
+    -- Measured on retail 12.1.0: the box exposes SetAmount, GetAmount,
+    -- GoldBox and SilverBox, MoneyInputFrame_SetCopper also exists, and
+    -- SetAmount is the one that takes. The other two are kept because that
+    -- is a fact about one build, not a promise about the next.
     local attempts = {
         { "SetAmount", function() box:SetAmount(suggested) end },
         { "MoneyInputFrame_SetCopper",
