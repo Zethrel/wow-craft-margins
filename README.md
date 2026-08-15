@@ -317,6 +317,12 @@ Run `doctor` first.
 | `doctor` | Probe every endpoint, write a shareable diagnostic report |
 | `names` | Look up names for every priced item that has none (one-off, ~6 min) |
 
+Blizzard allows 36,000 requests an hour. A full `init` plus a full `names` is
+most of that, so doing both in the same hour — or running two copies at once —
+earns HTTP 429s. Nothing is lost when that happens: refused items are simply
+skipped, reported separately from ones that genuinely have no name, and the
+next `names` run fetches only what is still missing.
+
 ## Price lookup (`pricecheck.py`)
 
 A small window you open and close, for "what is X going for" when you are
@@ -408,7 +414,7 @@ python3 test_trade.py       # the trade-channel watcher, including that it never
 real; without it the file skips rather than failing, so the scanner itself
 still has no third-party dependencies.
 
-299 assertions in total: the supply ladder, percentile pricing,
+303 assertions in total: the supply ladder, percentile pricing,
 troll-listing resistance, stack-price normalisation, the AH cut, every skip
 condition, crafting-rank collapsing, hourly snapshot de-duplication, init
 idempotency, and that the dashboard is genuinely self-contained — plus, for the

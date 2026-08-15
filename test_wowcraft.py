@@ -192,6 +192,52 @@ own_part = cost_from_slots(slots, sp, {}, batch=10, owned={11: 10})
 # needs 20 of item 11; half owned, so half its cost remains
 check("a partial stack is charged pro rata", round(own_part[4]), 30000)
 
+# ---- 6b. a 429 is obeyed, not guessed at -----------------------------
+# Blizzard says how long its quota lasts; a doubling backoff either sleeps far
+# longer than needed or keeps hammering a server that has said no.
+import urllib.error
+import wowcraft as _W
+
+
+class _Refusing:
+    """Refuses with 429 and a Retry-After, then succeeds."""
+
+    def __init__(self, retry_after):
+        self.retry_after, self.calls, self.slept = retry_after, 0, []
+
+    def open(self, *_a, **_k):
+        self.calls += 1
+        if self.calls == 1:
+            raise urllib.error.HTTPError(
+                "u", 429, "Too Many Requests", {"Retry-After": self.retry_after},
+                None)
+        raise urllib.error.HTTPError("u", 404, "gone", {}, None)
+
+
+def _waited(retry_after):
+    client = _W.BlizzardClient.__new__(_W.BlizzardClient)
+    client.region, client.locale = "eu", "en_GB"
+    client._token, client._token_expiry = "x", time.time() + 999
+    client._token_lock = threading.Lock()
+    client._limiter = _W.RateLimiter(1000.0)
+    refusing = _Refusing(retry_after)
+    slept = []
+    real_sleep, real_open = time.sleep, urllib.request.urlopen
+    time.sleep = lambda s: slept.append(s)
+    urllib.request.urlopen = refusing.open
+    try:
+        client.get("/data/wow/item/1", "static")
+    finally:
+        time.sleep, urllib.request.urlopen = real_sleep, real_open
+    return slept
+
+
+import threading, time, urllib.request
+check("Retry-After is obeyed", _waited("30")[0], 30.0)
+check("an absurd Retry-After is capped", _waited("99999")[0], 60.0)
+check("a missing Retry-After falls back to backoff", _waited(None)[0], 1.0)
+check("a junk Retry-After falls back to backoff", _waited("soon")[0], 1.0)
+
 # ---- 7. CLI scope helpers --------------------------------------------
 from wowcraft import _split_list, expansion_of
 

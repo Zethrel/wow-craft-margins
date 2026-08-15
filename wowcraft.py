@@ -231,7 +231,19 @@ class BlizzardClient:
                     return (None, {}) if want_headers else None
                 # 429 = rate limited, 5xx = transient. Back off and retry.
                 if exc.code in (429, 500, 502, 503, 504) and attempt < retries:
-                    time.sleep(delay)
+                    # A 429 usually carries Retry-After saying how long the
+                    # quota lasts. Guessing with a doubling backoff means
+                    # either sleeping far longer than needed or hammering a
+                    # server that has already said no; either way the honest
+                    # number is the one it gave us.
+                    wait = delay
+                    if exc.code == 429:
+                        told = (exc.headers or {}).get("Retry-After")
+                        try:
+                            wait = max(delay, min(60.0, float(told)))
+                        except (TypeError, ValueError):
+                            pass
+                    time.sleep(wait)
                     delay *= 2
                     continue
                 raise ApiError(f"HTTP {exc.code} for {path}: {exc.reason}") from exc
@@ -2320,11 +2332,19 @@ def cmd_names(client: BlizzardClient, store: Store, cfg: dict) -> None:
         "quality=excluded.quality, level=excluded.level", rows)
     store.db.commit()
     log(f"named {len(rows):,} items")
-    absent = len(missing) - len(rows)
-    if absent:
-        log(f"note: {absent:,} returned nothing at all -- items removed from "
-            "the game whose ids linger on old listings. Left as raw ids "
-            "rather than given an invented label.")
+    # Anything the server refused rather than answered is worth separating
+    # from anything that genuinely has no name: the first is worth retrying,
+    # the second never will be.
+    refused = len(missing) - len(payloads)
+    empty = len(payloads) - len(rows)
+    if empty:
+        log(f"note: {empty:,} returned no name -- items removed from the game "
+            "whose ids linger on old listings. Left as raw ids rather than "
+            "given an invented label.")
+    if refused:
+        log(f"note: {refused:,} were not answered at all, usually Blizzard's "
+            "hourly request quota. Nothing is lost -- run `names` again later "
+            "and it will fetch only those.")
 
 
 def cmd_doctor(client: BlizzardClient, store: Store, cfg: dict,
