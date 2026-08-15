@@ -58,63 +58,134 @@ end
 
 -- -- what is it selling for right now ---------------------------------------
 
-local function itemBeingSold()
-    -- The sell frame moved between expansions, so try what exists rather than
-    -- assuming one path.
+local function sellPages()
     local frame = AuctionHouseFrame
-    if not frame then return nil end
-    for _, page in ipairs({ frame.CommoditiesSellFrame, frame.ItemSellFrame }) do
+    if not frame then return {} end
+    return { { frame.CommoditiesSellFrame, "commodity" },
+             { frame.ItemSellFrame, "item" } }
+end
+
+-- Returns itemID, page, kind, itemKey.
+--
+-- The item key matters for gear and not at all for commodities. A commodity
+-- is one thing with one price; a piece of gear is an item id PLUS its item
+-- level and bonus ids, and two rings sharing an id can be different items at
+-- different prices. Looking up listings by bare item id would compare your
+-- 691 against someone else's 675. So take the key the sell frame is already
+-- holding wherever it offers one.
+local function itemBeingSold()
+    for _, entry in ipairs(sellPages()) do
+        local page, kind = entry[1], entry[2]
         if page and page:IsShown() then
-            local ok, item = pcall(function()
-                return page:GetItem() or page.itemLocation
-            end)
-            if ok and item then return item, page end
+            local itemID, itemKey
+            local display = page.ItemDisplay
+            if display then
+                pcall(function()
+                    if display.GetItemKey then itemKey = display:GetItemKey() end
+                end)
+                pcall(function()
+                    if display.GetItemID then itemID = display:GetItemID() end
+                end)
+            end
+            if type(itemKey) == "table" and itemKey.itemID then
+                itemID = itemID or itemKey.itemID
+            end
+            if not itemID then
+                -- Older shapes: an item location we resolve ourselves.
+                pcall(function()
+                    local loc = (page.GetItem and page:GetItem())
+                                or page.itemLocation
+                    if type(loc) == "number" then
+                        itemID = loc
+                    elseif type(loc) == "table" and loc.id then
+                        itemID = loc.id
+                    elseif loc and C_Item and C_Item.GetItemID then
+                        itemID = C_Item.GetItemID(loc)
+                    end
+                end)
+            end
+            if itemID and not issecretvalue(itemID) then
+                return itemID, page, kind, itemKey
+            end
         end
     end
     return nil
 end
 
-local function lowestListing(itemID)
-    if not itemID or type(C_AuctionHouse) ~= "table" then return nil end
-    -- Commodities first: one call, already populated for the open item.
-    if C_AuctionHouse.GetCommoditySearchResultsQuantity
-            and C_AuctionHouse.GetCommoditySearchResultInfo then
-        local ok, count = pcall(C_AuctionHouse.GetCommoditySearchResultsQuantity,
-                                itemID)
-        if ok and (count or 0) > 0 then
-            local ok2, info = pcall(C_AuctionHouse.GetCommoditySearchResultInfo,
-                                    itemID, 1)
-            if ok2 and type(info) == "table" and info.unitPrice then
-                return info.unitPrice, info.quantity, "commodity"
-            end
-        end
+local function commodityLowest(itemID)
+    if type(C_AuctionHouse.GetCommoditySearchResultsQuantity) ~= "function"
+            or type(C_AuctionHouse.GetCommoditySearchResultInfo) ~= "function" then
+        return nil
     end
-    -- Gear and other non-stackables.
-    if C_AuctionHouse.GetNumItemSearchResults
-            and C_AuctionHouse.GetItemSearchResultInfo then
-        local key = C_AuctionHouse.MakeItemKey and C_AuctionHouse.MakeItemKey(itemID)
-        if key then
-            local ok, count = pcall(C_AuctionHouse.GetNumItemSearchResults, key)
-            if ok and (count or 0) > 0 then
-                local ok2, info = pcall(C_AuctionHouse.GetItemSearchResultInfo,
-                                        key, 1)
-                if ok2 and type(info) == "table" then
-                    local price = info.buyoutAmount or info.bidAmount
-                    if price then return price, 1, "item" end
-                end
-            end
-        end
+    local ok, count = pcall(C_AuctionHouse.GetCommoditySearchResultsQuantity,
+                            itemID)
+    if not ok or (count or 0) <= 0 then return nil end
+    -- Commodity results arrive sorted by unit price, so the first one is the
+    -- price to beat.
+    local ok2, info = pcall(C_AuctionHouse.GetCommoditySearchResultInfo, itemID, 1)
+    if ok2 and type(info) == "table" and info.unitPrice then
+        return info.unitPrice, info.quantity, "commodity"
     end
     return nil
+end
+
+local function itemLowest(itemID, itemKey)
+    if type(C_AuctionHouse.GetNumItemSearchResults) ~= "function"
+            or type(C_AuctionHouse.GetItemSearchResultInfo) ~= "function" then
+        return nil
+    end
+    local key = itemKey
+    if type(key) ~= "table" and C_AuctionHouse.MakeItemKey then
+        local ok, made = pcall(C_AuctionHouse.MakeItemKey, itemID)
+        if ok then key = made end
+    end
+    if type(key) ~= "table" then return nil end
+
+    local ok, count = pcall(C_AuctionHouse.GetNumItemSearchResults, key)
+    if not ok or (count or 0) <= 0 then return nil end
+
+    -- Unlike commodities, item results are not guaranteed cheapest-first: the
+    -- order follows whichever column was last sorted on. So take the minimum
+    -- rather than trusting index 1. Bid-only listings are skipped, because a
+    -- price nobody can buy at is not a price to undercut.
+    local best, seen = nil, 0
+    for i = 1, math.min(count, 50) do
+        local ok2, info = pcall(C_AuctionHouse.GetItemSearchResultInfo, key, i)
+        if ok2 and type(info) == "table" then
+            local price = info.buyoutAmount
+            if price and price > 0 and not issecretvalue(price) then
+                seen = seen + 1
+                if not best or price < best then best = price end
+            end
+        end
+    end
+    if best then return best, seen, "item" end
+    return nil
+end
+
+local function lowestListing(itemID, kind, itemKey)
+    if not itemID or type(C_AuctionHouse) ~= "table" then return nil end
+    if kind == "item" then
+        return itemLowest(itemID, itemKey)
+    end
+    -- Which sell frame is open is a good hint, not a guarantee, so fall back.
+    -- Written out rather than `return a() or b()`, because `or` truncates a
+    -- multiple-return call to its first value and would silently drop the
+    -- quantity and the kind.
+    local price, qty, listingKind = commodityLowest(itemID)
+    if price then return price, qty, listingKind end
+    return itemLowest(itemID, itemKey)
 end
 
 local function priceBox()
-    local frame = AuctionHouseFrame
-    if not frame then return nil end
-    for _, page in ipairs({ frame.CommoditiesSellFrame, frame.ItemSellFrame }) do
+    for _, entry in ipairs(sellPages()) do
+        local page = entry[1]
         if page and page:IsShown() then
-            local box = page.PriceInput or page.BuyoutPriceInput
-            -- The money input is usually a container with a gold field inside.
+            -- A commodity has one price. Gear has a starting bid AND a
+            -- buyout, and it is the buyout people shop on, so prefer that
+            -- and never write into the bid field by accident.
+            local box = page.BuyoutPriceInput or page.PriceInput
+                        or page.BuyoutInput
             if box then
                 return box.MoneyInputFrame or box, page
             end
@@ -212,25 +283,14 @@ end
 
 local function refresh()
     if not panel then return end
-    local item, page = itemBeingSold()
-    if not item or not page then
-        panel:Hide()
-        return
-    end
-    local itemID
-    local ok, got = pcall(function()
-        if type(item) == "number" then return item end
-        if C_Item and C_Item.GetItemID then return C_Item.GetItemID(item) end
-        return nil
-    end)
-    if ok then itemID = got end
-    if not itemID or issecretvalue(itemID) then
+    local itemID, page, kind, itemKey = itemBeingSold()
+    if not itemID or not page then
         panel:Hide()
         return
     end
 
     currentItem = itemID
-    local lowest, qty, kind = lowestListing(itemID)
+    local lowest, qty, listingKind = lowestListing(itemID, kind, itemKey)
     if not lowest then
         lowestText:SetText("|cff808080nothing listed - name your price|r")
         priceText:SetText("")
@@ -244,7 +304,8 @@ local function refresh()
     suggested = toSilver(lowest * (1 - pct / 100))
     lowestText:SetText(string.format(
         "lowest listed: |cffffd100%s|r%s", money(lowest),
-        (kind == "commodity" and qty) and string.format(" (%d up)", qty) or ""))
+        (qty and listingKind == "commodity") and string.format(" (%d up)", qty)
+        or (qty and qty > 1) and string.format(" (%d listed)", qty) or ""))
     priceText:SetText(string.format("undercut %.1f%%: |cff66dd66%s|r",
                                     pct, money(suggested)))
     applyButton:Enable()

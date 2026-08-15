@@ -132,6 +132,51 @@ must("an unlisted item says so instead of guessing",
      "nothing listed" in blob)
 must("still no posting attempted", len(list(lua.eval("posted").values())) == 0)
 
+# --- the item sell frame -------------------------------------------------
+# Gear differs from commodities in three ways that all matter: it is keyed by
+# item level and bonuses rather than bare item id, its results are not sorted
+# cheapest-first, and it has a bid field alongside the buyout.
+GEAR = """
+C_AuctionHouse.GetCommoditySearchResultsQuantity = function() return 0 end
+C_AuctionHouse.GetNumItemSearchResults = function(key)
+  return (key and key.itemID == 244591) and 4 or 0 end
+local listings = { {buyoutAmount=980000}, {buyoutAmount=0, bidAmount=1},
+                   {buyoutAmount=610000}, {buyoutAmount=750000} }
+C_AuctionHouse.GetItemSearchResultInfo = function(key, i) return listings[i] end
+AuctionHouseFrame.CommoditiesSellFrame.shown = false
+local gear = setmetatable({}, getmetatable(AuctionHouseFrame))
+gear.ItemDisplay = { GetItemKey=function() return {itemID=244591, itemLevel=691} end }
+gear.BuyoutPriceInput = { SetAmount=function(_, v) boxValue=v end,
+                          GetAmount=function() return boxValue end }
+AuctionHouseFrame.ItemSellFrame = gear
+"""
+
+gearLua = lupa.LuaRuntime(unpack_returned_tuples=True)
+gearLua.execute(PRELUDE)
+gearLua.execute(GEAR)
+gearLua.eval("function(s) return assert(load(s,'undercut.lua')) end")(
+    open(ADDON, encoding="utf-8").read())()
+gearLua.eval("FireEvent")("AUCTION_HOUSE_SHOW")
+
+gear_text = " ".join(f["txt"] for f in gearLua.eval("strings").values() if f["txt"])
+must("gear frame shows a price at all", "lowest listed" in gear_text)
+must("takes the cheapest buyout, not the first result", "61g 0s" in gear_text)
+must("ignores a bid-only listing", "0g 1s" not in gear_text)
+must("counts the buyable listings", "(3 listed)" in gear_text)
+must("undercuts from the cheapest", "57g 95s" in gear_text)
+
+gear_button = None
+for f in gearLua.eval("frames").values():
+    if f["txt"] == "Use price" and f["OnClick"] is not None:
+        gear_button = f
+        break
+if gear_button is not None:
+    gear_button["OnClick"](gear_button)
+must("writes into the buyout box, never a bid box",
+     gearLua.eval("boxValue") == 579500)
+must("gear frame never posts either",
+     len(list(gearLua.eval("posted").values())) == 0)
+
 print()
 print("ALL PASS" if not fails else f"{len(fails)} FAILURES: {fails}")
 sys.exit(1 if fails else 0)

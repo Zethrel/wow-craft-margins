@@ -423,7 +423,7 @@ python3 test_undercut.py    # the undercut helper, including that it never posts
 real; without it the file skips rather than failing, so the scanner itself
 still has no third-party dependencies.
 
-321 assertions in total: the supply ladder, percentile pricing,
+328 assertions in total: the supply ladder, percentile pricing,
 troll-listing resistance, stack-price normalisation, the AH cut, every skip
 condition, crafting-rank collapsing, hourly snapshot de-duplication, init
 idempotency, and that the dashboard is genuinely self-contained — plus, for the
@@ -522,6 +522,14 @@ and the client already holds current listings for whatever you have open. And
 it **never posts**: setting an edit box is unprotected, driving the post is not,
 and that is where taint and "Interface action failed" come from. The test suite
 fails if a posting function is ever called.
+
+It works on both sell frames, but gear is not commodities and is handled
+differently in three ways that all matter. Listings are looked up by the sell
+frame's own **item key**, not by bare item id, so your 691 is not compared
+against someone else's 675. Item results are **not** sorted cheapest-first the
+way commodity ones are, so the minimum is taken rather than the first row. And
+bid-only listings are ignored — a price nobody can buy at is not a price to
+undercut. The number is written into the **buyout** box, never the starting bid.
 
 An item nobody has listed says so rather than inventing a price.
 
