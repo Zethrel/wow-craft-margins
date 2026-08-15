@@ -94,8 +94,7 @@ Linux/macOS cron, hourly:
 Windows: use the included `run-scan.cmd` rather than calling Python directly.
 
 ```powershell
-$cmd = "D:\path	o\wow-craft-margins
-un-scan.cmd"
+$cmd = "D:\path\to\wow-craft-margins\run-scan.cmd"
 $action = New-ScheduledTaskAction -Execute $cmd -WorkingDirectory (Split-Path $cmd)
 $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).Date.AddMinutes(5) `
            -RepetitionInterval (New-TimeSpan -Hours 1)
