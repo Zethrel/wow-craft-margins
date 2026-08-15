@@ -673,6 +673,21 @@ class Store:
                     "SELECT item_id, buy_low, buy_high, sell_low, sell_high "
                     "FROM price_snapshot WHERE taken_at=?", (taken_at,))}
 
+    def newest_expansion(self) -> str:
+        """The expansion the newest cached skill tier belongs to.
+
+        Read from the data rather than named in the source, so the dashboard
+        opens on current content after the next expansion lands without anyone
+        editing anything."""
+        row = self.db.execute(
+            "SELECT skill_tier_name, profession_name FROM recipe "
+            "WHERE skill_tier_id IS NOT NULL "
+            "ORDER BY skill_tier_id DESC LIMIT 1").fetchone()
+        if not row:
+            return ""
+        return expansion_of(row["skill_tier_name"] or "",
+                            row["profession_name"] or "")
+
     def price_trend(self, days: int = 7) -> dict:
         """{item_id: percent change} across the stored window.
 
@@ -1447,7 +1462,8 @@ def cmd_scan(client: BlizzardClient, store: Store, cfg: dict, out_path: str,
     ranges = store.price_ranges(taken_at)
     reagents = collect_reagents(recipes, prices, names, store, ranges=ranges)
     html = render_dashboard(results, cfg, taken_at, skipped, history, top, batch,
-                            store.snapshot_count(), reagents)
+                            store.snapshot_count(), reagents,
+                            store.newest_expansion())
     with open(out_path, "w", encoding="utf-8") as fh:
         fh.write(html)
     log(f"wrote {out_path}")
@@ -1604,6 +1620,7 @@ function applyReagentFilters() {
 }
 if (rSearch) {
   [rSearch, rExp].forEach(el => el.addEventListener('input', applyReagentFilters));
+  applyReagentFilters();   // honour the expansion the page opened on
   let rDir = {};
   document.querySelectorAll('th[data-rkey]').forEach(th => {
     th.addEventListener('click', () => {
@@ -1969,7 +1986,8 @@ def write_addon_prices(path: str, results: list, prices: dict, recipes: list,
 
 def render_dashboard(results: list, cfg: dict, taken_at: int, skipped: dict,
                      history: dict, top: int, batch: int,
-                     snapshots: int, reagents: Optional[list] = None) -> str:
+                     snapshots: int, reagents: Optional[list] = None,
+                     default_expansion: str = "") -> str:
     # Every headline number comes from crafts whose cost we actually know.
     # Floor-cost crafts still get a table row, but letting them set the
     # "best margin" would put a number on the page that nobody can achieve.
@@ -2086,9 +2104,16 @@ def render_dashboard(results: list, cfg: dict, taken_at: int, skipped: dict,
                    if r.skill_tier})
     reagents = reagents or []
     reagent_table = render_reagents(reagents)
+    # Opens on current content, because that is what you are usually shopping
+    # for; "All expansions" is one click away.
+    reagent_expansions = sorted({r["expansion"] for r in reagents})
+    if default_expansion not in reagent_expansions:
+        default_expansion = ""
     rexp_opts = "".join(
-        f'<option value="{esc(e)}">{esc(e)}</option>'
-        for e in sorted({r["expansion"] for r in reagents}))
+        f'<option value="{esc(e)}"'
+        + (" selected" if e == default_expansion else "")
+        + f">{esc(e)}</option>"
+        for e in reagent_expansions)
     exp_opts = "".join(f'<option value="{esc(e)}">{esc(e)}</option>' for e in exps)
 
     collapsed = skipped.get("quality_variants_collapsed", 0)

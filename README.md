@@ -167,7 +167,9 @@ I make*; the **Reagents to buy** table answers the question before it — what y
 will have to buy and whether it is cheap today. Ranked by how many recipes in
 that expansion use it, so staples come first rather than whatever is dearest,
 with supply, listing count and a price sparkline. Required reagents only:
-optional slots are a choice, not a shopping list.
+optional slots are a choice, not a shopping list. It opens on the current
+expansion — read from the newest cached skill tier, not named in the source, so
+it follows the game — with the other eleven a click away.
 
 **History is one row per item per day, kept for a week.** Scanning hourly does
 not give you a hundred and sixty-eight points; it gives you seven, each refined
