@@ -341,9 +341,17 @@ python3 pricecheck.py
 ```
 
 or double-click `pricecheck.cmd` on Windows, which launches it with `pythonw`
-so no console sits behind it. It reads `wowcraft.sqlite3` directly, so it shows
-whatever the last scan wrote — **Refresh** picks up a newer one without
-restarting.
+so no console sits behind it. It reads `wowcraft.sqlite3` directly and **keeps
+itself current**: every thirty seconds it checks whether the scan has written,
+reloads if so, and says which scan it picked up. Leave it open on a second
+monitor and the numbers stay live without you touching anything. **Refresh**
+forces it early.
+
+Your search, expansion and sort survive a refresh, a database locked by a scan
+mid-write is ridden out rather than blanking the window, and the "prices from"
+age is redrawn on the same timer — an age that freezes is worse than no age at
+all, since the whole point of stamping it is to stop stale numbers passing for
+current ones.
 
 Run `python3 wowcraft.py names` once after your first scan. `init` only names
 what recipes reference, which leaves most of the auction house showing as bare
@@ -417,13 +425,14 @@ python3 test_prices.py      # the in-game price display, against real generated 
 python3 test_inventory.py   # the inventory collector, addon Lua through to owned totals
 python3 test_trade.py       # the trade-channel watcher, including that it never sends
 python3 test_undercut.py    # the undercut helper, including that it never posts
+python3 test_pricecheck.py  # the lookup window, including picking up a scan while open
 ```
 
 `test_addon.py` needs `lupa` (`pip install lupa`) to run the addon's Lua for
 real; without it the file skips rather than failing, so the scanner itself
 still has no third-party dependencies.
 
-328 assertions in total: the supply ladder, percentile pricing,
+339 assertions in total: the supply ladder, percentile pricing,
 troll-listing resistance, stack-price normalisation, the AH cut, every skip
 condition, crafting-rank collapsing, hourly snapshot de-duplication, init
 idempotency, and that the dashboard is genuinely self-contained — plus, for the

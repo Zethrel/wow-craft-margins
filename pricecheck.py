@@ -71,13 +71,30 @@ class Prices:
         self.history: dict = {}
         self.expansions: list = []
         self.newest_expansion = ""
+        self.stamp = None          # file mtime+size when we last read it
         self.load()
+
+    def changed_on_disk(self) -> bool:
+        """Has the scan written since we last read?
+
+        Cheaper than reopening the database on a timer, and it does not matter
+        if it is momentarily wrong: the next tick catches it."""
+        try:
+            info = os.stat(self.db_path)
+        except OSError:
+            return False
+        return (info.st_mtime, info.st_size) != self.stamp
 
     def load(self) -> None:
         if not os.path.exists(self.db_path):
             raise SystemExit(
                 f"No database at {self.db_path}.\n"
                 "Run `python wowcraft.py scan` first, or pass --db.")
+        try:
+            info = os.stat(self.db_path)
+            self.stamp = (info.st_mtime, info.st_size)
+        except OSError:
+            self.stamp = None
         db = sqlite3.connect(self.db_path)
         db.row_factory = sqlite3.Row
         row = db.execute("SELECT MAX(taken_at) AS t FROM price_snapshot").fetchone()
@@ -230,11 +247,13 @@ class App:
 
         # Typing filters as you go; the whole set is in memory so there is no
         # need to debounce.
+        self.refreshed_at = None
         self.query.trace_add("write", lambda *_: self.render())
         self.tree.bind("<<TreeviewSelect>>", self.show_history)
         root.bind("<Escape>", lambda _e: (self.query.set(""), entry.focus_set()))
         root.bind("<Control-f>", lambda _e: entry.focus_set())
         self.render()
+        self.tick()
 
     # -- data ------------------------------------------------------------
 
@@ -270,13 +289,37 @@ class App:
             self.sort_key, self.sort_desc = key, key != "name"
         self.render()
 
-    def refresh(self) -> None:
+    def refresh(self, automatic: bool = False) -> None:
         try:
             self.data.load()
         except SystemExit as exc:
             self.status.set(str(exc))
             return
+        except sqlite3.OperationalError:
+            # The scan is mid-write and holding the file. Nothing to do but
+            # come back on the next tick; the old numbers stay on screen
+            # rather than the window blanking.
+            return
+        self.refreshed_at = time.time() if automatic else None
         self.render()
+
+    def tick(self) -> None:
+        """Pick up a new scan on its own, and keep the age honest.
+
+        The hourly task rewrites the database underneath this window. Polling
+        the file's mtime every half minute costs nothing and means the numbers
+        on screen are never quietly an hour old - which is exactly the failure
+        the age stamp exists to prevent, so leaving it to a button would have
+        been half a job."""
+        try:
+            if self.data.changed_on_disk():
+                self.refresh(automatic=True)
+            else:
+                # Even with no new data the age is ticking, so redraw the
+                # status line rather than letting it read "2m ago" forever.
+                self.status_line()
+        finally:
+            self.root.after(30_000, self.tick)
 
     # -- view ------------------------------------------------------------
 
@@ -299,15 +342,24 @@ class App:
                 r["name"], r["id"], gold(r["buy"]), gold(r["sell"]),
                 f"{r['supply']:,}", f"{r['listings']:,}", today, trend))
 
-        shown = min(len(rows), self.limit)
-        more = f" (showing {shown})" if len(rows) > self.limit else ""
+        self.shown_count = min(len(rows), self.limit)
+        self.match_count = len(rows)
+        self.status_line()
+
+    def status_line(self) -> None:
+        more = (f" (showing {self.shown_count})"
+                if self.match_count > self.shown_count else "")
         where = self.expansion.get()
         scope = "" if where in ("", "All expansions") else f" in {where}"
+        note = "updates itself"
+        if self.refreshed_at and time.time() - self.refreshed_at < 120:
+            note = ("picked up a new scan "
+                    + time.strftime("%H:%M", time.localtime(self.refreshed_at)))
         self.status.set(
-            f"{len(rows):,} of {len(self.data.rows):,} items{scope}{more}   |   "
-            f"prices from "
+            f"{self.match_count:,} of {len(self.data.rows):,} items{scope}{more}"
+            f"   |   prices from "
             f"{time.strftime('%d %b %H:%M', time.localtime(self.data.data_time))}"
-            f", {age(self.data.data_time)}   |   Refresh after a scan")
+            f", {age(self.data.data_time)}   |   {note}")
 
     def show_history(self, _event=None) -> None:
         selected = self.tree.selection()
