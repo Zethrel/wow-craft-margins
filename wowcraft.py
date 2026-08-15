@@ -1446,11 +1446,8 @@ def cmd_scan(client: BlizzardClient, store: Store, cfg: dict, out_path: str,
     history = {r.recipe_id: store.margin_history(r.recipe_id) for r in results[:top]}
     ranges = store.price_ranges(taken_at)
     reagents = collect_reagents(recipes, prices, names, store, ranges=ranges)
-    item_prices = collect_item_prices(prices, names, ranges,
-                                      store.price_trend(
-                                          int(cfg.get("history_days", 7) or 7)))
     html = render_dashboard(results, cfg, taken_at, skipped, history, top, batch,
-                            store.snapshot_count(), reagents, item_prices)
+                            store.snapshot_count(), reagents)
     with open(out_path, "w", encoding="utf-8") as fh:
         fh.write(html)
     log(f"wrote {out_path}")
@@ -1592,46 +1589,6 @@ function applyFilters() {
 }
 [search, profSel, expSel].forEach(el => el.addEventListener('input', applyFilters));
 [onlyPos, onlyFirm].forEach(el => el.addEventListener('change', applyFilters));
-
-const iSearch = document.getElementById('iq');
-const iBody = document.querySelector('#irows');
-const iRows = iBody ? Array.from(iBody.querySelectorAll('tr.irow')) : [];
-const iCount = document.getElementById('icount');
-const IPREVIEW = 150;
-function applyItemFilter() {
-  const q = iSearch.value.trim().toLowerCase();
-  let shown = 0;
-  iRows.forEach(tr => {
-    const hit = q ? tr.dataset.name.includes(q)
-                  : parseInt(tr.dataset.rank, 10) < IPREVIEW;
-    tr.hidden = !hit;
-    if (hit) shown++;
-  });
-  iCount.textContent = q
-    ? shown + ' of ' + iRows.length + ' items match'
-    : 'showing the ' + Math.min(IPREVIEW, iRows.length) + ' deepest markets of '
-      + iRows.length + ' — search to reach the rest';
-}
-if (iSearch) {
-  iSearch.addEventListener('input', applyItemFilter);
-  applyItemFilter();
-  let iDir = {};
-  document.querySelectorAll('th[data-ikey]').forEach(th => {
-    th.addEventListener('click', () => {
-      const k = th.dataset.ikey;
-      const dir = iDir[k] = -(iDir[k] || 1);
-      const sorted = iRows.slice().sort((a, b) => {
-        const x = a.dataset[k], y = b.dataset[k];
-        const nx = parseFloat(x), ny = parseFloat(y);
-        const cmp = (!isNaN(nx) && !isNaN(ny)) ? nx - ny : String(x).localeCompare(y);
-        return cmp * dir;
-      });
-      // Re-rank so the preview follows the new sort rather than the old one.
-      sorted.forEach((r, i) => { r.dataset.rank = i; iBody.appendChild(r); });
-      applyItemFilter();
-    });
-  });
-}
 
 const rSearch = document.getElementById('rq');
 const rExp = document.getElementById('rexp');
@@ -2012,8 +1969,7 @@ def write_addon_prices(path: str, results: list, prices: dict, recipes: list,
 
 def render_dashboard(results: list, cfg: dict, taken_at: int, skipped: dict,
                      history: dict, top: int, batch: int,
-                     snapshots: int, reagents: Optional[list] = None,
-                     item_prices: Optional[list] = None) -> str:
+                     snapshots: int, reagents: Optional[list] = None) -> str:
     # Every headline number comes from crafts whose cost we actually know.
     # Floor-cost crafts still get a table row, but letting them set the
     # "best margin" would put a number on the page that nobody can achieve.
@@ -2130,8 +2086,6 @@ def render_dashboard(results: list, cfg: dict, taken_at: int, skipped: dict,
                    if r.skill_tier})
     reagents = reagents or []
     reagent_table = render_reagents(reagents)
-    item_prices = item_prices or []
-    item_table = render_item_prices(item_prices)
     rexp_opts = "".join(
         f'<option value="{esc(e)}">{esc(e)}</option>'
         for e in sorted({r["expansion"] for r in reagents}))
@@ -2213,18 +2167,6 @@ as leads to check in-game, not as gold in the bank. Skipped this run:
 <em>k</em> = thousand gold, <em>M</em> = million. Crafts with reagent slots are
 excluded here because their cost is only a floor{floor_chart_note}.</p>
 {render_bars(firm)}
-</div>
-<div class="card">
-<h2>Look up any price</h2>
-<p class="cap">Every one of the {len(item_prices):,} priced items we have a name
-for, from the last scan &mdash; not just the ones that appear in a craft. Type to
-search; the table opens on the busiest markets. <em>Today</em> is the range seen
-since midnight, <em>7 days</em> the change across the stored history.</p>
-<div class="controls">
-<input id="iq" type="search" placeholder="Search any item&hellip;" style="min-width:260px">
-<span class="meta" id="icount"></span>
-</div>
-{item_table}
 </div>
 <div class="card">
 <h2>Reagents to buy</h2>

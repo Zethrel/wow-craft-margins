@@ -163,13 +163,6 @@ supply and listing counts are on the dashboard so you can judge. If you would ra
 not see them at all, `--min-listings 3` drops them (on a full scan that is about 417
 crafts).
 
-**Look up any price without opening the game.** The dashboard carries a
-searchable table of every priced item we have a name for — about 8,300 of them,
-not just the ones that appear in a craft. It opens on the deepest markets and
-searching reaches the rest, with today's range and the change across the stored
-history beside each price. That is the answer to "what is X going for" when you
-are nowhere near an auctioneer.
-
 **A reagent shopping list per expansion.** The margin table answers *what should
 I make*; the **Reagents to buy** table answers the question before it — what you
 will have to buy and whether it is cheap today. Ranked by how many recipes in
@@ -315,6 +308,31 @@ Run `doctor` first.
 | `scan` | Fetch auctions, compute margins, write the dashboard |
 | `demo` | Run the whole pipeline on synthetic data, no credentials |
 | `doctor` | Probe every endpoint, write a shareable diagnostic report |
+
+## Price lookup (`pricecheck.py`)
+
+A small window you open and close, for "what is X going for" when you are
+nowhere near an auctioneer.
+
+```bash
+python3 pricecheck.py
+```
+
+or double-click `pricecheck.cmd` on Windows, which launches it with `pythonw`
+so no console sits behind it. It reads `wowcraft.sqlite3` directly, so it shows
+whatever the last scan wrote — **Refresh** picks up a newer one without
+restarting.
+
+All 29,000-odd priced items, searchable by name or item id, sortable, with
+today's range and the trend across the stored history. Unnamed items are kept
+here (unlike the dashboard) because you can search them by id. The **ID** column
+matters more than it looks: quality tiers are separate items with identical
+names, so two `Void-Tempered Leather` rows at different prices are correct, not
+a duplicate.
+
+This deliberately is not part of the dashboard. That is a report you glance at;
+eight thousand searchable rows made it a four megabyte page that would not
+load.
 
 Useful flags: `--batch N` (crafts per batch, default 20), `--top N` (dashboard rows,
 default 200), `--min-listings N` (optional liquidity floor, default 1 = price
