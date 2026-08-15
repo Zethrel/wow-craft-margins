@@ -270,6 +270,10 @@ with contextlib.redirect_stdout(buf):
                out4, batch=5, top=50)
 html4 = open(out4).read()
 must("scoped scan says so on the page", "scoped to Midnight" in html4)
+must("the table opens on an expansion rather than everything",
+     'value="Midnight" selected' in html4)
+must("the opening filter is actually applied",
+     "applyFilters();" in html4)
 must("expansion dropdown built", 'id="exp"' in html4 and ">Midnight<" in html4)
 must("scoped page omits the other tier", ">Shadowlands<" not in html4)
 

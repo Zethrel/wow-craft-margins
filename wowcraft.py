@@ -57,6 +57,11 @@ MAX_WORKERS = 16
 # The auction house takes a 5% cut of the sale price.
 AH_CUT = 0.05
 
+# Rows per expansion guaranteed a place in the dashboard table, on top of the
+# global top-by-margin. Without this, filtering to current content shows almost
+# nothing, because old-world crafts win the ranking outright.
+EXPANSION_SLICE = 25
+
 # How a recipe's output item was determined.
 #   CRAFTED_API    - Blizzard told us, via crafted_item. Trustworthy.
 #   CRAFTED_NAME   - matched by name; exactly one item in the game bears the
@@ -1605,6 +1610,7 @@ function applyFilters() {
 }
 [search, profSel, expSel].forEach(el => el.addEventListener('input', applyFilters));
 [onlyPos, onlyFirm].forEach(el => el.addEventListener('change', applyFilters));
+applyFilters();   // honour the expansion the page opened on
 
 const rSearch = document.getElementById('rq');
 const rExp = document.getElementById('rexp');
@@ -1999,7 +2005,26 @@ def render_dashboard(results: list, cfg: dict, taken_at: int, skipped: dict,
     # Built from the rows the table actually renders, not from every result.
     # Offering a filter that selects nothing because its crafts fell outside
     # --top reads as a broken page.
-    shown = results[:top]
+    #
+    # Top-by-margin alone is not enough once the table can be filtered by
+    # expansion: old-world gear dominates the ranking, so the top 200 held
+    # three Midnight crafts out of ~350 priced. Each expansion therefore gets
+    # a guaranteed slice as well, so every choice in the dropdown has real
+    # content behind it.
+    shown = list(results[:top])
+    seen = {r.recipe_id for r in shown}
+    per_expansion: dict = {}
+    for r in results:
+        if r.recipe_id in seen:
+            continue
+        key = expansion_of(r.skill_tier, r.profession)
+        holding = per_expansion.setdefault(key, [])
+        if len(holding) < EXPANSION_SLICE:
+            holding.append(r)
+            seen.add(r.recipe_id)
+    for extra in per_expansion.values():
+        shown += extra
+    shown.sort(key=lambda x: (x.cost_complete, x.margin), reverse=True)
     profs = sorted({r.profession for r in shown if r.profession})
 
     tiles = [
@@ -2021,7 +2046,9 @@ def render_dashboard(results: list, cfg: dict, taken_at: int, skipped: dict,
         for l, v, n in tiles)
 
     rows_html = []
-    for i, r in enumerate(results[:top], 1):
+    # `shown`, not results[:top]: it carries the per-expansion slice as well,
+    # so filtering to current content finds something to show.
+    for i, r in enumerate(shown, 1):
         cls = "pos" if r.margin > 0 else "neg"
         # Several crafting quality ranks share one crafted_item id in the API.
         # Flag collapsed rows so the number is not mistaken for a single recipe.
@@ -2095,13 +2122,16 @@ def render_dashboard(results: list, cfg: dict, taken_at: int, skipped: dict,
             f'<div class="reagents">{reagent_bill}</div></details></td></tr>')
 
     prof_opts = "".join(f'<option value="{esc(p)}">{esc(p)}</option>' for p in profs)
+    craft_expansions = sorted({expansion_of(r.skill_tier, r.profession)
+                               for r in shown if r.skill_tier})
+    craft_default = (default_expansion if default_expansion in craft_expansions
+                     else "")
     # Say what this scan covered, so a --tier-narrowed page cannot be mistaken
     # for a view of everything you have cached.
     filters = (cfg.get("skill_tiers") or []) + (cfg.get("professions") or [])
     scope_txt = ("scoped to " + esc(", ".join(filters)) if filters
                  else "every cached recipe")
-    exps = sorted({expansion_of(r.skill_tier, r.profession) for r in shown
-                   if r.skill_tier})
+    exps = craft_expansions
     reagents = reagents or []
     reagent_table = render_reagents(reagents)
     # Opens on current content, because that is what you are usually shopping
@@ -2114,7 +2144,10 @@ def render_dashboard(results: list, cfg: dict, taken_at: int, skipped: dict,
         + (" selected" if e == default_expansion else "")
         + f">{esc(e)}</option>"
         for e in reagent_expansions)
-    exp_opts = "".join(f'<option value="{esc(e)}">{esc(e)}</option>' for e in exps)
+    exp_opts = "".join(
+        f'<option value="{esc(e)}"' + (" selected" if e == craft_default else "")
+        + f">{esc(e)}</option>" for e in exps)
+    craft_all_sel = "" if craft_default else " selected"
 
     collapsed = skipped.get("quality_variants_collapsed", 0)
     collapsed_txt = (f" {collapsed:,} duplicate rank-variants were collapsed into "
@@ -2214,7 +2247,7 @@ below the cut, scan it on its own with <code>--tier</code>, or raise
 <div class="controls">
 <input id="q" type="search" placeholder="Filter by item name&hellip;" style="min-width:220px">
 <select id="prof"><option value="">All professions</option>{prof_opts}</select>
-<select id="exp"><option value="">All expansions</option>{exp_opts}</select>
+<select id="exp"><option value=""{craft_all_sel}>All expansions</option>{exp_opts}</select>
 <label><input id="pos" type="checkbox" checked> Profitable only</label>
 <label><input id="firm" type="checkbox"> Fully costed only</label>
 </div>

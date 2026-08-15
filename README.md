@@ -207,6 +207,12 @@ been recorded, then `addon_import.py --apply` loads it.
 **Bid-only auctions are ignored** — you cannot reliably buy them, so letting them
 drag the market price down would be misleading.
 
+**The craft table opens on the current expansion, and guarantees each
+expansion a slice.** Ranking purely by margin puts old-world gear on top — of
+the best 200 crafts, three were Midnight — so filtering to current content
+would have shown an almost empty table. Each expansion gets 25 rows reserved on
+top of the global ranking, which is what makes the dropdown worth having.
+
 **Recipes are skipped, not guessed at**, when the output isn't listed or a reagent
 has no price or insufficient supply. The count of each skip reason is printed and
 shown on the dashboard, so you can see how much of the recipe list actually got
@@ -394,7 +400,7 @@ python3 test_trade.py       # the trade-channel watcher, including that it never
 real; without it the file skips rather than failing, so the scanner itself
 still has no third-party dependencies.
 
-297 assertions in total: the supply ladder, percentile pricing,
+299 assertions in total: the supply ladder, percentile pricing,
 troll-listing resistance, stack-price normalisation, the AH cut, every skip
 condition, crafting-rank collapsing, hourly snapshot de-duplication, init
 idempotency, and that the dashboard is genuinely self-contained — plus, for the
