@@ -16,12 +16,16 @@ Tkinter only, which ships with Python, so there is still nothing to install.
     python pricecheck.py            # or double-click pricecheck.cmd
 """
 import argparse
+import json
 import os
 import sqlite3
 import sys
 import time
 import tkinter as tk
 from tkinter import ttk
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import wowcraft as W          # for expansion_of, so the two agree on names
 
 GOLD = 10000
 
@@ -65,6 +69,8 @@ class Prices:
         self.rows: list = []
         self.taken_at = None
         self.history: dict = {}
+        self.expansions: list = []
+        self.newest_expansion = ""
         self.load()
 
     def load(self) -> None:
@@ -86,6 +92,34 @@ class Prices:
             self.data_time = int(meta["value"]) if meta else self.taken_at
         except (TypeError, ValueError):
             self.data_time = self.taken_at
+
+        # Items carry no expansion of their own, so it comes from the recipes
+        # that use them: anything a Midnight recipe consumes or produces is a
+        # Midnight item. An item can belong to several - Classic herbs still
+        # turn up in modern recipes - so this is a set per item rather than a
+        # single label, and the filter asks "is it used in X".
+        item_expansions: dict = {}
+        newest = (0, "")
+        for r in db.execute(
+                "SELECT skill_tier_id, skill_tier_name, profession_name, "
+                "crafted_item_id, reagents_json, slots_json FROM recipe"):
+            expansion = W.expansion_of(r["skill_tier_name"] or "",
+                                       r["profession_name"] or "")
+            if (r["skill_tier_id"] or 0) > newest[0]:
+                newest = (r["skill_tier_id"] or 0, expansion)
+            ids = set()
+            if r["crafted_item_id"]:
+                ids.add(r["crafted_item_id"])
+            for reagent in json.loads(r["reagents_json"] or "[]"):
+                ids.add(reagent["id"])
+            for slot in json.loads(r["slots_json"] or "null") or []:
+                ids.update(slot.get("items") or [])
+            for item_id in ids:
+                item_expansions.setdefault(item_id, set()).add(expansion)
+        # Newest skill tier wins, so this follows the game rather than needing
+        # editing every expansion.
+        self.newest_expansion = newest[1]
+        self.expansions = sorted({e for s in item_expansions.values() for e in s})
 
         names = {r["id"]: r["name"] for r in db.execute(
             "SELECT id, name FROM item WHERE name IS NOT NULL AND name <> ''")}
@@ -127,6 +161,7 @@ class Prices:
                 "high": r["buy_high"],
                 "trend": trend,
                 "source": r["source"],
+                "expansions": item_expansions.get(item_id) or set(),
             }
         db.close()
         self.rows = sorted(best.values(), key=lambda x: -x["supply"])
@@ -162,6 +197,15 @@ class App:
         entry = ttk.Entry(top, textvariable=self.query)
         entry.pack(side="left", fill="x", expand=True, padx=(6, 6))
         entry.focus_set()
+        self.expansion = tk.StringVar()
+        choices = ["All expansions"] + data.expansions + ["Not in any recipe"]
+        picker = ttk.Combobox(top, textvariable=self.expansion, values=choices,
+                              state="readonly", width=20)
+        picker.pack(side="left", padx=(0, 6))
+        # Default to whatever the newest skill tier belongs to - Midnight now,
+        # and whatever follows it later without anyone editing this.
+        self.expansion.set(data.newest_expansion or "All expansions")
+        picker.bind("<<ComboboxSelected>>", lambda _e: self.render())
         ttk.Button(top, text="Refresh", command=self.refresh).pack(side="left")
 
         self.tree = ttk.Treeview(root, columns=[c[0] for c in COLUMNS],
@@ -197,6 +241,11 @@ class App:
     def matching(self) -> list:
         q = self.query.get().strip().lower()
         rows = self.data.rows
+        chosen = self.expansion.get()
+        if chosen == "Not in any recipe":
+            rows = [r for r in rows if not r["expansions"]]
+        elif chosen and chosen != "All expansions":
+            rows = [r for r in rows if chosen in r["expansions"]]
         if q:
             # An id search is exact; a name search is a substring.
             if q.isdigit():
@@ -252,8 +301,10 @@ class App:
 
         shown = min(len(rows), self.limit)
         more = f" (showing {shown})" if len(rows) > self.limit else ""
+        where = self.expansion.get()
+        scope = "" if where in ("", "All expansions") else f" in {where}"
         self.status.set(
-            f"{len(rows):,} of {len(self.data.rows):,} items{more}   |   "
+            f"{len(rows):,} of {len(self.data.rows):,} items{scope}{more}   |   "
             f"prices from "
             f"{time.strftime('%d %b %H:%M', time.localtime(self.data.data_time))}"
             f", {age(self.data.data_time)}   |   Refresh after a scan")

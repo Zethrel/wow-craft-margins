@@ -323,7 +323,12 @@ whatever the last scan wrote — **Refresh** picks up a newer one without
 restarting.
 
 All 29,000-odd priced items, searchable by name or item id, sortable, with
-today's range and the trend across the stored history. Unnamed items are kept
+today's range and the trend across the stored history. The dropdown narrows to
+one expansion and **opens on the current one** — items carry no expansion of
+their own, so it is derived from the recipes that use them, and "current" is
+whatever the newest cached skill tier belongs to rather than a hardcoded name.
+An item can be in several (Classic herbs still turn up in modern recipes), and
+*Not in any recipe* reaches the ~21,000 that no craft touches. Unnamed items are kept
 here (unlike the dashboard) because you can search them by id. The **ID** column
 matters more than it looks: quality tiers are separate items with identical
 names, so two `Void-Tempered Leather` rows at different prices are correct, not
