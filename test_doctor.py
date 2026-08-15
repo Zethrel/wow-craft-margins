@@ -52,8 +52,9 @@ class FakeClient:
         return None
     def items_named(self, name):
         return W.BlizzardClient.items_named(self, name)
-    def get_many(self, paths, ns):
-        return {k: self.get(p, ns) for k, p in paths}
+    def get_many(self, paths, ns, errors=None):
+        return {k: v for k, v in ((k, self.get(p, ns)) for k, p in paths)
+                if v is not None}
     def commodities(self):
         return [{"item": {"id": 2001}, "quantity": 50, "unit_price": 12000},
                 {"item": {"id": 2002}, "quantity": 20, "unit_price": 500}]

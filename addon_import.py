@@ -572,8 +572,9 @@ def resolve_item_names(db_path: str, config_path: str = "config.json",
                                   cfg["region"], cfg["locale"])
     print(f"  looking up {len(missing)} unnamed items "
           f"(~{len(missing) / W.RATE_LIMIT_PER_SEC:.0f}s)...")
+    refusals: dict = {}
     payloads = client.get_many(
-        ((i, f"/data/wow/item/{i}") for i in missing), "static")
+        ((i, f"/data/wow/item/{i}") for i in missing), "static", refusals)
 
     rows = []
     for item_id, payload in payloads.items():
@@ -589,14 +590,16 @@ def resolve_item_names(db_path: str, config_path: str = "config.json",
         "quality=excluded.quality, level=excluded.level", rows)
     db.commit()
     print(f"  named {len(rows)} items")
-    # The rest 404ed or came back without a name. Items get removed from the
-    # game and their ids linger in recipes, so this is expected rather than a
-    # failure - say how many so a growing number is noticeable, and leave them
-    # unnamed rather than inventing a label.
-    absent = len(missing) - len(rows)
-    if absent:
-        print(f"    {absent} the API would not name (removed from the game?), "
+    # A 404 and a refusal both arrive as no payload and mean opposite things:
+    # one will never change, the other is worth another run.
+    refused = len(refusals)
+    gone = len(missing) - len(payloads) - refused + (len(payloads) - len(rows))
+    if gone:
+        print(f"    {gone} have no name to fetch (removed from the game), "
               "left as raw ids")
+    if refused:
+        print(f"    {refused} were refused, usually the hourly request quota "
+              "- worth running again later")
 
 
 def main(argv=None) -> int:

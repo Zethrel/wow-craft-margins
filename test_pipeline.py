@@ -13,8 +13,9 @@ class FakeClient:
         return [{"href": "https://eu.api.blizzard.com/data/wow/connected-realm/1234"}]
     def connected_realm(self, cid):
         return {"realms": [{"slug": "argent-dawn", "name": "Argent Dawn"}]}
-    def get_many(self, paths, ns):
-        return {k: self.get(p, ns) for k, p in paths}
+    def get_many(self, paths, ns, errors=None):
+        return {k: v for k, v in ((k, self.get(p, ns)) for k, p in paths)
+                if v is not None}
 
 
 
@@ -352,7 +353,7 @@ import addon_import
 
 class NamingClient:
     """Names two of the three asked-for items; the third is gone from the game."""
-    def get_many(self, paths, ns):
+    def get_many(self, paths, ns, errors=None):
         out = {}
         for key, _path in paths:
             if key == 555:
@@ -380,11 +381,28 @@ must("slot item got a name", names6.get(777) == "Item 777")
 must("crafted item got a name", names6.get(900) == "Item 900")
 must("item the API will not name is left alone", 555 not in names6)
 must("unnameable items are reported",
-     "1 the API would not name" in buf3.getvalue())
+     "have no name to fetch" in buf3.getvalue())
+# A 404 and a rate limit both arrive as "no payload" but mean opposite things:
+# one will never change, the other is worth another run. Saying the wrong one
+# sends you off retrying something that cannot succeed.
+class RefusingClient:
+    def get_many(self, paths, ns, errors=None):
+        for key, _path in paths:
+            if errors is not None:
+                errors[key] = "HTTP 429: Too Many Requests"
+        return {}
+
+
+buf4 = io.StringIO()
+with contextlib.redirect_stdout(buf4):
+    addon_import.resolve_item_names(os.path.join(tmp, "names.sqlite3"),
+                                    client=RefusingClient())
+must("a refusal is not reported as a missing item",
+     "have no name to fetch" not in buf4.getvalue())
 
 # A second pass has nothing to fetch for the ones already named.
 class ExplodingClient:
-    def get_many(self, paths, ns):
+    def get_many(self, paths, ns, errors=None):
         asked = [k for k, _ in paths]
         assert 777 not in asked, "re-fetched an item that already had a name"
         return {}

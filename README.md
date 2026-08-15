@@ -414,7 +414,7 @@ python3 test_trade.py       # the trade-channel watcher, including that it never
 real; without it the file skips rather than failing, so the scanner itself
 still has no third-party dependencies.
 
-303 assertions in total: the supply ladder, percentile pricing,
+304 assertions in total: the supply ladder, percentile pricing,
 troll-listing resistance, stack-price normalisation, the AH cut, every skip
 condition, crafting-rank collapsing, hourly snapshot de-duplication, init
 idempotency, and that the dashboard is genuinely self-contained — plus, for the

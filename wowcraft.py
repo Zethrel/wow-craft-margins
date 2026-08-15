@@ -262,8 +262,14 @@ class BlizzardClient:
                                f"{type(exc).__name__}: {exc}") from exc
         return (None, {}) if want_headers else None
 
-    def get_many(self, paths: Iterable[tuple], namespace: str) -> dict:
-        """Fetch many (key, path) pairs concurrently. Returns {key: payload}."""
+    def get_many(self, paths: Iterable[tuple], namespace: str,
+                 errors: Optional[dict] = None) -> dict:
+        """Fetch many (key, path) pairs concurrently. Returns {key: payload}.
+
+        A 404 and a refusal both come back as no payload, but they mean
+        opposite things - one is "this does not exist", the other "ask again
+        later". Pass `errors` to have the refusals recorded there, so callers
+        can tell a missing item from a rate limit."""
         paths = list(paths)
         out: dict = {}
         if not paths:
@@ -278,6 +284,8 @@ class BlizzardClient:
                 data = self.get(path, namespace)
             except ApiError as exc:
                 log(f"  warn: {path}: {exc}")
+                if errors is not None:
+                    errors[key] = str(exc)
                 data = None
             with lock:
                 done += 1
@@ -2316,8 +2324,9 @@ def cmd_names(client: BlizzardClient, store: Store, cfg: dict) -> None:
     log(f"looking up {len(missing):,} names "
         f"(~{len(missing) / RATE_LIMIT_PER_SEC / 60:.0f} min, one time -- "
         "names do not change)")
+    refusals: dict = {}
     payloads = client.get_many(
-        ((i, f"/data/wow/item/{i}") for i in missing), "static")
+        ((i, f"/data/wow/item/{i}") for i in missing), "static", refusals)
 
     rows = []
     for item_id, payload in payloads.items():
@@ -2332,19 +2341,21 @@ def cmd_names(client: BlizzardClient, store: Store, cfg: dict) -> None:
         "quality=excluded.quality, level=excluded.level", rows)
     store.db.commit()
     log(f"named {len(rows):,} items")
-    # Anything the server refused rather than answered is worth separating
-    # from anything that genuinely has no name: the first is worth retrying,
-    # the second never will be.
-    refused = len(missing) - len(payloads)
+    # Three different outcomes, and conflating them turns "these items do not
+    # exist" into "the server is throttling you", which sends you off retrying
+    # something that will never change.
+    refused = len(refusals)
+    gone = len(missing) - len(payloads) - refused
     empty = len(payloads) - len(rows)
-    if empty:
-        log(f"note: {empty:,} returned no name -- items removed from the game "
-            "whose ids linger on old listings. Left as raw ids rather than "
-            "given an invented label.")
+    if gone or empty:
+        log(f"note: {gone + empty:,} have no name to fetch -- items removed "
+            "from the game whose ids linger on old listings. Left as raw ids "
+            "rather than given an invented label; re-running will not change "
+            "them.")
     if refused:
-        log(f"note: {refused:,} were not answered at all, usually Blizzard's "
-            "hourly request quota. Nothing is lost -- run `names` again later "
-            "and it will fetch only those.")
+        log(f"note: {refused:,} were refused, usually Blizzard's hourly "
+            "request quota. Those ARE worth another run later -- `names` "
+            "fetches only what is still missing.")
 
 
 def cmd_doctor(client: BlizzardClient, store: Store, cfg: dict,
