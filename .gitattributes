@@ -1,0 +1,18 @@
+# Workflow files run through bash on a Linux runner. autocrlf on Windows would
+# otherwise be free to hand them back with CRLF line endings, which breaks
+# multi-line `run:` blocks in ways that are tedious to diagnose from a CI log.
+*.yml text eol=lf
+*.yaml text eol=lf
+*.sh text eol=lf
+
+# Batch files are the opposite case: cmd.exe wants CRLF.
+*.cmd text eol=crlf
+
+*.py text
+*.lua text
+*.md text
+*.json text
+
+# Binary. Never touch the line endings, never try to diff it.
+*.sqlite3 binary
+*.gz binary

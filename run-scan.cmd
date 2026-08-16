@@ -1,6 +1,11 @@
 @echo off
 REM Hourly scan wrapper for Task Scheduler.
 REM
+REM Takes the wowcraft subcommand as its first argument and defaults to `scan`,
+REM so an existing scheduled task that just points here keeps working. pull.cmd
+REM passes `pull` instead, which is the same plumbing - find a Python, log with
+REM a timestamp, trim the log - around a command that needs no credentials.
+REM
 REM A wrapper rather than putting the command straight into the task: the
 REM project path contains both spaces and an ampersand, and cmd.exe treats the
 REM ampersand as a command separator. Point the task's Execute at THIS FILE,
@@ -15,6 +20,9 @@ setlocal enabledelayedexpansion
 
 set "PROJECT=%~dp0"
 cd /d "%PROJECT%"
+
+set "WCCMD=%~1"
+if "%WCCMD%"=="" set "WCCMD=scan"
 
 REM -- find an interpreter ---------------------------------------------------
 REM This machine runs Python from the Microsoft Store, whose real executable
@@ -31,7 +39,7 @@ REM refuses to launch, so an existence check picks the one path guaranteed to
 REM fail and never reaches the alias that works.
 
 echo.>> scan.log
-echo ==== %DATE% %TIME% ==== >> scan.log
+echo ==== %DATE% %TIME% (%WCCMD%) ==== >> scan.log
 
 set "PY="
 REM Real installs first. The py.exe launcher comes after them because it can
@@ -61,7 +69,7 @@ if not defined PY (
 )
 echo ---- python: %PY% >> scan.log
 
-"%PY%" wowcraft.py scan >> scan.log 2>&1
+"%PY%" wowcraft.py %WCCMD% >> scan.log 2>&1
 set RC=%ERRORLEVEL%
 if not "%RC%"=="0" echo ---- exited with code %RC% >> scan.log
 

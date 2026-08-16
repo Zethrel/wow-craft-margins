@@ -135,6 +135,104 @@ logs which interpreter it chose, and real installs are tried ahead of the
 
 ---
 
+## Running it in the cloud instead
+
+The scan does not have to happen on your PC. `.github/workflows/scan.yml` runs
+it hourly in GitHub Actions and publishes the results to GitHub Pages; `pull`
+downloads them. Your machine then needs **no Battle.net credentials, no recipe
+cache and no scheduled scan** — and the data stays current while the PC is off.
+
+**The one thing that cannot move.** WoW's Lua sandbox has no sockets and no
+HTTP, deliberately, so an addon can never fetch anything. `PriceData.lua` has
+to be a real file in the AddOns folder before the client loads it. Something
+local must always do the writing — `pull` is that something, reduced to a
+download. Every price addon works this way.
+
+### What gets published
+
+`scan --publish site` fills a directory with everything a machine that never
+talks to Blizzard would need:
+
+| File | Size | Read by |
+|---|---|---|
+| `PriceData.lua` | ~520 KB | the in-game addon |
+| `dashboard.html` (and `index.html`) | ~1.2 MB | your browser |
+| `prices.sqlite3.gz` | ~4.8 MB | `pricecheck` |
+| `manifest.json` | ~400 B | `pull`, to skip what has not changed |
+
+`prices.sqlite3.gz` is the real database with `inventory` and `margin_snapshot`
+emptied and the file `VACUUM`ed — schema-identical on purpose, so `pricecheck`
+opens it with the queries it always used. Nothing needed a second code path.
+
+### Setting it up
+
+**1. Repository secrets.** Settings → Secrets and variables → Actions → *New
+repository secret*, twice: `BNET_CLIENT_ID` and `BNET_CLIENT_SECRET`. The tool
+already prefers those environment variables over `config.json`, so no code
+change. They stay hidden even on a public repo, and the workflow does not run
+on pull requests, so a fork cannot read them.
+
+**2. Enable Pages.** Settings → Pages → Source: **GitHub Actions**. Not the
+"deploy from a branch" option — the workflow uploads an artifact directly, so
+nothing is ever committed to a `gh-pages` branch and the repo stays small.
+
+**3. Edit `ci-config.json`** if your realm is not Argent Dawn (EU). It holds no
+secrets and is meant to be committed.
+
+**4. Run it once** — Actions → *hourly scan* → *Run workflow*. The first run
+cold-starts from `seed/recipes.sqlite3.gz` and takes about a minute.
+
+**5. Point your PC at it.** In `config.json`:
+
+```json
+"pull_url": "https://<your-user>.github.io/wow-craft-margins/"
+```
+
+Then, instead of `run-scan.cmd`:
+
+```bash
+pull.cmd
+```
+
+Swap the scheduled task's **Execute** from `run-scan.cmd` to `pull.cmd` and it
+keeps running hourly, minus the credentials and the API calls. `/reload` in
+game picks up new prices.
+
+### The database, and why there is a seed
+
+`scan` needs the recipe cache `init` builds — 9,725 recipes, about fifteen
+minutes. Actions runners keep nothing between runs, so the workflow carries the
+database in the Actions cache, and `seed/recipes.sqlite3.gz` (794 KB, tracked)
+is the cold-start fallback for when that cache is empty or expired. Rebuild it
+after a content patch:
+
+```bash
+python3 wowcraft.py init
+python3 wowcraft.py seed
+```
+
+and commit the result. Prices are deliberately not in the seed; they are
+refetched every run anyway.
+
+The workflow saves a fresh ~18 MB cache each hour and prunes all but the newest
+three, so this does not quietly grow until GitHub starts evicting caches.
+
+### What stays local
+
+Inventory-aware scoring and the undercut helper read your SavedVariables, which
+a runner cannot see. `pull` therefore **carries your `inventory` rows across**
+rather than replacing the database wholesale — those rows exist nowhere else,
+and losing them would silently re-score every craft as though you own nothing.
+It swaps by rename, so an interrupted pull leaves the old database intact.
+
+Keep running `addon_import.py` locally for that side; it is unaffected.
+
+`test_cloud.py` covers the whole round trip — publish, serve, pull — against a
+fake API and a local HTTP server, including the inventory hand-off and a
+corrupt download.
+
+---
+
 ## How the numbers are worked out
 
 This is the part worth understanding, because it's where naive versions of this
@@ -321,6 +419,8 @@ Run `doctor` first.
 | `config` | Write a starter `config.json` |
 | `init` | Cache recipe definitions (once per patch) |
 | `scan` | Fetch auctions, compute margins, write the dashboard |
+| `pull` | Download a published scan instead of running one — no credentials |
+| `seed` | Export the recipe cache for the CI workflow to cold-start from |
 | `demo` | Run the whole pipeline on synthetic data, no credentials |
 | `doctor` | Probe every endpoint, write a shareable diagnostic report |
 | `names` | Look up names for every priced item that has none (one-off, ~6 min) |

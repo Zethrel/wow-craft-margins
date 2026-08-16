@@ -1,0 +1,14 @@
+{
+  "_comment": "Config for the GitHub Actions scan. Deliberately holds no secrets - client_id and client_secret come from the BNET_CLIENT_ID / BNET_CLIENT_SECRET repository secrets, which override this file. Safe to commit; edit it here to change what the hourly scan covers.",
+  "client_id": "",
+  "client_secret": "",
+  "region": "eu",
+  "locale": "en_GB",
+  "realm_slug": "argent-dawn",
+  "_scope": "Empty lists = everything in the cached recipe set. The runner scans the lot because it costs four seconds and the published dashboard is nicer for having every expansion in the dropdown.",
+  "professions": [],
+  "skill_tiers": [],
+  "_addon_path": "Empty on purpose. There is no WoW install on a CI runner; --publish writes PriceData.lua into the site directory instead.",
+  "addon_path": "",
+  "history_days": 7
+}

@@ -26,6 +26,15 @@ addon/WowCraftExport/PriceData.lua
 build/
 dist/
 *.spec
+pricecheck.exe
+
+# What `scan --publish` builds for GitHub Pages. Regenerated every run and
+# uploaded straight from the runner, so it never needs to be in the repo.
+# seed/ is the exception and IS tracked - see the README.
+site/
+
+# Which published files this PC already has, so `pull` can skip them.
+.pull-state.json
 
 __pycache__/
 *.pyc

@@ -1,0 +1,89 @@
+name: hourly scan
+
+# Blizzard refreshes auction data once an hour. GitHub's cron is best-effort
+# and can run late under load, which does not matter here: snapshots are keyed
+# on Blizzard's own Last-Modified, so a late run stores the same snapshot
+# rather than a duplicate, and an early one is a no-op.
+on:
+  schedule:
+    - cron: "20 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+  actions: write        # only to prune this workflow's own old caches
+
+# Pages allows one deployment at a time. Queue rather than cancel: a cancelled
+# run would still have spent its Blizzard calls.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # No pip install step. wowcraft.py is standard library only, which is
+      # the reason this job takes under a minute.
+
+      # The database carries the recipe cache and the rolling price history.
+      # Restoring the newest one is what makes an hourly run cheap.
+      - name: Restore the database
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: wowcraft.sqlite3
+          key: wowcraft-db-${{ github.run_id }}
+          restore-keys: wowcraft-db-
+
+      # First run ever, or the cache expired. The seed holds what `init`
+      # spent fifteen minutes building, so this costs a second instead.
+      - name: Seed from the committed recipe cache
+        if: steps.cache.outputs.cache-matched-key == ''
+        run: |
+          python -c "import gzip,shutil; \
+            shutil.copyfileobj(gzip.open('seed/recipes.sqlite3.gz','rb'), \
+                               open('wowcraft.sqlite3','wb'))"
+          echo "cold start: seeded from seed/recipes.sqlite3.gz"
+
+      - name: Scan
+        env:
+          BNET_CLIENT_ID: ${{ secrets.BNET_CLIENT_ID }}
+          BNET_CLIENT_SECRET: ${{ secrets.BNET_CLIENT_SECRET }}
+        run: python wowcraft.py scan -c ci-config.json --publish site
+
+      - name: Save the database
+        uses: actions/cache/save@v4
+        with:
+          path: wowcraft.sqlite3
+          key: wowcraft-db-${{ github.run_id }}
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - id: deploy
+        uses: actions/deploy-pages@v4
+
+      # A new ~18 MB cache every hour would otherwise pile up until GitHub
+      # started evicting other repositories' caches to make room.
+      - name: Prune old database caches
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh cache list --repo "$GITHUB_REPOSITORY" --key wowcraft-db- \
+            --limit 100 --sort created_at --order desc \
+            --json id --jq '.[3:][].id' \
+          | while read -r id; do
+              gh cache delete "$id" --repo "$GITHUB_REPOSITORY" || true
+            done

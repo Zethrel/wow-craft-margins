@@ -1391,7 +1391,8 @@ def resolve_connected_realm(client: BlizzardClient, store: Store,
 # --------------------------------------------------------------------------
 
 def cmd_scan(client: BlizzardClient, store: Store, cfg: dict, out_path: str,
-             batch: int, top: int, min_listings: int = 1) -> None:
+             batch: int, top: int, min_listings: int = 1,
+             publish_dir: str = "") -> None:
     recipes = store.recipes(cfg.get("professions"), cfg.get("skill_tiers"))
     scope = " and ".join(
         filter(None, [", ".join(cfg.get("skill_tiers") or []),
@@ -1492,6 +1493,12 @@ def cmd_scan(client: BlizzardClient, store: Store, cfg: dict, out_path: str,
     with open(out_path, "w", encoding="utf-8") as fh:
         fh.write(html)
     log(f"wrote {out_path}")
+
+    if publish_dir:
+        # Same results, second destination: this is the set a machine with no
+        # credentials pulls down instead of scanning.
+        publish(publish_dir, store, cfg, out_path, results, prices, recipes,
+                taken_at, batch, data_time)
 
 
 # --------------------------------------------------------------------------
@@ -2749,6 +2756,298 @@ def cmd_demo(out_path: str, batch: int, top: int) -> None:
 
 
 # --------------------------------------------------------------------------
+# Publishing, and pulling what was published
+# --------------------------------------------------------------------------
+#
+# `scan --publish DIR` fills DIR with everything a machine that never talks to
+# Blizzard would need, and `pull` is the other half: it fetches that set over
+# HTTPS and puts each piece where the local tools already look for it.
+#
+# The split exists because the game cannot do this itself. WoW's Lua sandbox
+# has no sockets and no HTTP, by design, so PriceData.lua has to be a real file
+# in the AddOns folder before the client loads it. Something local must always
+# do the writing. `pull` is that something, reduced to its smallest form: no
+# credentials, no Blizzard calls, no recipe cache, just a download.
+
+MANIFEST_NAME = "manifest.json"
+PRICES_NAME = "prices.sqlite3.gz"
+PULL_STATE = ".pull-state.json"
+SEED_PATH = os.path.join("seed", "recipes.sqlite3.gz")
+
+# Tables a consumer has no use for. inventory is per-character and came off
+# this machine's SavedVariables in the first place; margin_snapshot is derived
+# and dashboard.html already shows it.
+UNPUBLISHED_TABLES = ("inventory", "margin_snapshot")
+
+# The seed drops prices too, leaving only what `init` spent fifteen minutes
+# building. Recipes change on patch day and not otherwise, so this compresses
+# to under a megabyte and is worth committing: without it a CI runner with a
+# cold cache would have to re-run `init` from scratch before it could scan.
+SEED_TABLES = UNPUBLISHED_TABLES + ("price_snapshot",)
+
+
+def _sha256(path: str) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def export_prices_db(src: str, dest: str,
+                     drop: Iterable[str] = UNPUBLISHED_TABLES) -> int:
+    """Write a gzipped copy of the database with the named tables emptied.
+
+    Deliberately schema-identical to the real thing rather than a trimmed-down
+    format of its own. pricecheck opens whatever this produces with the same
+    queries it has always used, so the cloud path needs no second code path in
+    the reader - the file just arrives from somewhere else.
+    """
+    import gzip
+    import shutil
+    import tempfile
+
+    fd, tmp = tempfile.mkstemp(suffix=".sqlite3",
+                               dir=os.path.dirname(os.path.abspath(dest)))
+    os.close(fd)
+    try:
+        shutil.copyfile(src, tmp)
+        db = sqlite3.connect(tmp)
+        try:
+            for table in drop:
+                db.execute(f"DELETE FROM {table}")
+            db.commit()
+            # Without this the pages the deleted rows used to occupy are still
+            # in the file, and the download carries them.
+            db.execute("VACUUM")
+        finally:
+            db.close()
+        with open(tmp, "rb") as fh, gzip.open(dest, "wb", 9) as out:
+            shutil.copyfileobj(fh, out)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    return os.path.getsize(dest)
+
+
+def publish(out_dir: str, store: Store, cfg: dict, dashboard_path: str,
+            results: list, prices: dict, recipes: list, taken_at: int,
+            batch: int, data_time: Optional[int] = None) -> dict:
+    """Fill out_dir with the published set, and return the manifest.
+
+    Everything here is static: no server, no database, no API. A plain file
+    host is enough, which is why GitHub Pages can serve it.
+    """
+    import shutil
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    lua_path = os.path.join(out_dir, "PriceData.lua")
+    write_addon_prices(lua_path, results, prices, recipes, taken_at, cfg,
+                       batch, store.price_ranges(taken_at))
+
+    if dashboard_path and os.path.exists(dashboard_path):
+        shutil.copyfile(dashboard_path, os.path.join(out_dir, "dashboard.html"))
+        # A bare Pages URL should land on the dashboard rather than a 404.
+        shutil.copyfile(dashboard_path, os.path.join(out_dir, "index.html"))
+
+    export_prices_db(store.path, os.path.join(out_dir, PRICES_NAME))
+
+    files = {}
+    for name in sorted(os.listdir(out_dir)):
+        if name == MANIFEST_NAME:
+            continue
+        path = os.path.join(out_dir, name)
+        if os.path.isfile(path):
+            files[name] = {"size": os.path.getsize(path),
+                           "sha256": _sha256(path)}
+
+    manifest = {
+        "generated_at": int(time.time()),
+        # Blizzard's own Last-Modified. The one timestamp that says how stale
+        # the prices actually are - generated_at only says when we ran.
+        "data_time": data_time or taken_at,
+        "realm_slug": cfg.get("realm_slug", ""),
+        "region": cfg.get("region", ""),
+        "files": files,
+    }
+    with open(os.path.join(out_dir, MANIFEST_NAME), "w", encoding="utf-8") as fh:
+        json.dump(manifest, fh, indent=2)
+
+    total = sum(f["size"] for f in files.values())
+    log(f"published {len(files)} files to {out_dir} ({total // 1024} KB total)")
+    return manifest
+
+
+def cmd_seed(db_path: str, dest: str) -> int:
+    """Refresh the committed recipe cache. Run after a content patch, once."""
+    if not os.path.exists(db_path):
+        log(f"No database at {db_path}. Run `init` first.")
+        return 1
+    store = Store(db_path)
+    try:
+        count = len(store.recipes())
+    finally:
+        store.close()
+    if not count:
+        log(f"{db_path} holds no cached recipes. Run `init` first.")
+        return 1
+    os.makedirs(os.path.dirname(os.path.abspath(dest)), exist_ok=True)
+    size = export_prices_db(db_path, dest, SEED_TABLES)
+    log(f"wrote {dest} ({size // 1024} KB, {count} recipes). Commit it so the "
+        "workflow can cold-start without re-running `init`.")
+    return 0
+
+
+def _fetch(url: str, timeout: int = 120) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def _install_prices_db(blob: bytes, db_path: str) -> None:
+    """Swap a downloaded price database in, keeping what only this PC knows.
+
+    inventory comes from your own SavedVariables and exists nowhere else, so
+    replacing the file wholesale would quietly delete it and every craft would
+    go back to being scored as though you own nothing. Carry it across first,
+    then swap - and swap by rename, so an interrupted pull leaves the old
+    database intact rather than a half-written one.
+    """
+    import gzip
+    import tempfile
+
+    folder = os.path.dirname(os.path.abspath(db_path)) or "."
+    os.makedirs(folder, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(suffix=".sqlite3", dir=folder)
+    os.close(fd)
+
+    # Everything from here is inside the try: a truncated or non-gzip download
+    # must not leave a stray half-database sitting next to the real one.
+    try:
+        with open(tmp, "wb") as fh:
+            fh.write(gzip.decompress(blob))
+
+        carried = 0
+        if os.path.exists(db_path):
+            db = sqlite3.connect(tmp)
+            try:
+                db.execute("ATTACH DATABASE ? AS old", (db_path,))
+                have = db.execute(
+                    "SELECT name FROM old.sqlite_master WHERE type='table' "
+                    "AND name='inventory'").fetchone()
+                if have:
+                    db.execute("INSERT OR REPLACE INTO inventory "
+                               "SELECT * FROM old.inventory")
+                    carried = db.execute(
+                        "SELECT COUNT(*) FROM inventory").fetchone()[0]
+                db.commit()
+                db.execute("DETACH DATABASE old")
+            finally:
+                db.close()
+        os.replace(tmp, db_path)
+        if carried:
+            log(f"  kept {carried} inventory rows from the local database")
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+
+
+def cmd_pull(url: str, cfg: dict, db_path: str, out_path: str,
+             force: bool = False) -> int:
+    """Download the published set and put each piece where it is looked for.
+
+    Runs with no credentials and no Blizzard access at all - the scan already
+    happened somewhere else. Files are matched by hash against the last pull,
+    so the usual case costs one 400-byte manifest and nothing else.
+    """
+    base = url.rstrip("/") + "/"
+    log(f"pulling from {base}")
+    try:
+        manifest = json.loads(_fetch(base + MANIFEST_NAME, timeout=30))
+    except urllib.error.HTTPError as exc:
+        log(f"error: {base}{MANIFEST_NAME} returned HTTP {exc.code}. "
+            "Check the URL, and that the publishing workflow has run at least "
+            "once.")
+        return 2
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        log(f"error: could not read the manifest: {exc}")
+        return 2
+
+    age = int(time.time()) - int(manifest.get("data_time") or 0)
+    log(f"  published data is {age // 60} minutes old "
+        f"({manifest.get('realm_slug', '?')} {manifest.get('region', '?')})")
+
+    state_path = os.path.join(os.path.dirname(os.path.abspath(db_path)),
+                              PULL_STATE)
+    state = {}
+    if not force and os.path.exists(state_path):
+        try:
+            with open(state_path, encoding="utf-8") as fh:
+                state = json.load(fh)
+        except (ValueError, OSError):
+            state = {}
+
+    # Where each published file belongs on this machine. A destination of None
+    # means "published, but this PC has not asked for it".
+    addon_path = cfg.get("addon_path") or ""
+    targets = {
+        "PriceData.lua": os.path.join(addon_path, "PriceData.lua")
+                         if addon_path else None,
+        "dashboard.html": out_path,
+        PRICES_NAME: db_path,
+    }
+
+    changed = 0
+    for name, dest in targets.items():
+        entry = manifest.get("files", {}).get(name)
+        if not entry:
+            continue
+        if dest is None:
+            log(f"  skipping {name} (no addon_path set in config)")
+            continue
+        if state.get(name) == entry["sha256"] and os.path.exists(
+                dest if name != PRICES_NAME else db_path):
+            log(f"  {name} unchanged")
+            continue
+        log(f"  downloading {name} ({entry['size'] // 1024} KB)")
+        try:
+            blob = _fetch(base + name)
+        except (urllib.error.URLError, OSError) as exc:
+            log(f"  warn: {name} failed: {exc}")
+            continue
+        try:
+            if name == PRICES_NAME:
+                _install_prices_db(blob, db_path)
+            else:
+                os.makedirs(os.path.dirname(os.path.abspath(dest)) or ".",
+                            exist_ok=True)
+                with open(dest, "wb") as fh:
+                    fh.write(blob)
+            log(f"    -> {dest}")
+        except OSError as exc:
+            log(f"  warn: could not write {dest}: {exc}")
+            continue
+        state[name] = entry["sha256"]
+        changed += 1
+
+    try:
+        with open(state_path, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, indent=2)
+    except OSError:
+        pass  # Only costs a redundant download next time.
+
+    if changed:
+        log(f"pull complete: {changed} file(s) updated. /reload in game to "
+            "pick up new prices.")
+    else:
+        log("pull complete: everything was already current.")
+    return 0
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 
@@ -2768,6 +3067,11 @@ DEFAULT_CONFIG = {
     # 7 means a week of daily readings. 0 keeps everything, which grows the
     # database indefinitely.
     "history_days": 7,
+    # Where `pull` fetches from - the GitHub Pages site the scan workflow
+    # publishes to. Set this and you never need credentials, a recipe cache or
+    # a scheduled scan on this machine; `pull` downloads what the workflow
+    # already worked out. Empty = this PC scans for itself.
+    "pull_url": "",
 }
 
 
@@ -2807,10 +3111,14 @@ def main(argv: Optional[list] = None) -> int:
         prog="wowcraft",
         description="Crafting margin scanner using Blizzard's official API.")
     ap.add_argument("command",
-                    choices=["init", "scan", "demo", "config", "doctor",
-                             "names"],
+                    choices=["init", "scan", "pull", "seed", "demo", "config",
+                             "doctor", "names"],
                     help="init: cache recipes (run once per patch). "
                          "scan: fetch auctions and build the dashboard. "
+                         "pull: download a published scan instead of running "
+                         "one - no credentials needed. "
+                         "seed: export the recipe cache for the CI workflow "
+                         "to cold-start from. "
                          "demo: run on synthetic data, no credentials needed. "
                          "config: write a starter config.json. "
                          "doctor: probe every endpoint and write a shareable "
@@ -2846,6 +3154,17 @@ def main(argv: Optional[list] = None) -> int:
                          "Alchemy. Repeatable, comma-separated accepted, and "
                          "must match the full name. Overrides professions in "
                          "config.json for this run only.")
+    ap.add_argument("--publish", metavar="DIR", default="",
+                    help="on `scan`, also write the publishable set (addon "
+                         "prices, dashboard, price database, manifest) into "
+                         "DIR. This is what the GitHub Actions workflow "
+                         "uploads to Pages.")
+    ap.add_argument("--url", metavar="URL", default="",
+                    help="on `pull`, the published site to fetch from. "
+                         "Defaults to pull_url in config.json.")
+    ap.add_argument("--force", action="store_true",
+                    help="on `pull`, download every file even if the hashes "
+                         "say it is already current.")
     args = ap.parse_args(argv)
 
     if args.command == "config":
@@ -2861,7 +3180,22 @@ def main(argv: Optional[list] = None) -> int:
         cmd_demo(args.out, args.batch, args.top)
         return 0
 
+    # Reads the local database and writes a file. No credentials involved.
+    if args.command == "seed":
+        return cmd_seed(args.db, args.publish or SEED_PATH)
+
     cfg = load_config(args.config)
+
+    # Before the credential gate on purpose: the whole point of `pull` is that
+    # the machine running it has no Blizzard credentials and needs none.
+    if args.command == "pull":
+        url = args.url or cfg.get("pull_url") or ""
+        if not url:
+            log("Nothing to pull from. Set pull_url in config.json to the "
+                "published site, or pass --url.")
+            return 1
+        return cmd_pull(url, cfg, args.db, args.out, args.force)
+
     if not cfg["client_id"] or not cfg["client_secret"]:
         log("Missing credentials. Put client_id/client_secret in config.json, "
             "or set BNET_CLIENT_ID / BNET_CLIENT_SECRET. "
@@ -2889,7 +3223,7 @@ def main(argv: Optional[list] = None) -> int:
             cmd_names(client, store, run_cfg)
         else:
             cmd_scan(client, store, run_cfg, args.out, args.batch, args.top,
-                     args.min_listings)
+                     args.min_listings, args.publish)
     except ApiError as exc:
         log(f"error: {exc}")
         return 2
