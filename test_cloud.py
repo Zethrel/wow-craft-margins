@@ -403,6 +403,14 @@ must("a user page has no repository to guess",
 must("a custom domain has no repository to guess",
      W._derive_repo("https://prices.example.com/wow/") == "")
 
+# These assertions are about what the CONFIG says, so the ambient environment
+# has to be out of the way. Once a real token is set with setx, every new
+# process inherits it and "no token configured" quietly stops being true -
+# which is how this suite went red on a machine where the feature was working
+# perfectly. Saved and restored so the test cannot disturb the session either.
+_saved_env = {k: os.environ.pop(k, None)
+              for k in ("WOWCRAFT_GITHUB_TOKEN", "GITHUB_TOKEN")}
+
 calls = []
 real_dispatch = W._dispatch_workflow
 
@@ -531,6 +539,10 @@ must("the token is not in the persisted state", "tok" not in json.dumps(
     {k: v for k, v in statefile.items() if k.startswith("_")}))
 W._dispatch_workflow = real_dispatch
 open(mpath2, "w", encoding="utf-8").write(orig2)
+
+for _k, _v in _saved_env.items():
+    if _v is not None:
+        os.environ[_k] = _v
 
 # ---- 6f. doctor, pull side -------------------------------------------
 # Diagnosing a refused dispatch by hand took three rounds of guessing at

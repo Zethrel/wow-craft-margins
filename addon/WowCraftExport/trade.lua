@@ -17,12 +17,73 @@ local KEEP_SECONDS = 900        -- forget a request after fifteen minutes
 
 local matches = {}              -- newest first
 local frame, rows
+-- Requests dropped because the rank asked for is above anything this
+-- character can produce. Counted rather than discarded silently, so /wctrade
+-- can say "you are being filtered" instead of the addon just looking dead.
+local skipped_quality = 0
 
 -- -- what this character can make -------------------------------------------
 
 local function me()
     return (UnitName and UnitName("player") or "?") .. "-"
            .. (GetRealmName and GetRealmName() or "?")
+end
+
+-- CHAT_MSG_CHANNEL fires for your own lines too, so without this the addon
+-- answers you advertising your own services: "Zethrel wants [thing] and you
+-- can make it." Sender arrives short on your own realm and Name-Realm from
+-- elsewhere, so compare the name part and only then the realm.
+local function isMe(sender)
+    if type(sender) ~= "string" or sender == "" then return false end
+    local myName = UnitName and UnitName("player") or ""
+    local name, realm = sender:match("^([^-]+)-?(.*)$")
+    if name ~= myName then return false end
+    if realm == "" then return true end
+    local myRealm = (GetRealmName and GetRealmName() or ""):gsub("%s+", "")
+    return realm:gsub("%s+", "") == myRealm
+end
+
+-- -- quality ------------------------------------------------------------------
+--
+-- Modern crafts come out at one of five ranks and the rank is most of the
+-- price. Someone asking for rank 5 is not asking for the same object as
+-- someone who will take rank 1, and until now this addon could not tell the
+-- difference: it matched on item id alone and announced that you could make
+-- whatever was linked.
+--
+-- Two independent ways to learn what is being asked for, because people ask
+-- in both:
+--   * the link itself, when they paste an existing item - crafted quality
+--     rides along in the link and the client will decode it;
+--   * the words, when they link the plain item and type "r5" beside it.
+
+local QUALITY_WORDS = {
+    "r(%d)", "rank%s*(%d)", "q(%d)", "quality%s*(%d)", "t(%d)", "(%d)%s*star",
+}
+
+local function askedQuality(message)
+    local text = tostring(message):lower()
+    -- Strip links first: an item link is full of digits and "r5" will match
+    -- inside one sooner or later.
+    text = text:gsub("|H.-|h.-|h", " "):gsub("|c%x%x%x%x%x%x%x%x", " ")
+    for _, pattern in ipairs(QUALITY_WORDS) do
+        local n = tonumber(text:match(pattern))
+        if n and n >= 1 and n <= 5 then return n end
+    end
+    -- Written as stars rather than a number.
+    local stars = select(2, text:gsub("★", ""))
+    if stars >= 1 and stars <= 5 then return stars end
+    return nil
+end
+
+local function linkQuality(link)
+    if type(link) ~= "string" or link == "" then return nil end
+    if type(C_TradeSkillUI) ~= "table" then return nil end
+    local fn = C_TradeSkillUI.GetItemCraftedQualityByItemInfo
+    if type(fn) ~= "function" then return nil end
+    local ok, q = pcall(fn, link)
+    if ok and type(q) == "number" and q >= 1 and q <= 5 then return q end
+    return nil
 end
 
 local function craftableSet()
@@ -36,6 +97,46 @@ local function craftableSet()
     return mine
 end
 
+-- itemID -> the best rank this character can currently produce.
+local function reachableSet()
+    WowCraftExportDB = WowCraftExportDB or { format = 2, exports = {} }
+    local all = WowCraftExportDB.reachable
+    if type(all) ~= "table" then all = {} end
+    local mine = all[me()]
+    if type(mine) ~= "table" then mine = {} end
+    all[me()] = mine
+    WowCraftExportDB.reachable = all
+    return mine
+end
+
+-- What rank would come out if you made this now.
+--
+-- Asked twice, plain and with concentration, and the better answer kept -
+-- concentration is the whole point of concentration, and treating its result
+-- as out of reach would hide work you can actually take. It is still a floor:
+-- allocating higher-quality reagents can lift it further, and modelling that
+-- means rebuilding the client's allocation UI. So this errs towards saying yes,
+-- and only rules a request out when even the generous answer falls short.
+local function reachableQuality(recipeID)
+    if type(C_TradeSkillUI) ~= "table"
+            or type(C_TradeSkillUI.GetCraftingOperationInfo) ~= "function" then
+        return nil
+    end
+    local best
+    for _, concentrating in ipairs({ false, true }) do
+        local ok, info = pcall(C_TradeSkillUI.GetCraftingOperationInfo,
+                               recipeID, {}, nil, concentrating)
+        if ok and type(info) == "table" then
+            local q = info.craftingQuality or info.quality
+            if type(q) == "number" and not issecretvalue(q)
+                    and q >= 1 and q <= 5 then
+                if not best or q > best then best = q end
+            end
+        end
+    end
+    return best
+end
+
 -- Refreshed whenever a profession window is open, which is also when you would
 -- run /wcexport, so there is no extra chore. Only learned recipes count: being
 -- able to see a recipe is not being able to make it.
@@ -46,7 +147,7 @@ local function learnFromOpenProfession()
     end
     local ok, ids = pcall(C_TradeSkillUI.GetAllRecipeIDs)
     if not ok or type(ids) ~= "table" then return 0 end
-    local mine, added = craftableSet(), 0
+    local mine, reach, added = craftableSet(), reachableSet(), 0
     for _, recipeID in ipairs(ids) do
         local known = true
         local ok2, info = pcall(C_TradeSkillUI.GetRecipeInfo, recipeID)
@@ -58,10 +159,16 @@ local function learnFromOpenProfession()
                                          recipeID, false)
             if ok3 and type(schematic) == "table" then
                 local itemID = schematic.outputItemID
-                if type(itemID) == "number" and not issecretvalue(itemID)
-                        and not mine[itemID] then
-                    mine[itemID] = true
-                    added = added + 1
+                if type(itemID) == "number" and not issecretvalue(itemID) then
+                    if not mine[itemID] then
+                        mine[itemID] = true
+                        added = added + 1
+                    end
+                    -- Refreshed every time, not only for new recipes: skill
+                    -- goes up, and a rank you could not reach last week is
+                    -- exactly the thing you want the addon to notice.
+                    local q = reachableQuality(recipeID)
+                    if q then reach[itemID] = q end
                 end
             end
         end
@@ -210,18 +317,36 @@ f:SetScript("OnEvent", function(_, event, ...)
     if type(channel) ~= "string" or not channel:lower():find("trade") then
         return
     end
+    -- Your own advertisement is not a lead.
+    if isMe(sender) then return end
 
-    local mine = craftableSet()
+    local mine, reach = craftableSet(), reachableSet()
+    local wanted = askedQuality(message)
     local hit = false
     for _, itemID in ipairs(itemIDsIn(message)) do
         if mine[itemID] then
             local link = message:match("(|Hitem:" .. itemID .. ":.-|h.-|h)")
-            if remember(sender, itemID, link) then
+            -- A quality baked into the link beats one typed beside it: they
+            -- pasted the actual thing they want.
+            local want = linkQuality(link) or wanted
+            local best = reach[itemID]
+            if want and best and want > best then
+                -- Asking for a rank above anything you can produce. Announcing
+                -- it would be the addon telling you to do work you cannot do,
+                -- which is worse than silence.
+                skipped_quality = skipped_quality + 1
+            elseif remember(sender, itemID, link) then
+                local note = ""
+                if want then
+                    note = string.format(" |cffffd100(rank %d", want)
+                    note = note .. (best and string.format(", you reach %d)|r",
+                                                           best) or ")|r")
+                end
                 print(string.format(
                     "|cff44ff44WowCraft|r: |Hplayer:%s|h[%s]|h wants %s "
-                    .. "and you can make it.%s",
+                    .. "and you can make it.%s%s",
                     sender, Ambiguate and Ambiguate(sender, "short") or sender,
-                    link or "an item you know", priceLine(itemID)))
+                    link or "an item you know", note, priceLine(itemID)))
                 hit = true
             end
         end
@@ -240,15 +365,26 @@ SlashCmdList["WCTRADE"] = function(arg)
     end
     if arg == "clear" then
         matches = {}
+        skipped_quality = 0
         redraw()
         print("|cff44ff44WowCraft|r: cleared.")
         return
     end
     local mine, n = craftableSet(), 0
     for _ in pairs(mine) do n = n + 1 end
+    local reach, ranked = reachableSet(), 0
+    for _ in pairs(reach) do ranked = ranked + 1 end
     print(string.format("|cff44ff44WowCraft|r: watching trade for %d item(s) "
                         .. "%s can craft. %d recent request(s).",
                         n, me(), #matches))
+    if ranked > 0 then
+        print(string.format("  Best rank known for %d of them.", ranked))
+    end
+    if skipped_quality > 0 then
+        print(string.format("  |cffffd100%d request(s) hidden|r: the rank "
+                            .. "asked for was above anything you can make.",
+                            skipped_quality))
+    end
     if n == 0 then
         print("  Open a profession window, then |cffffff00/wctrade learn|r.")
     end
