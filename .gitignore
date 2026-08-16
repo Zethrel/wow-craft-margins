@@ -11,6 +11,8 @@ config.json
 wowcraft.sqlite3
 *.sqlite3-journal
 *.sqlite3-wal
+# Hand-made backups, e.g. before a `pull` replaces the database.
+*.sqlite3.bak-*
 
 # Generated every scan.
 dashboard.html
