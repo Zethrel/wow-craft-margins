@@ -113,7 +113,12 @@ must("and claims no savings", plate3.crafted_savings == 0.0)
 html = W.render_dashboard(res, {"realm_slug": "r", "region": "eu"},
                           1700000000, {}, {}, 50, 1, 1)
 must("the row is badged", "sourced by crafting" in html)
-must("the badge warns it needs the profession", "professions for it" in html)
+must("the badge warns it needs the profession",
+     "whether you have the professions" in html)
+# The largest savings this finds are all transmutes, which are exactly the
+# crafts limited to one a day. A saving resting on twenty of them is a
+# twenty-day plan, and the badge has to say so.
+must("the badge warns about cooldowns", "cooldown" in html)
 must("the bill names the craft", "made via Smelt Bar" in html)
 
 print()
