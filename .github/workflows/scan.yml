@@ -7,10 +7,31 @@ name: hourly scan
 on:
   schedule:
     - cron: "20 * * * *"
+  # Patch day: tick `init` to re-cache recipe definitions before scanning.
+  # Deliberately part of this workflow rather than one of its own, so the
+  # `pages` concurrency group serialises it against the hourly cron - two jobs
+  # writing the recipe cache at once would let a scan that started before the
+  # init finished save a pre-patch database over it.
   workflow_dispatch:
+    inputs:
+      init:
+        description: "Re-cache recipe definitions (patch day)"
+        type: boolean
+        default: false
+      tier:
+        description: "Limit init/names to skill tiers containing this, e.g. Midnight. Empty = every expansion (~15 min instead of ~2)"
+        type: string
+        default: ""
+      names:
+        description: "Look up names for newly priced items (~6 min). Init and names together are most of the hourly API budget; 429s only skip items, they lose nothing"
+        type: boolean
+        default: false
 
 permissions:
-  contents: read
+  # write, only so a patch-day init can commit the refreshed cold-start seed.
+  # Nothing else here writes, and the token cannot reach a fork: this workflow
+  # never runs on pull_request.
+  contents: write
   pages: write
   id-token: write
   actions: write        # only to prune this workflow's own old caches
@@ -91,6 +112,40 @@ jobs:
           echo "::error::Missing repository secret(s):$missing — add under Settings > Secrets and variables > Actions, Secrets tab. Names must match exactly, including case. Create the client at https://develop.battle.net/access/clients"
           exit 1
 
+      # Patch day only. Recipe definitions change when the game does and not
+      # otherwise, which is why the hourly run never pays for this.
+      - name: Re-cache recipe definitions
+        if: inputs.init
+        env:
+          BNET_CLIENT_ID: ${{ secrets.BNET_CLIENT_ID }}
+          BNET_CLIENT_SECRET: ${{ secrets.BNET_CLIENT_SECRET }}
+          # Through the environment, never interpolated into the script. A
+          # dispatch input substituted straight into a run: block is a shell
+          # injection, dressed up as a convenience.
+          TIER: ${{ inputs.tier }}
+        run: |
+          if [ -n "$TIER" ]; then
+            echo "init, tiers matching '$TIER'"
+            python wowcraft.py init -c ci-config.json --tier "$TIER"
+          else
+            echo "init, every expansion - this takes about fifteen minutes"
+            python wowcraft.py init -c ci-config.json
+          fi
+
+      # New items arrive unnamed, and pricecheck searches by name.
+      - name: Look up missing item names
+        if: inputs.names
+        env:
+          BNET_CLIENT_ID: ${{ secrets.BNET_CLIENT_ID }}
+          BNET_CLIENT_SECRET: ${{ secrets.BNET_CLIENT_SECRET }}
+          TIER: ${{ inputs.tier }}
+        run: |
+          if [ -n "$TIER" ]; then
+            python wowcraft.py names -c ci-config.json --tier "$TIER"
+          else
+            python wowcraft.py names -c ci-config.json
+          fi
+
       - name: Scan
         env:
           BNET_CLIENT_ID: ${{ secrets.BNET_CLIENT_ID }}
@@ -122,6 +177,34 @@ jobs:
 
       - id: deploy
         uses: actions/deploy-pages@v5
+
+      # The seed is the cold-start fallback. Leaving it at pre-patch recipes
+      # means that if the cache is ever evicted after a patch, the next run
+      # silently scans against a stale recipe set - the failure being wrong
+      # numbers rather than an error, which is the worst kind.
+      #
+      # After the deploy on purpose. The prices are already correct by this
+      # point; a push rejected because something else landed on main first
+      # should not also stop them being published.
+      - name: Commit the refreshed seed
+        if: inputs.init
+        env:
+          TIER: ${{ inputs.tier }}
+          RUN_ID: ${{ github.run_id }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          python wowcraft.py seed
+          if git diff --quiet -- seed/; then
+            echo "seed unchanged - nothing to commit"
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add seed/
+          git commit -m "Refresh the recipe seed after an init" \
+                     -m "Run ${RUN_ID}, tier filter: '${TIER:-none}'."
+          # checkout leaves a detached HEAD, so name the branch explicitly.
+          git push origin "HEAD:${BRANCH}"
 
       # A new ~18 MB cache every hour would otherwise pile up until GitHub
       # started evicting other repositories' caches to make room.

@@ -203,19 +203,35 @@ game picks up new prices.
 `scan` needs the recipe cache `init` builds — 9,725 recipes, about fifteen
 minutes. Actions runners keep nothing between runs, so the workflow carries the
 database in the Actions cache, and `seed/recipes.sqlite3.gz` (794 KB, tracked)
-is the cold-start fallback for when that cache is empty or expired. Rebuild it
-after a content patch:
-
-```bash
-python3 wowcraft.py init
-python3 wowcraft.py seed
-```
-
-and commit the result. Prices are deliberately not in the seed; they are
-refetched every run anyway.
+is the cold-start fallback for when that cache is empty or expired. Prices are
+deliberately not in the seed; they are refetched every run anyway.
 
 The workflow saves a fresh ~18 MB cache each hour and prunes all but the newest
 three, so this does not quietly grow until GitHub starts evicting caches.
+
+### Patch day
+
+Recipe definitions change when the game does and not otherwise, so the hourly
+run never pays for re-caching them. When a patch lands, go to **Actions →
+*hourly scan* → Run workflow** and tick:
+
+| Input | When |
+|---|---|
+| **init** | Always, after a patch. Re-caches recipe definitions. |
+| **tier** | Set to the new expansion, e.g. `Midnight`. Turns fifteen minutes into about two. Leave empty to re-cache every expansion back to Classic. |
+| **names** | If new items are showing up unnamed in `pricecheck`. Adds ~6 minutes. |
+
+The run inits, then scans and publishes as usual, then regenerates
+`seed/recipes.sqlite3.gz` and commits it if it changed — so a cache eviction
+after a patch cold-starts from post-patch recipes rather than silently scanning
+against a stale recipe set, which fails as wrong numbers rather than an error.
+
+`init` and `names` together are most of Blizzard's 36,000-per-hour budget. The
+worst case is HTTP 429s, which skip individual items rather than losing
+anything; the next run picks up whatever is still missing.
+
+These are the only jobs that ever needed Battle.net credentials on your own PC.
+They no longer do.
 
 ### Set the timezone, or you get every day twice
 
