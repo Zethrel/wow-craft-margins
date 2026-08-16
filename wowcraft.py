@@ -1909,22 +1909,37 @@ body {
   font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   background: var(--plane); color: var(--ink);
 }
+/* Black and yellow, after the logo.
+   --accent is the logo yellow as a FILL, and --accent-ink is what goes on top
+   of it: black, always. White on this yellow measures 1.3:1, which is no
+   contrast at all. --accent-text is yellow used as TEXT, which only works on
+   a dark ground - on the light theme it drops to an amber dark enough to read,
+   because the same yellow as text on white is illegible.
+   Profit is yellow rather than blue. Gold is the thing being counted, it is
+   the one number anybody opens this page for, and it puts the accent on
+   meaning rather than on decoration. */
 .viz-root {
-  --plane:#f9f9f7; --surface:#fcfcfb; --ink:#0b0b0b; --ink-2:#52514e;
-  --muted:#898781; --grid:#e1e0d9; --axis:#c3c2b7;
-  --pos:#2a78d6; --neg:#e34948; --mid:#f0efec;
+  --plane:#faf9f0; --surface:#ffffff; --ink:#0e0e0c; --ink-2:#4f4d43;
+  /* Dark enough to clear 4.5:1 on the plane, not just on white. The obvious
+     warm grey measured 3.7:1 there, and "muted" is still the label on half
+     the numbers. */
+  --muted:#736f5a; --grid:#e7e3cf; --axis:#c4c0a6;
+  --pos:#7d6f00; --neg:#c2491f; --mid:#f0ecd9;
+  --accent:#f5e400; --accent-ink:#0e0e0c; --accent-text:#7d6f00;
 }
 @media (prefers-color-scheme: dark) {
   :root:where(:not([data-theme="light"])) .viz-root {
-    --plane:#0d0d0d; --surface:#1a1a19; --ink:#ffffff; --ink-2:#c3c2b7;
-    --muted:#898781; --grid:#2c2c2a; --axis:#383835;
-    --pos:#3987e5; --neg:#e66767; --mid:#383835;
+    --plane:#0e0e0c; --surface:#181713; --ink:#f2f0e6; --ink-2:#b8b5a5;
+    --muted:#8d8a7c; --grid:#2a2a22; --axis:#3a3a30;
+    --pos:#f5e400; --neg:#e0784f; --mid:#3a3a30;
+    --accent:#f5e400; --accent-ink:#0e0e0c; --accent-text:#f5e400;
   }
 }
 :root[data-theme="dark"] .viz-root {
-  --plane:#0d0d0d; --surface:#1a1a19; --ink:#ffffff; --ink-2:#c3c2b7;
-  --muted:#898781; --grid:#2c2c2a; --axis:#383835;
-  --pos:#3987e5; --neg:#e66767; --mid:#383835;
+  --plane:#0e0e0c; --surface:#181713; --ink:#f2f0e6; --ink-2:#b8b5a5;
+  --muted:#8d8a7c; --grid:#2a2a22; --axis:#3a3a30;
+  --pos:#f5e400; --neg:#e0784f; --mid:#3a3a30;
+  --accent:#f5e400; --accent-ink:#0e0e0c; --accent-text:#f5e400;
 }
 .wrap { max-width: 1180px; margin: 0 auto; }
 h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: -0.01em; }
@@ -1949,13 +1964,19 @@ h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: -0.01em; }
 .bars rect.mark:hover { filter: brightness(1.12); }
 .bars line.zero { stroke: var(--axis); stroke-width: 1; }
 table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+/* Headings are sortable and nothing said so. Lighting them on hover is the
+   cheapest way to make a whole row of them discoverable. */
 th { text-align: left; font-size: 11px; text-transform: uppercase;
      letter-spacing: .05em; color: var(--muted); font-weight: 600;
      padding: 0 10px 8px; border-bottom: 1px solid var(--grid);
      white-space: nowrap; cursor: pointer; user-select: none; }
+th:hover { color: var(--accent-text); }
 th.num, td.num { text-align: right; font-variant-numeric: tabular-nums; }
 td { padding: 9px 10px; border-bottom: 1px solid var(--grid); vertical-align: middle; }
-tbody tr:hover { background: color-mix(in srgb, var(--ink) 4%, transparent); }
+/* A yellow wash rather than a grey one, so the row under the cursor belongs
+   to the same palette as everything else. Kept at 8% because a full-strength
+   yellow row would drown the numbers on it. */
+tbody tr:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); }
 .pos { color: var(--pos); font-weight: 600; }
 .neg { color: var(--neg); font-weight: 600; }
 .name { font-weight: 500; }
@@ -1980,6 +2001,15 @@ details[open] summary::before { content: "▾ "; }
   font: inherit; font-size: 13px; padding: 6px 10px; border-radius: 7px;
   border: 1px solid var(--axis); background: var(--surface); color: var(--ink); }
 .controls button { cursor: pointer; }
+.controls button:hover { background: var(--accent); color: var(--accent-ink);
+                         border-color: var(--accent); }
+/* One focus treatment for every control, and a visible one. Keyboard users
+   were previously left with whatever the browser drew over a dark surface. */
+.controls input:focus-visible, .controls select:focus-visible,
+.controls button:focus-visible, th:focus-visible, summary:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 2px; }
+.controls input:focus, .controls select:focus { border-color: var(--accent); }
+.controls input[type=checkbox] { accent-color: var(--accent); }
 .warn { background: var(--surface); border: 1px solid var(--grid);
         border-left: 3px solid var(--neg); border-radius: 8px;
         padding: 12px 16px; font-size: 13px; color: var(--ink-2);
