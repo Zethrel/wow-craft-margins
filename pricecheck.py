@@ -218,22 +218,39 @@ class Prices:
         self.rows = sorted(best.values(), key=lambda x: -x["supply"])
 
 
-# A dark palette, because this sits open beside a game that is dark, and a
-# white grid at 11pm is the reason people close a tool like this. Colours are
-# assigned to meaning rather than to rows: gold is money, green and red are
-# direction, grey is context you can ignore.
+# Black and yellow, after the logo. Dark because this sits open beside a game
+# that is dark, and a white grid at 11pm is the reason people close a tool like
+# this.
+#
+# Yellow is an accent, not a surface. A saturated yellow is the brightest thing
+# a screen can do, and a window full of it is unreadable within a minute - so
+# it marks the few things worth the eye: the row you picked, the field you are
+# typing in, the headings you can click. Everything else is black, grey and the
+# off-white that carries the actual numbers. (The sorted column is marked with
+# an arrow rather than a colour: ttk styles all headings together, so there is
+# no way to light up just one.)
+#
+# Backgrounds are warm-tinted rather than pure #000: on an LCD, true black
+# beside a bright yellow makes the edges buzz.
 THEME = {
-    "bg":      "#1b1b19",
-    "panel":   "#232321",
-    "row":     "#1c1c1a",
-    "row_alt": "#242422",
-    "sel":     "#34506e",
-    "text":    "#e6e4df",
-    "muted":   "#8c8a83",
-    "gold":    "#d8b45a",
-    "pos":     "#6cc06c",
-    "neg":     "#e06c6c",
-    "line":    "#33332f",
+    "bg":       "#0e0e0c",
+    "panel":    "#181713",
+    "row":      "#121210",
+    "row_alt":  "#1a1a16",
+    "sel":      "#f5e400",   # the logo yellow, as a selected row
+    "sel_text": "#0e0e0c",   # black on it, because yellow cannot carry white
+    "text":     "#eceade",
+    "muted":    "#8d8a7c",
+    "accent":   "#f5e400",
+    "accent_dim": "#b3a600",  # yellow at rest, for borders and headings
+    "line":     "#2c2b24",
+    # Kept because they name meanings the window will want when it grows a
+    # profit column: money, and direction. Tuned to sit with the yellow rather
+    # than fight it - a pure #6cc06c green next to #f5e400 reads as a traffic
+    # light. Not referenced yet; nothing here has a direction to show.
+    "gold":     "#f5e400",
+    "pos":      "#9fc95a",
+    "neg":      "#e0784f",
 }
 
 
@@ -252,32 +269,50 @@ def style_window(root: tk.Tk) -> None:
     style.configure("TFrame", background=THEME["bg"])
     style.configure("TLabel", background=THEME["bg"], foreground=THEME["muted"])
     style.configure("Status.TLabel", foreground=THEME["muted"])
+    # The caret is yellow so you can find where you are typing on a black
+    # field, and the focus border lights up rather than merely thickening.
     style.configure("TEntry", fieldbackground=THEME["panel"],
-                    foreground=THEME["text"], insertcolor=THEME["text"],
+                    foreground=THEME["text"], insertcolor=THEME["accent"],
                     bordercolor=THEME["line"], lightcolor=THEME["line"],
                     darkcolor=THEME["line"], padding=5)
+    style.map("TEntry",
+              bordercolor=[("focus", THEME["accent"])],
+              lightcolor=[("focus", THEME["accent"])],
+              darkcolor=[("focus", THEME["accent"])])
     style.configure("TCombobox", fieldbackground=THEME["panel"],
                     background=THEME["panel"], foreground=THEME["text"],
-                    arrowcolor=THEME["muted"], bordercolor=THEME["line"],
+                    arrowcolor=THEME["accent_dim"], bordercolor=THEME["line"],
                     padding=4)
     style.map("TCombobox",
               fieldbackground=[("readonly", THEME["panel"])],
-              foreground=[("readonly", THEME["text"])])
+              foreground=[("readonly", THEME["text"])],
+              bordercolor=[("focus", THEME["accent"])],
+              arrowcolor=[("active", THEME["accent"])])
+    # Buttons sit quiet until hovered, then go full logo: yellow plate, black
+    # letter. Black on yellow, never white - white on this yellow is barely
+    # a contrast at all.
     style.configure("TButton", background=THEME["panel"],
                     foreground=THEME["text"], bordercolor=THEME["line"],
                     padding=(10, 4))
-    style.map("TButton", background=[("active", THEME["sel"])])
+    style.map("TButton",
+              background=[("active", THEME["accent"])],
+              foreground=[("active", THEME["sel_text"])])
     style.configure("Treeview", background=THEME["row"],
                     fieldbackground=THEME["row"], foreground=THEME["text"],
                     rowheight=22, borderwidth=0)
     style.configure("Treeview.Heading", background=THEME["panel"],
-                    foreground=THEME["muted"], relief="flat", padding=(6, 5))
-    style.map("Treeview.Heading", background=[("active", THEME["line"])])
+                    foreground=THEME["accent_dim"], relief="flat",
+                    padding=(6, 5))
+    style.map("Treeview.Heading",
+              background=[("active", THEME["line"])],
+              foreground=[("active", THEME["accent"])])
     style.map("Treeview", background=[("selected", THEME["sel"])],
-              foreground=[("selected", THEME["text"])])
-    style.configure("Vertical.TScrollbar", background=THEME["panel"],
+              foreground=[("selected", THEME["sel_text"])])
+    style.configure("Vertical.TScrollbar", background=THEME["line"],
                     troughcolor=THEME["bg"], bordercolor=THEME["bg"],
                     arrowcolor=THEME["muted"])
+    style.map("Vertical.TScrollbar",
+              background=[("active", THEME["accent_dim"])])
 
 
 COLUMNS = (
@@ -382,6 +417,18 @@ class App:
                       reverse=reverse)
         return rows
 
+    def mark_headings(self) -> None:
+        """Arrow on the column being sorted by.
+
+        The headings are clickable and nothing said so, which on a dark grid
+        is easy to miss entirely. An arrow rather than a colour because ttk
+        styles every heading as one - there is no per-column foreground."""
+        for key, title, _w, _a in COLUMNS:
+            sorted_on = self.sort_key == key or (
+                key == "today" and self.sort_key == "high")
+            arrow = (" ▾" if self.sort_desc else " ▴") if sorted_on else ""
+            self.tree.heading(key, text=title + arrow)
+
     def sort_by(self, key: str) -> None:
         if key in ("today", "trend"):
             key = "trend" if key == "trend" else "high"
@@ -427,6 +474,7 @@ class App:
 
     def render(self) -> None:
         rows = self.matching()
+        self.mark_headings()
         self.tree.delete(*self.tree.get_children())
         for index, r in enumerate(rows[:self.limit]):
             today = "-"
