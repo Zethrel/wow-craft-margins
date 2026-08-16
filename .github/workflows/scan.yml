@@ -57,15 +57,23 @@ jobs:
           echo "cold start: seeded from seed/recipes.sqlite3.gz"
 
       # Without this a missing secret is just "exit code 1" in a collapsed log
-      # group. Checked as lengths so nothing about the values reaches the log.
+      # group. Only lengths are ever printed, never any part of a value.
+      #
+      # Deliberately reads the two secrets by name. An earlier version listed
+      # every visible secret name via toJSON(secrets) to tell a typo apart
+      # from a missing entry, and GitHub's scanner blocked the workflow for
+      # it - correctly, since dumping that context is exactly what
+      # exfiltration looks like and no scanner can see that the jq only ever
+      # emitted keys. Not worth a permanent malicious-workflow flag.
       - name: Check the credentials are configured
         env:
           BNET_CLIENT_ID: ${{ secrets.BNET_CLIENT_ID }}
           BNET_CLIENT_SECRET: ${{ secrets.BNET_CLIENT_SECRET }}
-          # Names only, never values - see the jq below. The one thing that
-          # tells a typo apart from a secret in the wrong place.
-          SECRET_NAMES: ${{ toJSON(secrets) }}
-          VAR_NAMES: ${{ toJSON(vars) }}
+          # Settings > Secrets and variables > Actions has two tabs, and a
+          # client secret pasted into the Variables one is stored in clear.
+          # Testing for emptiness names no value.
+          ID_IN_VARS: ${{ vars.BNET_CLIENT_ID != '' }}
+          SECRET_IN_VARS: ${{ vars.BNET_CLIENT_SECRET != '' }}
         run: |
           missing=""
           [ -n "$BNET_CLIENT_ID" ] || missing="$missing BNET_CLIENT_ID"
@@ -75,20 +83,12 @@ jobs:
             exit 0
           fi
 
-          echo "Secrets this job can see:"
-          printf '%s' "$SECRET_NAMES" | jq -r 'keys[]' | sed 's/^/  - /'
-          echo "Variables this job can see:"
-          printf '%s' "$VAR_NAMES" | jq -r 'keys[]' | sed 's/^/  - /'
-
-          # Settings > Secrets and variables > Actions has two tabs, and a
-          # client secret pasted into the Variables one is stored in clear and
-          # printable. Say so rather than quietly reading it.
-          if printf '%s' "$VAR_NAMES" | jq -e 'has("BNET_CLIENT_ID") or has("BNET_CLIENT_SECRET")' >/dev/null; then
-            echo "::error::BNET_* is set under Variables, not Secrets. Variables are stored in clear and show up in logs - delete them there and re-add under the Secrets tab."
+          if [ "$ID_IN_VARS" = "true" ] || [ "$SECRET_IN_VARS" = "true" ]; then
+            echo "::error::BNET_* is set under Variables, not Secrets. Variables are stored in clear and show up in logs - delete them there, treat the value as exposed, and re-add under the Secrets tab."
             exit 1
           fi
 
-          echo "::error::Missing repository secret(s):$missing — add them under Settings > Secrets and variables > Actions, on the Secrets tab. The names must match exactly. Create the client at https://develop.battle.net/access/clients"
+          echo "::error::Missing repository secret(s):$missing — add under Settings > Secrets and variables > Actions, Secrets tab. Names must match exactly, including case. Create the client at https://develop.battle.net/access/clients"
           exit 1
 
       - name: Scan
