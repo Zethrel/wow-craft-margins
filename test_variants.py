@@ -1,4 +1,4 @@
-"""Blizzard's recipe endpoint gives every crafting-quality rank the same
+﻿"""Blizzard's recipe endpoint gives every crafting-quality rank the same
 crafted_item id. Verify we collapse those to the cheapest rather than
 reporting one opportunity several times."""
 import json, sys
@@ -113,19 +113,19 @@ res5, _ = compute_margins([rec(1, 1, 5)], lp, {1: "A", 9: "Out"}, batch=1,
 html3 = render_dashboard(res5, {"realm_slug": "r", "region": "eu"},
                          1700000000, {}, {}, 50, 1, 1)
 must("a single fishing listing does not earn a badge",
-     "revenue is a floor" not in html3)
+     ">revenue is a floor</span>" not in html3)
 
 # The badge itself, through the renderer.
 cfg = {"realm_slug": "r", "region": "eu"}
 html = render_dashboard(res3, cfg, 1700000000, {}, {}, 50, 1, 1)
-must("a wide spread is badged", "revenue is a floor" in html)
+must("a wide spread is badged", ">revenue is a floor</span>" in html)
 must("the badge says what the dearest variant would pay",
      "instead" in html and "bonus-list variants" in html)
 
 res4, _ = compute_margins([rec(1, 1, 5)], fp, {1: "A", 9: "Out"}, batch=1,
                           min_listings=1)
 html2 = render_dashboard(res4, cfg, 1700000000, {}, {}, 50, 1, 1)
-must("flat variants are not badged", "revenue is a floor" not in html2)
+must("flat variants are not badged", ">revenue is a floor</span>" not in html2)
 must(f"the threshold is a spread of {VARIANT_SPREAD}x", VARIANT_SPREAD > 1.0)
 
 print()

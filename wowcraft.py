@@ -1696,7 +1696,14 @@ function applyFilters() {
     const ok = (!q || tr.dataset.name.includes(q))
       && (!p || tr.dataset.prof === p)
       && (!x || tr.dataset.exp === x)
-      && (!onlyPos.checked || parseFloat(tr.dataset.margin) > 0)
+      // "Only profitable" filters on the margin - which, on rows badged
+      // "revenue is a floor", is the very number that is understated. Hiding
+      // them by it would use the flaw to suppress the warning about the flaw,
+      // and those rows are the ones worth a second look: a loss that may not
+      // be one. data-maybe marks a row whose dearest traded variant clears
+      // its cost.
+      && (!onlyPos.checked || parseFloat(tr.dataset.margin) > 0
+          || tr.dataset.maybe === '1')
       && (!onlyFirm.checked || tr.dataset.firm === '1');
     tr.hidden = !ok;
     if (detail && detail.classList.contains('detail')) detail.hidden = !ok;
@@ -2228,6 +2235,7 @@ def render_dashboard(results: list, cfg: dict, taken_at: int, skipped: dict,
             f'data-prof="{esc(r.profession)}" '
             f'data-exp="{esc(expansion_of(r.skill_tier, r.profession))}" '
             f'data-firm="{1 if r.cost_complete else 0}" '
+            f'data-maybe="{1 if best and best > r.cost else 0}" '
             f'data-margin="{r.margin:.0f}" '
             f'data-pct="{r.margin_pct:.2f}" data-cost="{r.cost:.0f}" '
             f'data-rev="{r.revenue:.0f}" data-supply="{r.output_supply}">'
