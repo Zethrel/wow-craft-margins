@@ -8,7 +8,8 @@ try:
 except ImportError:
     print("SKIP  test_prices.py needs lupa (pip install lupa)")
     sys.exit(0)
-ADDON = r"D:\Claude & Zethrel\wow-craft-margins\addon\WowCraftExport\prices.lua"
+ADDON = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                     "addon", "WowCraftExport", "prices.lua")
 import tempfile, sqlite3
 import wowcraft as W
 
