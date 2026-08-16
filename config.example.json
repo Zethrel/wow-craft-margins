@@ -15,5 +15,16 @@
   "_history_days": "Days of price history to keep. One row per item per day; several scans on the same day update that day's row. 0 keeps everything.",
   "history_days": 7,
   "_pull_url": "Where `pull` fetches a published scan from - the GitHub Pages site the hourly workflow deploys to, e.g. https://<user>.github.io/wow-craft-margins/ . Set this and this machine needs no credentials, no recipe cache and no scheduled scan; `pull` just downloads the answer. Empty = this PC scans for itself.",
-  "pull_url": ""
+  "pull_url": "",
+
+  "_dispatch": "GitHub's scheduler is best-effort and drops slots. If the published data is older than dispatch_when_stale_minutes, `pull` asks GitHub to run the scan now rather than waiting out the gap. Blizzard refreshes hourly, so past 90 minutes a cycle went missing rather than merely running late. 0 disables the whole thing and needs no token.",
+  "dispatch_when_stale_minutes": 90,
+  "_github_token": "A FINE-GRAINED token, this repository only, with Actions: read and write and nothing else. Prefer the WOWCRAFT_GITHUB_TOKEN environment variable, which overrides this - config.json is gitignored, but a token in an environment variable cannot be committed by accident at all. Leave empty to never dispatch.",
+  "github_token": "",
+  "_dispatch_repo": "\"owner/name\". Empty = derived from pull_url when that is a project Pages URL; set it for a custom domain.",
+  "dispatch_repo": "",
+  "dispatch_workflow": "scan.yml",
+  "dispatch_ref": "main",
+  "_dispatch_wait_seconds": "How long to wait for the requested scan to publish before leaving it to the next pull. A run takes about a minute plus the Pages deploy. 0 = do not wait.",
+  "dispatch_wait_seconds": 240
 }

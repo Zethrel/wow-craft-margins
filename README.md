@@ -205,6 +205,43 @@ forty minutes late is still collected within the hour instead of being missed
 entirely. An unchanged pull costs one 693-byte manifest fetch, so the extra
 runs are free.
 
+### Kicking a late publisher
+
+Running late is one thing; **dropped slots** are another. Of the first three
+observed, two ran 21 and 31 minutes behind and one never published at all.
+
+Set a token and `pull` handles that itself: when the published data is older
+than `dispatch_when_stale_minutes` (default 90), it asks GitHub to run the
+scan now, waits up to `dispatch_wait_seconds` for it to appear, and collects
+it in the same run. Blizzard refreshes hourly, so 90 minutes means a cycle
+genuinely went missing rather than merely arriving late — normal lateness never
+triggers it. A dispatched run starts immediately, because it is not sitting in
+the schedule queue.
+
+It asks **once per half hour at most**, whatever the pull schedule, and the
+cooldown survives `--force`. The workflow is not the bottleneck — GitHub's
+queue is — so asking twice does not make it arrive sooner.
+
+**The token.** Create a [fine-grained personal access
+token](https://github.com/settings/personal-access-tokens/new): this
+repository only, and **Actions: read and write** as the sole permission. Give
+it the shortest expiry you will tolerate re-issuing. Then either put it in
+`config.json` as `github_token`, or — better — set it as an environment
+variable:
+
+```bash
+setx WOWCRAFT_GITHUB_TOKEN "github_pat_..."
+```
+
+The environment wins over the file. `config.json` is gitignored, but a token
+that is never in a file cannot be committed by accident at all. `pull` only
+ever puts it in an `Authorization` header: it is never logged, never echoed on
+failure, and never written to `.pull-state.json`, all of which the tests check.
+
+Leave `github_token` empty and none of this happens — `pull` says it noticed
+the staleness and carries on. Set `dispatch_when_stale_minutes` to `0` to
+switch it off entirely.
+
 ### The database, and why there is a seed
 
 `scan` needs the recipe cache `init` builds — 9,725 recipes, about fifteen

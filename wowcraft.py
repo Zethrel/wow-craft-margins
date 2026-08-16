@@ -3064,6 +3064,146 @@ def _install_prices_db(blob: bytes, db_path: str, keep_days: int = 0) -> None:
         raise
 
 
+# Once every half hour at most, however many pulls notice the staleness. The
+# workflow is not the bottleneck - GitHub's queue is - so asking twice does
+# not make it arrive sooner, it just spends API budget and run minutes.
+DISPATCH_COOLDOWN = 1800
+
+
+def _derive_repo(pull_url: str) -> str:
+    """owner/repo from a project Pages URL, so the usual case needs no config.
+
+    https://zethrel.github.io/wow-craft-margins/ -> Zethrel/wow-craft-margins
+
+    Only that shape. A custom domain or a user/organisation page carries no
+    repository name at all, and guessing one would produce a confusing 404
+    against somebody else's repository rather than an honest "set this".
+    """
+    parts = urllib.parse.urlsplit(pull_url)
+    host, path = parts.netloc.lower(), parts.path.strip("/")
+    if not host.endswith(".github.io") or not path:
+        return ""
+    owner = host[:-len(".github.io")]
+    repo = path.split("/")[0]
+    return f"{owner}/{repo}" if owner and repo else ""
+
+
+def _dispatch_workflow(repo: str, workflow: str, ref: str,
+                       token: str) -> tuple:
+    """Ask GitHub to run the scan now. Returns (ok, message).
+
+    The token is only ever put in a header. It is never logged, never echoed
+    back on failure, and never written to the pull state.
+    """
+    url = (f"https://api.github.com/repos/{repo}/actions/workflows/"
+           f"{workflow}/dispatches")
+    body = json.dumps({"ref": ref}).encode()
+    req = urllib.request.Request(url, data=body, method="POST", headers={
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.status in (201, 204), f"HTTP {resp.status}"
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            return False, (f"HTTP {exc.code} - the token was rejected. It "
+                           "needs Actions: read and write on this repository, "
+                           "and must not have expired.")
+        if exc.code == 404:
+            return False, (f"HTTP 404 - no workflow '{workflow}' in {repo}, "
+                           "or the token cannot see the repository.")
+        if exc.code == 422:
+            return False, (f"HTTP 422 - {repo} has no '{workflow}' on ref "
+                           f"'{ref}', or it has no workflow_dispatch trigger.")
+        return False, f"HTTP {exc.code}"
+    except (urllib.error.URLError, OSError) as exc:
+        return False, str(exc)
+
+
+def _maybe_dispatch(cfg: dict, url: str, manifest: dict, state: dict) -> bool:
+    """Kick the publisher when it has plainly missed a cycle.
+
+    GitHub's scheduler is best-effort: observed slots ran twenty to thirty
+    minutes late, and one was dropped outright. Blizzard refreshes hourly, so
+    data older than the threshold means a whole cycle went missing rather than
+    merely arriving late. A dispatch runs the same workflow the cron would
+    have, and it starts immediately because it is not sitting in the schedule
+    queue.
+
+    Returns True if a dispatch was accepted, so the caller can wait for it.
+    """
+    minutes = int(cfg.get("dispatch_when_stale_minutes", 0) or 0)
+    if minutes <= 0:
+        return False
+
+    age = int(time.time()) - int(manifest.get("data_time") or 0)
+    if age < minutes * 60:
+        return False
+
+    token = (os.environ.get("WOWCRAFT_GITHUB_TOKEN")
+             or os.environ.get("GITHUB_TOKEN")
+             or cfg.get("github_token") or "")
+    if not token:
+        log(f"  data is {age // 60} min old, past the {minutes}-minute "
+            "threshold, but no token is set - not asking for a fresh scan. "
+            "See 'Kicking a late publisher' in the README.")
+        return False
+
+    repo = cfg.get("dispatch_repo") or _derive_repo(url)
+    if not repo:
+        log("  cannot work out the repository from pull_url - set "
+            "dispatch_repo to \"owner/name\" in config.json.")
+        return False
+
+    since = int(time.time()) - int(state.get("_dispatched_at", 0) or 0)
+    if since < DISPATCH_COOLDOWN:
+        log(f"  data is {age // 60} min old, but a scan was already requested "
+            f"{since // 60} min ago - waiting for it.")
+        return False
+
+    log(f"  data is {age // 60} min old (threshold {minutes}); asking "
+        f"{repo} to scan now")
+    ok, detail = _dispatch_workflow(
+        repo, cfg.get("dispatch_workflow", "scan.yml") or "scan.yml",
+        cfg.get("dispatch_ref", "main") or "main", token)
+    # Recorded even on failure: a rejected token rejects it every thirty
+    # minutes too, and hammering the API changes nothing.
+    state["_dispatched_at"] = int(time.time())
+    if ok:
+        log("    accepted - the workflow is starting")
+    else:
+        log(f"    warn: could not request a scan: {detail}")
+    return ok
+
+
+def _await_publish(base: str, was: int, seconds: int) -> dict:
+    """Wait for a newer manifest after a dispatch. Returns it, or {}.
+
+    A scan takes about four seconds; the wait is almost entirely the runner
+    starting up and Pages deploying. Bounded, because the scheduled task that
+    calls this has a thirty-minute execution limit and the next pull is only
+    half an hour away in any case.
+    """
+    deadline = time.time() + seconds
+    log(f"  waiting up to {seconds}s for it to publish")
+    while time.time() < deadline:
+        time.sleep(15)
+        try:
+            fresh = json.loads(_fetch(base + MANIFEST_NAME, timeout=30))
+        except (urllib.error.URLError, OSError, ValueError):
+            continue
+        if int(fresh.get("generated_at") or 0) > was:
+            age = int(time.time()) - int(fresh.get("data_time") or 0)
+            log(f"    published - data is now {age // 60} min old")
+            return fresh
+    log("    still nothing; the next pull will collect it")
+    return {}
+
+
 def cmd_pull(url: str, cfg: dict, db_path: str, out_path: str,
              force: bool = False) -> int:
     """Download the published set and put each piece where it is looked for.
@@ -3107,12 +3247,25 @@ def cmd_pull(url: str, cfg: dict, db_path: str, out_path: str,
     state_path = os.path.join(os.path.dirname(os.path.abspath(db_path)),
                               PULL_STATE)
     state = {}
-    if not force and os.path.exists(state_path):
+    if os.path.exists(state_path):
         try:
             with open(state_path, encoding="utf-8") as fh:
                 state = json.load(fh)
         except (ValueError, OSError):
             state = {}
+    if force:
+        # Drop the file hashes so everything downloads again, but keep the
+        # dispatch cooldown - `--force` means "fetch it all", not "ignore the
+        # request you already made ten minutes ago".
+        state = {k: v for k, v in state.items() if k.startswith("_")}
+
+    # GitHub's scheduler drops slots. If a whole cycle has gone missing, ask
+    # for the scan rather than waiting out the gap.
+    if _maybe_dispatch(cfg, url, manifest, state):
+        fresh = _await_publish(base, int(manifest.get("generated_at") or 0),
+                               int(cfg.get("dispatch_wait_seconds", 240) or 0))
+        if fresh:
+            manifest = fresh
 
     # Where each published file belongs on this machine. A destination of None
     # means "published, but this PC has not asked for it".
@@ -3209,6 +3362,23 @@ DEFAULT_CONFIG = {
     # a scheduled scan on this machine; `pull` downloads what the workflow
     # already worked out. Empty = this PC scans for itself.
     "pull_url": "",
+    # If the published data is older than this, `pull` asks GitHub to run the
+    # scan now instead of waiting for the next cron slot. Blizzard refreshes
+    # hourly, so anything past 90 minutes means a cycle was dropped rather
+    # than merely running late. 0 disables it. Needs a token - see below.
+    "dispatch_when_stale_minutes": 90,
+    # A fine-grained token with Actions: read and write on this one
+    # repository, and nothing else. WOWCRAFT_GITHUB_TOKEN or GITHUB_TOKEN in
+    # the environment override this, which is the tidier place for it.
+    "github_token": "",
+    # "owner/name". Empty = worked out from pull_url when that is a project
+    # Pages URL; set it explicitly for a custom domain.
+    "dispatch_repo": "",
+    "dispatch_workflow": "scan.yml",
+    "dispatch_ref": "main",
+    # How long to wait for the requested scan to publish before giving up and
+    # leaving it to the next pull. 0 = do not wait.
+    "dispatch_wait_seconds": 240,
 }
 
 

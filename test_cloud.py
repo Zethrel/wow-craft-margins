@@ -387,6 +387,151 @@ with contextlib.redirect_stderr(zlog := io.StringIO()):
         W.cmd_pull(url, local_cfg, local_db, local_dash)
 must("matching timezones say nothing", "WARNING" not in zlog.getvalue())
 
+# ---- 6e. kicking a late publisher ------------------------------------
+# GitHub's scheduler drops slots outright, so a pull that finds a whole cycle
+# missing asks for the scan rather than waiting the gap out. What matters is
+# that it only fires when a cycle really is missing, only once per cooldown,
+# and never puts the token anywhere it can leak.
+must("a project Pages URL yields the repository",
+     W._derive_repo("https://zethrel.github.io/wow-craft-margins/")
+     == "zethrel/wow-craft-margins")
+must("a trailing path does not confuse it",
+     W._derive_repo("https://zethrel.github.io/wow-craft-margins")
+     == "zethrel/wow-craft-margins")
+must("a user page has no repository to guess",
+     W._derive_repo("https://zethrel.github.io/") == "")
+must("a custom domain has no repository to guess",
+     W._derive_repo("https://prices.example.com/wow/") == "")
+
+calls = []
+real_dispatch = W._dispatch_workflow
+
+
+def fake_dispatch(repo, workflow, ref, token):
+    calls.append({"repo": repo, "workflow": workflow, "ref": ref,
+                  "token": token})
+    return True, "HTTP 204"
+
+
+W._dispatch_workflow = fake_dispatch
+NOW = int(time.time())
+base_cfg = dict(local_cfg, dispatch_when_stale_minutes=90,
+                github_token="tok_SECRET_VALUE", dispatch_wait_seconds=0)
+site_url = "https://zethrel.github.io/wow-craft-margins/"
+
+
+def try_dispatch(cfg, age_minutes, state):
+    calls.clear()
+    manifest = {"data_time": NOW - age_minutes * 60, "generated_at": NOW}
+    with contextlib.redirect_stderr(io.StringIO()) as err:
+        fired = W._maybe_dispatch(cfg, site_url, manifest, state)
+    return fired, state, err.getvalue()
+
+
+fired, st, _ = try_dispatch(base_cfg, 40, {})
+must("fresh data does not ask for a scan", fired is False and not calls)
+
+fired, st, _ = try_dispatch(base_cfg, 120, {})
+must("a missed cycle asks for a scan", fired is True and len(calls) == 1)
+must("it asks the right repository and workflow",
+     calls[0]["repo"] == "zethrel/wow-craft-margins"
+     and calls[0]["workflow"] == "scan.yml" and calls[0]["ref"] == "main")
+must("the dispatch time is recorded", "_dispatched_at" in st)
+
+# Second pull, thirty minutes not yet elapsed.
+fired, _, msg = try_dispatch(base_cfg, 120, dict(st))
+must("a second pull inside the cooldown does not ask again",
+     fired is False and not calls)
+must("it says a scan is already on its way", "already requested" in msg)
+
+fired, _, _ = try_dispatch(base_cfg, 120,
+                           {"_dispatched_at": NOW - W.DISPATCH_COOLDOWN - 60})
+must("past the cooldown it asks again", fired is True and len(calls) == 1)
+
+fired, _, msg = try_dispatch(dict(base_cfg, github_token=""), 120, {})
+must("no token means no dispatch", fired is False and not calls)
+must("and it says why", "no token is set" in msg)
+
+fired, _, msg = try_dispatch(
+    dict(base_cfg, dispatch_repo=""), 120, {})
+must("a derivable repo needs no config", fired is True)
+fired, _, msg = try_dispatch(
+    dict(base_cfg, dispatch_repo=""), 120, {})
+# Same call but through a URL nothing can be derived from.
+calls.clear()
+with contextlib.redirect_stderr(io.StringIO()) as err:
+    fired = W._maybe_dispatch(dict(base_cfg, dispatch_repo=""),
+                              "https://prices.example.com/",
+                              {"data_time": NOW - 7200, "generated_at": NOW}, {})
+must("an underivable URL asks for dispatch_repo instead of guessing",
+     fired is False and "dispatch_repo" in err.getvalue())
+
+fired, _, msg = try_dispatch(dict(base_cfg, dispatch_when_stale_minutes=0),
+                             9999, {})
+must("zero disables it entirely", fired is False and not calls)
+
+# A failed dispatch still starts the cooldown - a rejected token is rejected
+# every thirty minutes too.
+W._dispatch_workflow = lambda *a: (False, "HTTP 403 - the token was rejected.")
+st2 = {}
+with contextlib.redirect_stderr(io.StringIO()) as err:
+    fired = W._maybe_dispatch(base_cfg, site_url,
+                              {"data_time": NOW - 7200, "generated_at": NOW},
+                              st2)
+must("a rejected dispatch is reported, not swallowed",
+     fired is False and "403" in err.getvalue())
+must("a rejected dispatch still starts the cooldown", "_dispatched_at" in st2)
+
+# The token must not reach the log, or the state file that sits beside the db.
+W._dispatch_workflow = fake_dispatch
+leak = io.StringIO()
+st3 = {}
+with contextlib.redirect_stderr(leak):
+    W._maybe_dispatch(base_cfg, site_url,
+                      {"data_time": NOW - 7200, "generated_at": NOW}, st3)
+must("the token is never logged", "tok_SECRET_VALUE" not in leak.getvalue())
+must("the token is never written to the pull state",
+     "tok_SECRET_VALUE" not in json.dumps(st3))
+
+# The environment beats the config file, so the token can stay out of it.
+os.environ["WOWCRAFT_GITHUB_TOKEN"] = "tok_FROM_ENV"
+calls.clear()
+with contextlib.redirect_stderr(io.StringIO()):
+    W._maybe_dispatch(dict(base_cfg, github_token="tok_FROM_FILE"), site_url,
+                      {"data_time": NOW - 7200, "generated_at": NOW}, {})
+must("the environment overrides the config file",
+     calls and calls[0]["token"] == "tok_FROM_ENV")
+del os.environ["WOWCRAFT_GITHUB_TOKEN"]
+
+W._dispatch_workflow = real_dispatch
+
+# End to end: a stale manifest on the real pull path triggers one dispatch.
+mpath2 = os.path.join(site, W.MANIFEST_NAME)
+orig2 = open(mpath2, encoding="utf-8").read()
+stale = json.loads(orig2)
+stale["data_time"] = NOW - 7200
+open(mpath2, "w", encoding="utf-8").write(json.dumps(stale))
+seen = []
+W._dispatch_workflow = lambda *a: (seen.append(a) or (True, "HTTP 204"))
+with contextlib.redirect_stderr(io.StringIO()) as elog:
+    with contextlib.redirect_stdout(quiet):
+        # dispatch_repo explicitly: this pull is served from a local test
+        # server, not a Pages URL, so there is nothing to derive from.
+        W.cmd_pull(url, dict(local_cfg, dispatch_when_stale_minutes=90,
+                             github_token="tok", dispatch_wait_seconds=0,
+                             dispatch_repo="zethrel/wow-craft-margins"),
+                   local_db, local_dash)
+must("cmd_pull dispatches when the published data is stale", len(seen) == 1)
+must("the pull still completes after dispatching",
+     "pull complete" in elog.getvalue())
+statefile = json.load(open(os.path.join(local, W.PULL_STATE), encoding="utf-8"))
+must("the cooldown is persisted for the next pull",
+     "_dispatched_at" in statefile)
+must("the token is not in the persisted state", "tok" not in json.dumps(
+    {k: v for k, v in statefile.items() if k.startswith("_")}))
+W._dispatch_workflow = real_dispatch
+open(mpath2, "w", encoding="utf-8").write(orig2)
+
 # ---- 7. an interrupted pull leaves the old database alone ------------
 good = open(local_db, "rb").read()
 try:
