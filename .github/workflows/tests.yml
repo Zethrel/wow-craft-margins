@@ -12,8 +12,8 @@ jobs:
   tests:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       # test_addon.py drives the addon's Lua for real and skips cleanly
@@ -22,9 +22,16 @@ jobs:
       - run: pip install lupa
       - name: Run every suite
         run: |
-          status=0
+          failed=""
           for f in test_*.py; do
-            echo "== $f"
-            python "$f" || status=1
+            echo "::group::$f"
+            python "$f" || failed="$failed $f"
+            echo "::endgroup::"
           done
-          exit $status
+          # Each suite prints its own PASS/FAIL lines; without this you have to
+          # open every group to find out which one actually went red.
+          if [ -n "$failed" ]; then
+            echo "::error::failing suites:$failed"
+            exit 1
+          fi
+          echo "all suites pass"
