@@ -560,24 +560,33 @@ These are real gaps, not hedging:
   mistake — the first version of this badge reported that a lone 2.6M listing on
   old PvP gear made a craft worth 2.48M. On a live scan the honest count is 7
   rows out of 5,919, three of which show a loss that may not be one.
-- **How much sold.** Not available, and worth being precise about why. The API
-  publishes what is *listed*, never what changed hands. The **Moves** column
-  therefore reports only a direction: whether the listed quantity ever fell
-  across the observed window, which means units left the market, against
-  *static*, which means nothing did.
+- **How much sold — with caveats, not none.** The API publishes what is
+  *listed*, never what changed hands, so sales have to be inferred. The
+  aggregate quantity cannot do it: it moves for postings and cancellations too,
+  and an early version of this column summed its falls and printed the result
+  as units per day. That was nonsense — **15% of items "sold" more than their
+  entire standing supply within seven hours**, one of them 1,200 units of an
+  item with a single listing. A one-sided sum over a noisy series measures
+  volatility, not trade.
 
-  It deliberately gives no rate. The first version of this column did — it
-  summed `max(0, previous − current)` across scans and printed units per day —
-  and the number was nonsense. That sum takes every downward move and no upward
-  one, so for a quantity that oscillates it grows with volatility and with how
-  often you look, not with trade. Measured against live data, **15% of items
-  "sold" more than their entire standing supply within seven hours**, one of
-  them 1,200 units of an item with a single listing.
+  Individual auctions can do it, because each carries an id. Two signals, and
+  both are needed because each is blind to half the market:
 
-  Even the direction has a blind spot, and the tooltip says so: an item
-  restocked faster than it sells never shows a fall and reads as static. A dash
-  means not measured yet, which is a third thing again. For commodities the
-  observation is region-wide, because commodity auctions are.
+  - **a listing that shrank** — the same auction id with fewer units on it.
+    Nobody partially cancels a posting, so this is a purchase and nothing else.
+    Only ever fires on commodities, where one posting holds a stack.
+  - **a listing that vanished with hours still to run** — `time_left` was
+    `LONG` or `VERY_LONG`, so it cannot have expired within an hourly scan. The
+    only signal that works on gear, where an auction is one item that goes
+    whole or not at all.
+
+  What remains uncertain is **cancellation**, which is indistinguishable from a
+  sale in the second signal. Auctions that vanish on `SHORT` are not counted at
+  all, since those may simply have run out.
+
+  The rate divides by the market time actually observed, taken from Blizzard's
+  own `Last-Modified`, so a dropped cron slot slows accumulation rather than
+  corrupting the figure. Nothing is shown until six hours are behind it.
 - **Cooldowns.** Reagent costs take the cheaper of buying a reagent or making
   it (see below), and the biggest savings it finds are transmutes — which are
   precisely the crafts limited to one a day. Nothing in the API says so. A row

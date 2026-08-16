@@ -75,16 +75,67 @@ must("a repeat of unchanged data is not counted as an observation",
      after == before)
 s.close()
 
+# ---- 1b. sales, from watching individual auctions --------------------
+# Aggregate quantity cannot tell a sale from a cancellation or a repost.
+# An auction id can: a posting that shrank was bought from, and one that
+# vanished with hours still to run did not expire.
+sf = W.Store(os.path.join(tmp, "flow.sqlite3"))
+
+
+def auc(aid, item, qty, left="VERY_LONG"):
+    return {"id": aid, "item": {"id": item}, "quantity": qty,
+            "time_left": left}
+
+
+# First sight of the market: nothing to compare against, so no sales claimed.
+first = sf.record_auction_flow([auc(1, 50, 100), auc(2, 50, 40),
+                                auc(3, 60, 1), auc(4, 60, 1, "SHORT")])
+must("the first scan claims no sales", first == {})
+
+flow = sf.record_auction_flow([
+    auc(1, 50, 70),        # 30 bought off a surviving stack
+    auc(3, 60, 1),         # untouched
+    # auction 2 (40 units, VERY_LONG) has gone: sold or cancelled, not expired
+    # auction 4 (1 unit, SHORT) has gone: might simply have run out
+])
+confirmed, likely = flow[50]
+must("a shrunken listing is a confirmed purchase", confirmed == 30.0)
+must("a vanished listing with hours left counts as sold", likely == 40.0)
+must("an auction that vanished on SHORT is not counted",
+     60 not in flow or flow[60] == (0.0, 0.0))
+
+# Reposting is the case the aggregate got wrong: quantity swings down and up
+# while nothing sells. Ids make it obvious - the old auction is gone but a
+# new one appeared, and only the vanished one with time left counts.
+sf2 = W.Store(os.path.join(tmp, "repost.sqlite3"))
+sf2.record_auction_flow([auc(10, 70, 500, "SHORT")])
+churn = sf2.record_auction_flow([auc(11, 70, 500)])
+must("cancel-and-relist on a short auction is not a sale",
+     churn.get(70, (0.0, 0.0)) == (0.0, 0.0))
+sf2.close()
+
+# Growing a stack is not a negative sale.
+sf3 = W.Store(os.path.join(tmp, "grow.sqlite3"))
+sf3.record_auction_flow([auc(20, 80, 10)])
+grown = sf3.record_auction_flow([auc(20, 80, 90)])
+must("a listing that grew reports nothing", 80 not in grown)
+sf3.close()
+
+# The working set is replaced, not appended, or it would grow without bound.
+kept = sf.db.execute("SELECT COUNT(*) FROM auction_prev").fetchone()[0]
+must("only the latest scan's auctions are kept", kept == 2)
+sf.close()
+
 # ---- 2. velocity is units per unit of OBSERVED time ------------------
 s = W.Store(os.path.join(tmp, "rate.sqlite3"))
 H = 3600.0
 
 
-def put(day, iid, removed, obs, covered_h):
+def put(day, iid, sold, obs, covered_h):
     s.db.execute("INSERT INTO price_snapshot(taken_at,item_id,source,"
-                 "sell_unit_price,total_quantity,units_removed,removal_obs,"
+                 "sell_unit_price,total_quantity,sold_confirmed,removal_obs,"
                  "seconds_covered) VALUES(?,?,?,?,?,?,?,?)",
-                 (day, iid, "commodity", 100, 10, removed, obs, covered_h * H))
+                 (day, iid, "commodity", 100, 10, sold, obs, covered_h * H))
 
 
 # 100 units over 24h of observation spread across two days = 100/day.

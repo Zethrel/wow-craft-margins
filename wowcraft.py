@@ -452,6 +452,22 @@ CREATE TABLE IF NOT EXISTS price_snapshot (
     -- seller posting more between two scans masks the ones that went, and it
     -- overcounts cancellations - but it separates "this moves" from "this
     -- sits", which margin alone cannot.
+    -- Units this item genuinely sold, from watching individual auctions
+    -- rather than the aggregate. Two independent signals, both narrow:
+    --   sold_confirmed - an auction that survived between two scans with
+    --     FEWER units on it. Nobody partially cancels a posting, so this is
+    --     a purchase and nothing else. It only ever fires on commodities,
+    --     where one posting holds a stack.
+    --   sold_likely - an auction that vanished while it still had hours to
+    --     run. It cannot have expired, so it sold or was cancelled. This is
+    --     the only signal that works on gear, where every auction is a single
+    --     item that either goes whole or does not go.
+    sold_confirmed REAL DEFAULT 0,
+    sold_likely    REAL DEFAULT 0,
+    -- The original, kept only so old databases still read. It summed every
+    -- downward move in the aggregate quantity, which measures volatility
+    -- rather than trade - on live data it had items shifting a thousand times
+    -- their own supply. Nothing computes from it any more.
     units_removed REAL DEFAULT 0,
     -- Scans that contributed a delta, so a day covered by one scan is not
     -- read as a full day's trade.
@@ -513,6 +529,11 @@ class Store:
         if "seconds_covered" not in price_cols:
             self.db.execute("ALTER TABLE price_snapshot ADD COLUMN "
                             "seconds_covered REAL DEFAULT 0")
+        for column in ("sold_confirmed", "sold_likely"):
+            if column not in price_cols:
+                self.db.execute(
+                    f"ALTER TABLE price_snapshot ADD COLUMN {column} "
+                    "REAL DEFAULT 0")
         if "sell_low" not in price_cols:
             # Seed the range from what is already stored: one reading is a
             # range of zero width, which is honest until the day's next scan.
@@ -670,7 +691,8 @@ class Store:
 
     def save_prices(self, taken_at: int, prices: dict,
                     count_removals: bool = True,
-                    elapsed: float = 0.0) -> None:
+                    elapsed: float = 0.0,
+                    flow: Optional[dict] = None) -> None:
         """Write today's readings, widening the day's range as it goes.
 
         The headline columns hold the latest reading; sell_low/high and
@@ -696,17 +718,18 @@ class Store:
                 removed = max(0.0, float(previous[iid] - p.total_quantity))
                 obs = 1
                 covered = span
+            confirmed, likely = (flow or {}).get(iid, (0.0, 0.0))
             rows.append((taken_at, iid, p.source, p.sell_unit_price,
                          p.min_unit_price, p.total_quantity, p.listing_count,
                          p.sell_unit_price, p.sell_unit_price,
                          p.min_unit_price, p.min_unit_price,
-                         removed, obs, covered))
+                         removed, obs, covered, confirmed, likely))
         self.db.executemany("""
             INSERT INTO price_snapshot(taken_at,item_id,source,sell_unit_price,
                 min_unit_price,total_quantity,listing_count,
                 sell_low,sell_high,buy_low,buy_high,units_removed,removal_obs,
-                seconds_covered)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                seconds_covered,sold_confirmed,sold_likely)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(taken_at,item_id,source) DO UPDATE SET
                 units_removed=COALESCE(price_snapshot.units_removed,0)
                               + excluded.units_removed,
@@ -714,6 +737,10 @@ class Store:
                             + excluded.removal_obs,
                 seconds_covered=COALESCE(price_snapshot.seconds_covered,0)
                                 + excluded.seconds_covered,
+                sold_confirmed=COALESCE(price_snapshot.sold_confirmed,0)
+                               + excluded.sold_confirmed,
+                sold_likely=COALESCE(price_snapshot.sold_likely,0)
+                            + excluded.sold_likely,
                 sell_unit_price=excluded.sell_unit_price,
                 min_unit_price=excluded.min_unit_price,
                 total_quantity=excluded.total_quantity,
@@ -775,6 +802,69 @@ class Store:
         return {r["item_id"]: r["n"] for r in self.db.execute(
             "SELECT item_id, SUM(quantity) AS n FROM inventory GROUP BY item_id")}
 
+    # An auction that vanished having had at least this long left cannot have
+    # expired, so it sold or was cancelled. Blizzard's buckets are SHORT
+    # (under 30m), MEDIUM (30m-2h), LONG (2-12h) and VERY_LONG (over 12h);
+    # only the last two clear an hourly scan interval with room to spare.
+    SAFE_TIME_LEFT = ("LONG", "VERY_LONG")
+
+    def record_auction_flow(self, auctions: Iterable[dict]) -> dict:
+        """Diff individual auctions against the previous scan.
+
+        Aggregate quantity cannot answer "did this sell": it moves for
+        postings and cancellations too, and summing only its falls measures
+        volatility. Individual auctions can, because they carry an id.
+
+        Returns {item_id: (confirmed, likely)} in units.
+        """
+        db = self.db
+        db.execute("CREATE TABLE IF NOT EXISTS auction_prev ("
+                   "id INTEGER PRIMARY KEY, item_id INTEGER, qty INTEGER, "
+                   "time_left TEXT)")
+        db.execute("DROP TABLE IF EXISTS auc_now")
+        db.execute("CREATE TEMP TABLE auc_now ("
+                   "id INTEGER PRIMARY KEY, item_id INTEGER, qty INTEGER, "
+                   "time_left TEXT)")
+
+        rows = []
+        for a in auctions:
+            aid = a.get("id")
+            item = a.get("item") or {}
+            iid = item.get("id")
+            if not isinstance(aid, int) or not isinstance(iid, int):
+                continue
+            rows.append((aid, iid, int(a.get("quantity") or 0),
+                         str(a.get("time_left") or "")))
+        # OR IGNORE: the same id should not appear twice, but a duplicate must
+        # not abort a scan over a sale statistic.
+        db.executemany("INSERT OR IGNORE INTO auc_now VALUES (?,?,?,?)", rows)
+
+        had_previous = db.execute(
+            "SELECT 1 FROM auction_prev LIMIT 1").fetchone() is not None
+        flow: dict = {}
+        if had_previous:
+            # Survived, with fewer units on it. Nobody partially cancels.
+            for iid, units in db.execute(
+                    "SELECT p.item_id, SUM(p.qty - n.qty) FROM auction_prev p "
+                    "JOIN auc_now n ON n.id = p.id WHERE n.qty < p.qty "
+                    "GROUP BY p.item_id"):
+                flow[iid] = (float(units or 0), 0.0)
+            # Gone, with hours still to run.
+            marks = ",".join("?" * len(self.SAFE_TIME_LEFT))
+            for iid, units in db.execute(
+                    "SELECT p.item_id, SUM(p.qty) FROM auction_prev p "
+                    "LEFT JOIN auc_now n ON n.id = p.id "
+                    f"WHERE n.id IS NULL AND p.time_left IN ({marks}) "
+                    "GROUP BY p.item_id", self.SAFE_TIME_LEFT):
+                confirmed, _ = flow.get(iid, (0.0, 0.0))
+                flow[iid] = (confirmed, float(units or 0))
+
+        db.execute("DELETE FROM auction_prev")
+        db.execute("INSERT INTO auction_prev SELECT * FROM auc_now")
+        db.execute("DROP TABLE auc_now")
+        db.commit()
+        return flow
+
     def market_values(self, days: int = 14, halflife: float = 2.0) -> dict:
         """{item_id: recency-weighted mean sell price} across the window.
 
@@ -808,31 +898,34 @@ class Store:
     MIN_VELOCITY_HOURS = 6.0
 
     def sale_velocity(self, days: int = 7) -> dict:
-        """{item_id: units leaving the market per day}.
+        """{item_id: units sold per day}, from watching individual auctions.
 
-        Rate, not total: units removed divided by the market time those
-        observations actually span. Scanning is irregular - the publishing
-        cron drops slots, machines reboot - so a day holding four hours of
-        observation would otherwise be read as a slow day rather than a
-        short one.
+        A rate, divided by the market time actually observed rather than by
+        the calendar: scanning is irregular - the publishing cron drops slots,
+        machines reboot - so a day holding four hours of observation would
+        otherwise read as a slow day rather than a short one.
 
-        Today is included here, unlike a daily total, because dividing by
-        measured time already handles a part-day correctly.
+        Confirmed partial sales and vanished-with-hours-left are added
+        together. Each alone would be blind to half the market: partial sales
+        only happen to commodity stacks, and gear is single auctions that go
+        whole or not at all. Cancellations still count as sales in the second
+        term; nothing in the API separates them.
         """
         today = day_bucket(int(time.time()))
         cutoff = today - max(1, days) * 86400
-        removed: dict = {}
+        sold: dict = {}
         covered: dict = {}
         for row in self.db.execute(
-                "SELECT item_id, units_removed, removal_obs, seconds_covered "
+                "SELECT item_id, sold_confirmed, sold_likely, seconds_covered "
                 "FROM price_snapshot WHERE taken_at >= ?", (cutoff,)):
-            if not row[2] or not row[3]:
+            if not row[3]:
                 continue
-            removed[row[0]] = removed.get(row[0], 0.0) + (row[1] or 0.0)
+            sold[row[0]] = sold.get(row[0], 0.0) + (row[1] or 0.0) \
+                + (row[2] or 0.0)
             covered[row[0]] = covered.get(row[0], 0.0) + (row[3] or 0.0)
         floor = self.MIN_VELOCITY_HOURS * 3600
-        return {iid: removed[iid] / covered[iid] * 86400.0
-                for iid in removed if covered.get(iid, 0.0) >= floor}
+        return {iid: sold[iid] / covered[iid] * 86400.0
+                for iid in sold if covered.get(iid, 0.0) >= floor}
 
     def price_ranges(self, taken_at: int) -> dict:
         """{item_id: (buy_low, buy_high, sell_low, sell_high)} for one day."""
@@ -1759,11 +1852,24 @@ def cmd_scan(client: BlizzardClient, store: Store, cfg: dict, out_path: str,
     # sale signal is the drop since the previous reading, which this write is
     # about to overwrite.
     store.set_meta("last_data_time", str(data_stamp))
+    # Diff individual auctions before the aggregate is written over. This is
+    # what makes a sale rate possible at all: an auction carries an id, so a
+    # posting that shrank was bought from, and one that vanished with hours
+    # left did not expire.
+    flow = {}
+    if fresh_data:
+        flow = store.record_auction_flow(commodity + realm)
+        if flow:
+            confirmed = sum(c for c, _ in flow.values())
+            likely = sum(k for _, k in flow.values())
+            log(f"sold since the last reading: {confirmed:,.0f} units bought "
+                f"off surviving listings, {likely:,.0f} more on auctions that "
+                f"went while they still had hours to run")
     store.save_prices(taken_at, prices, count_removals=fresh_data,
-                      elapsed=elapsed)
+                      elapsed=elapsed, flow=flow)
     if fresh_data and elapsed:
-        log(f"sale signal: {elapsed / 3600:.1f}h of market time since the "
-            "last reading")
+        log(f"covering {elapsed / 3600:.1f}h of market time since the last "
+            "reading")
 
     keep_days = int(cfg.get("history_days", 7) or 0)
     basis = str(cfg.get("price_basis", "market")).lower()
@@ -3497,7 +3603,11 @@ SEED_PATH = os.path.join("seed", "recipes.sqlite3.gz")
 # Tables a consumer has no use for. inventory is per-character and came off
 # this machine's SavedVariables in the first place; margin_snapshot is derived
 # and dashboard.html already shows it.
-UNPUBLISHED_TABLES = ("inventory", "margin_snapshot")
+# auction_prev is a working set - one row per live auction, ~430,000 of them -
+# kept only so the next scan has something to diff against. Publishing it would
+# roughly triple the download to say nothing the sale figures do not already
+# carry.
+UNPUBLISHED_TABLES = ("inventory", "margin_snapshot", "auction_prev")
 
 # The seed drops prices too, leaving only what `init` spent fifteen minutes
 # building. Recipes change on patch day and not otherwise, so this compresses
@@ -3535,8 +3645,15 @@ def export_prices_db(src: str, dest: str,
         shutil.copyfile(src, tmp)
         db = sqlite3.connect(tmp)
         try:
+            # Only what is actually there. auction_prev is created by the
+            # first scan that sees auction data, so a database from before
+            # this - or a seed, which has never scanned - simply has no such
+            # table, and publishing must not fall over on that.
+            present = {r[0] for r in db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
             for table in drop:
-                db.execute(f"DELETE FROM {table}")
+                if table in present:
+                    db.execute(f"DELETE FROM {table}")
             db.commit()
             # Without this the pages the deleted rows used to occupy are still
             # in the file, and the download carries them.
