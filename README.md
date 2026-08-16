@@ -348,6 +348,28 @@ corrupt download.
 
 ---
 
+## What the sell price actually is
+
+A single scan's price is a single moment. One seller undercutting hard for an
+hour, or a thin patch overnight, moves it a long way — which is why the sell
+side is **smoothed across the stored history**, weighted towards recent days.
+Weight halves every two days, so over a seven-day window the last three days
+carry about 71% of it and today still dominates without being the only voice.
+
+This is the same idea as TradeSkillMaster's `DBMarket`, and the underlying
+statistic already matched: TSM describes market value as "roughly around the
+15th percentile" of listings, which is exactly what `SELL_PERCENTILE = 0.15`
+here has always computed. What was missing was averaging it over time.
+
+Set `"price_basis": "current"` in `config.json` for the old behaviour — this
+scan's reading alone.
+
+**Only the sell side is smoothed.** Reagent costs come off the live supply
+ladder, because that is what you would actually pay this minute; averaging them
+would quote a bill nobody can settle.
+
+---
+
 ## How the numbers are worked out
 
 This is the part worth understanding, because it's where naive versions of this
@@ -503,6 +525,15 @@ These are real gaps, not hedging:
   mistake — the first version of this badge reported that a lone 2.6M listing on
   old PvP gear made a craft worth 2.48M. On a live scan the honest count is 7
   rows out of 5,919, three of which show a loss that may not be one.
+- **Whether anything actually sold.** The API publishes what is *listed*, never
+  what changed hands. The **Sells/day** column is the nearest thing available:
+  the fall in listed quantity between one scan and the next, divided by the
+  market time those observations actually span. It counts cancellations as
+  sales, and misses sales masked by somebody posting more in the same interval
+  — so read it as "this moves" versus "this sits", not as a sales figure. A
+  dash means not measured yet, which is not the same as zero; a rate needs six
+  hours of observation behind it before it is shown at all. For commodities the
+  figure is region-wide, because commodity auctions are.
 - **Inspiration, resourcefulness, multicraft.** All of these move real profit and
   none are visible to the API. They generally push margins *up*.
 - **Crafting orders.** Personal and patron orders often beat the open market

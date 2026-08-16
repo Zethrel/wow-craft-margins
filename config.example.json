@@ -12,8 +12,10 @@
   "skill_tiers": [],
   "_addon_path": "Where the WowCraftExport addon lives. `scan` writes PriceData.lua here so reagent tooltips and the crafting window show prices in game. /reload to pick up a new one.",
   "addon_path": "",
-  "_history_days": "Days of price history to keep. One row per item per day; several scans on the same day update that day's row. 0 keeps everything.",
+  "_history_days": "Days of price history to keep. One row per item per day; several scans on the same day update that day's row. 0 keeps everything. This is also the window the smoothed sell price and the sale rate are measured over, so shortening it makes both twitchier.",
   "history_days": 7,
+  "_price_basis": "\"market\" smooths the sell price across the stored days, weighted towards recent ones - a single scan is one moment, and one seller undercutting for an hour should not become the price. \"current\" uses this scan's reading alone, which is what the tool did before. Only the sell side is ever smoothed: reagents are bought at today's asking prices off the live ladder.",
+  "price_basis": "market",
   "_pull_url": "Where `pull` fetches a published scan from - the GitHub Pages site the hourly workflow deploys to, e.g. https://<user>.github.io/wow-craft-margins/ . Set this and this machine needs no credentials, no recipe cache and no scheduled scan; `pull` just downloads the answer. Empty = this PC scans for itself.",
   "pull_url": "",
 

@@ -445,6 +445,22 @@ CREATE TABLE IF NOT EXISTS price_snapshot (
     sell_high  REAL,
     buy_low    REAL,
     buy_high   REAL,
+    -- How many units left the market during this day, accumulated across the
+    -- day's scans as the drop in total_quantity from one scan to the next.
+    -- The API never reports sales, so this is the only sale signal available:
+    -- units that were listed and are not any more. It undercounts, because a
+    -- seller posting more between two scans masks the ones that went, and it
+    -- overcounts cancellations - but it separates "this moves" from "this
+    -- sits", which margin alone cannot.
+    units_removed REAL DEFAULT 0,
+    -- Scans that contributed a delta, so a day covered by one scan is not
+    -- read as a full day's trade.
+    removal_obs   INTEGER DEFAULT 0,
+    -- Seconds of market time those deltas actually span, measured on
+    -- Blizzard's own Last-Modified. Scanning is not reliably hourly - the
+    -- publishing cron drops slots, machines reboot - so a day's units_removed
+    -- says nothing until you know whether it covers four hours or twenty-four.
+    seconds_covered REAL DEFAULT 0,
     PRIMARY KEY (taken_at, item_id, source)
 );
 
@@ -488,6 +504,15 @@ class Store:
             if column not in price_cols:
                 self.db.execute(
                     f"ALTER TABLE price_snapshot ADD COLUMN {column} REAL")
+        if "units_removed" not in price_cols:
+            self.db.execute("ALTER TABLE price_snapshot ADD COLUMN "
+                            "units_removed REAL DEFAULT 0")
+        if "removal_obs" not in price_cols:
+            self.db.execute("ALTER TABLE price_snapshot ADD COLUMN "
+                            "removal_obs INTEGER DEFAULT 0")
+        if "seconds_covered" not in price_cols:
+            self.db.execute("ALTER TABLE price_snapshot ADD COLUMN "
+                            "seconds_covered REAL DEFAULT 0")
         if "sell_low" not in price_cols:
             # Seed the range from what is already stored: one reading is a
             # range of zero width, which is honest until the day's next scan.
@@ -627,24 +652,68 @@ class Store:
         self.db.execute("VACUUM")
         return len(stamps)
 
-    def save_prices(self, taken_at: int, prices: dict) -> None:
+    def latest_quantities(self) -> dict:
+        """{item_id: total_quantity} as of the most recent reading of each.
+
+        One pass rather than a query per item: with thirty thousand priced
+        items, per-item lookups would cost more than the scan that produced
+        them. Keyed on item id alone, not (id, source), so an item that moves
+        between the realm and commodity listings still compares against itself.
+        """
+        latest: dict = {}
+        for row in self.db.execute(
+                "SELECT item_id, taken_at, total_quantity FROM price_snapshot"):
+            seen = latest.get(row[0])
+            if seen is None or row[1] >= seen[0]:
+                latest[row[0]] = (row[1], row[2])
+        return {iid: qty for iid, (_, qty) in latest.items() if qty is not None}
+
+    def save_prices(self, taken_at: int, prices: dict,
+                    count_removals: bool = True,
+                    elapsed: float = 0.0) -> None:
         """Write today's readings, widening the day's range as it goes.
 
         The headline columns hold the latest reading; sell_low/high and
         buy_low/high accumulate across every scan of that day. Written as an
         upsert rather than a replace so an evening scan cannot forget what the
-        morning saw."""
-        rows = [(taken_at, iid, p.source, p.sell_unit_price, p.min_unit_price,
-                 p.total_quantity, p.listing_count,
-                 p.sell_unit_price, p.sell_unit_price,
-                 p.min_unit_price, p.min_unit_price)
-                for iid, p in prices.items()]
+        morning saw.
+
+        `count_removals` adds the drop in listed quantity since the previous
+        reading to the day's running total - the only sale signal the API
+        offers. Pass False when re-scanning data Blizzard has not refreshed,
+        or an unchanged snapshot would be counted as a quiet hour of trade.
+        `elapsed` is how many seconds of market time that delta spans, so an
+        irregular scan schedule still yields an honest rate.
+        """
+        previous = self.latest_quantities() if count_removals else {}
+        span = float(elapsed) if count_removals and elapsed > 0 else 0.0
+        rows = []
+        for iid, p in prices.items():
+            removed, obs, covered = 0.0, 0, 0.0
+            if iid in previous and p.total_quantity is not None:
+                # Only decreases. A rise means somebody posted more, which
+                # says nothing about what sold.
+                removed = max(0.0, float(previous[iid] - p.total_quantity))
+                obs = 1
+                covered = span
+            rows.append((taken_at, iid, p.source, p.sell_unit_price,
+                         p.min_unit_price, p.total_quantity, p.listing_count,
+                         p.sell_unit_price, p.sell_unit_price,
+                         p.min_unit_price, p.min_unit_price,
+                         removed, obs, covered))
         self.db.executemany("""
             INSERT INTO price_snapshot(taken_at,item_id,source,sell_unit_price,
                 min_unit_price,total_quantity,listing_count,
-                sell_low,sell_high,buy_low,buy_high)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                sell_low,sell_high,buy_low,buy_high,units_removed,removal_obs,
+                seconds_covered)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(taken_at,item_id,source) DO UPDATE SET
+                units_removed=COALESCE(price_snapshot.units_removed,0)
+                              + excluded.units_removed,
+                removal_obs=COALESCE(price_snapshot.removal_obs,0)
+                            + excluded.removal_obs,
+                seconds_covered=COALESCE(price_snapshot.seconds_covered,0)
+                                + excluded.seconds_covered,
                 sell_unit_price=excluded.sell_unit_price,
                 min_unit_price=excluded.min_unit_price,
                 total_quantity=excluded.total_quantity,
@@ -705,6 +774,65 @@ class Store:
         """{item_id: quantity} pooled across every character we know about."""
         return {r["item_id"]: r["n"] for r in self.db.execute(
             "SELECT item_id, SUM(quantity) AS n FROM inventory GROUP BY item_id")}
+
+    def market_values(self, days: int = 14, halflife: float = 2.0) -> dict:
+        """{item_id: recency-weighted mean sell price} across the window.
+
+        A single scan's price is one moment: one seller undercutting hard, or
+        a thin hour, moves it a long way. TSM solves this with a 14-day
+        weighted average that leans on the last three days, and the same idea
+        works here on the daily rows already stored. Weight halves every
+        `halflife` days, so today dominates but yesterday still argues.
+
+        Only the SELL side is smoothed. Reagents are bought at today's asking
+        prices off the live ladder, and averaging those would quote a cost
+        nobody can actually pay.
+        """
+        today = day_bucket(int(time.time()))
+        cutoff = today - max(0, days - 1) * 86400
+        num: dict = {}
+        den: dict = {}
+        for row in self.db.execute(
+                "SELECT item_id, taken_at, sell_unit_price FROM price_snapshot "
+                "WHERE taken_at >= ? AND sell_unit_price IS NOT NULL",
+                (cutoff,)):
+            age_days = max(0.0, (today - row[1]) / 86400.0)
+            weight = 0.5 ** (age_days / halflife) if halflife > 0 else 1.0
+            num[row[0]] = num.get(row[0], 0.0) + weight * row[2]
+            den[row[0]] = den.get(row[0], 0.0) + weight
+        return {iid: num[iid] / den[iid] for iid in num if den[iid] > 0}
+
+    # Below this much observed market time, a rate is arithmetic rather than
+    # evidence: four hours of a quiet morning extrapolated to a day says more
+    # about when we looked than about what sells.
+    MIN_VELOCITY_HOURS = 6.0
+
+    def sale_velocity(self, days: int = 7) -> dict:
+        """{item_id: units leaving the market per day}.
+
+        Rate, not total: units removed divided by the market time those
+        observations actually span. Scanning is irregular - the publishing
+        cron drops slots, machines reboot - so a day holding four hours of
+        observation would otherwise be read as a slow day rather than a
+        short one.
+
+        Today is included here, unlike a daily total, because dividing by
+        measured time already handles a part-day correctly.
+        """
+        today = day_bucket(int(time.time()))
+        cutoff = today - max(1, days) * 86400
+        removed: dict = {}
+        covered: dict = {}
+        for row in self.db.execute(
+                "SELECT item_id, units_removed, removal_obs, seconds_covered "
+                "FROM price_snapshot WHERE taken_at >= ?", (cutoff,)):
+            if not row[2] or not row[3]:
+                continue
+            removed[row[0]] = removed.get(row[0], 0.0) + (row[1] or 0.0)
+            covered[row[0]] = covered.get(row[0], 0.0) + (row[3] or 0.0)
+        floor = self.MIN_VELOCITY_HOURS * 3600
+        return {iid: removed[iid] / covered[iid] * 86400.0
+                for iid in removed if covered.get(iid, 0.0) >= floor}
 
     def price_ranges(self, taken_at: int) -> dict:
         """{item_id: (buy_low, buy_high, sell_low, sell_high)} for one day."""
@@ -928,6 +1056,13 @@ class MarginResult:
     # end 99% of the time, so where these differ the margin shown is a floor.
     output_variant_count: int = 1
     output_variant_high: float = 0.0
+    # Units of the output leaving the auction house per day, from the drop in
+    # listed quantity between scans. None means not measured yet, which is a
+    # different thing from zero: a fresh database has no history to diff.
+    # A big margin on something that shifts twice a month is worth less than a
+    # small one on something that shifts fifty times a day, and this is the
+    # only handle the API gives on which is which.
+    output_sold_per_day: Optional[float] = None
 
 
 def _col(row: Any, key: str, default: Any = None) -> Any:
@@ -1000,7 +1135,8 @@ def cost_from_slots(slots: list, prices: dict, item_names: dict,
 def compute_margins(recipes: list, prices: dict, item_names: dict,
                     batch: int = 1, min_supply: int = 1,
                     min_listings: int = 1,
-                    owned: Optional[dict] = None) -> tuple:
+                    owned: Optional[dict] = None,
+                    velocity: Optional[dict] = None) -> tuple:
     """Return (results, skipped) for every recipe we can fully price.
 
     `batch` = how many crafts you would do, which matters because buying 200
@@ -1064,6 +1200,7 @@ def compute_margins(recipes: list, prices: dict, item_names: dict,
                 output_listings=out_price.listing_count,
                 output_variant_count=out_price.variant_count,
                 output_variant_high=out_price.variant_high,
+                output_sold_per_day=(velocity or {}).get(out_id),
                 crafted_source=_col(r, "crafted_source", CRAFTED_API),
                 cost_complete=True,
                 optionals_filled=optionals,
@@ -1133,6 +1270,7 @@ def compute_margins(recipes: list, prices: dict, item_names: dict,
             output_listings=out_price.listing_count,
             output_variant_count=out_price.variant_count,
             output_variant_high=out_price.variant_high,
+            output_sold_per_day=(velocity or {}).get(out_id),
             crafted_source=_col(r, "crafted_source", CRAFTED_API),
             cost_complete=not _col(r, "uses_slots", 0),
             cost_to_finish=to_buy,
@@ -1480,7 +1618,15 @@ def cmd_scan(client: BlizzardClient, store: Store, cfg: dict, out_path: str,
     # of stacking up points nobody asked for.
     data_stamp = data_time or int(time.time())
     taken_at = day_bucket(data_stamp)
-    if store.get_meta("last_data_time") == str(data_stamp):
+    previous_stamp = store.get_meta("last_data_time")
+    fresh_data = previous_stamp != str(data_stamp)
+    # Measured on Blizzard's Last-Modified, not our clock: it is the interval
+    # the market actually moved over, and it stays right when a scan is late.
+    try:
+        elapsed = max(0.0, data_stamp - int(previous_stamp or 0))
+    except (TypeError, ValueError):
+        elapsed = 0.0
+    if not fresh_data:
         log("note: this is the same auction data as the last scan "
             "(Blizzard refreshes hourly) -- today's entry will be rewritten "
             "with it, not duplicated.")
@@ -1493,19 +1639,56 @@ def cmd_scan(client: BlizzardClient, store: Store, cfg: dict, out_path: str,
     if owned:
         log(f"{len(owned):,} distinct items in your bags and banks -- margins "
             "also show what is left to buy")
-    results, skipped = compute_margins(recipes, prices, names, batch=batch,
-                                       min_listings=min_listings, owned=owned)
 
     collapsed = store.collapse_to_days()
     if collapsed:
         log(f"note: folded {collapsed} older hourly snapshots into daily ones "
             "-- history is now one row per day.")
 
+    # Store before scoring, not after. The smoothed sell price is read back
+    # out of the history, so today's reading has to be in it first; and the
+    # sale signal is the drop since the previous reading, which this write is
+    # about to overwrite.
     store.set_meta("last_data_time", str(data_stamp))
-    store.save_prices(taken_at, prices)
-    store.save_margins(taken_at, results, considered=[r["id"] for r in recipes])
+    store.save_prices(taken_at, prices, count_removals=fresh_data,
+                      elapsed=elapsed)
+    if fresh_data and elapsed:
+        log(f"sale signal: {elapsed / 3600:.1f}h of market time since the "
+            "last reading")
 
     keep_days = int(cfg.get("history_days", 7) or 0)
+    basis = str(cfg.get("price_basis", "market")).lower()
+    if basis == "market":
+        window = keep_days if keep_days > 0 else 14
+        market = store.market_values(days=window)
+        smoothed = 0
+        for iid, p in prices.items():
+            value = market.get(iid)
+            if value and value > 0:
+                p.sell_unit_price = value
+                smoothed += 1
+        days_held = store.snapshot_count()
+        log(f"sell prices smoothed over {min(days_held, window)} day(s) of "
+            f"history ({smoothed:,} items)"
+            + ("" if days_held > 1 else
+               " -- only one day stored, so this is still today's reading"))
+    else:
+        log("sell prices are this scan's reading only (price_basis=current)")
+
+    velocity = store.sale_velocity(days=keep_days or 7)
+    if velocity:
+        moving = sum(1 for v in velocity.values() if v >= 1.0)
+        log(f"sale rate measured for {len(velocity):,} items; "
+            f"{moving:,} shift at least one a day")
+    else:
+        log("no sale rate yet -- it needs a full day of scans behind it")
+
+    results, skipped = compute_margins(recipes, prices, names, batch=batch,
+                                       min_listings=min_listings, owned=owned,
+                                       velocity=velocity)
+
+    store.save_margins(taken_at, results, considered=[r["id"] for r in recipes])
+
     dropped = store.prune_history(keep_days)
     if dropped:
         log(f"pruned {dropped} day(s) of history beyond the "
@@ -1555,6 +1738,47 @@ def cmd_scan(client: BlizzardClient, store: Store, cfg: dict, out_path: str,
 # --------------------------------------------------------------------------
 # Dashboard rendering
 # --------------------------------------------------------------------------
+
+def velocity_str(per_day: Optional[float]) -> str:
+    """How fast it moves, or a dash when we have not watched long enough.
+
+    A dash and a zero mean very different things and must not look alike:
+    one is "no full day of scans behind this yet", the other is "watched, and
+    nothing shifted".
+    """
+    if per_day is None:
+        return '<span class="meta">&ndash;</span>'
+    if per_day >= 10:
+        return f"{per_day:,.0f}"
+    if per_day >= 1:
+        return f"{per_day:.1f}"
+    if per_day > 0:
+        return f"{per_day:.2f}"
+    return "0"
+
+
+def velocity_cls(per_day: Optional[float]) -> str:
+    if per_day is None:
+        return "meta"
+    return "pos" if per_day >= 1.0 else "neg" if per_day <= 0 else "num"
+
+
+def velocity_tip(per_day: Optional[float]) -> str:
+    if per_day is None:
+        return ("Not measured yet. Sale rate is the drop in listed quantity "
+                "between scans, so it needs a full day of scans behind it.")
+    base = (f"About {per_day:,.2f} of these leave the auction house per day, "
+            "measured as the fall in listed quantity between scans.")
+    if per_day <= 0:
+        return base + (" Nothing has shifted while we have been watching - a "
+                       "margin you cannot realise is not a margin.")
+    if per_day < 1:
+        return base + (" Fewer than one a day: the margin is real but you "
+                       "will wait for it.")
+    return base + (" Cancellations look like sales here and simultaneous "
+                   "posting hides some, so read it as a rough rate, not a "
+                   "sales count.")
+
 
 def _variant_floor(r) -> Optional[float]:
     """Revenue at the dearest traded variant, when that is worth saying.
@@ -1686,6 +1910,7 @@ const profSel = document.getElementById('prof');
 const expSel = document.getElementById('exp');
 const onlyPos = document.getElementById('pos');
 const onlyFirm = document.getElementById('firm');
+const onlyMoves = document.getElementById('moves');
 
 function applyFilters() {
   const q = search.value.toLowerCase();
@@ -1704,13 +1929,16 @@ function applyFilters() {
       // its cost.
       && (!onlyPos.checked || parseFloat(tr.dataset.margin) > 0
           || tr.dataset.maybe === '1')
-      && (!onlyFirm.checked || tr.dataset.firm === '1');
+      && (!onlyFirm.checked || tr.dataset.firm === '1')
+      // -1 is "not measured yet", which is not the same as "does not sell" -
+      // keep those, or a fresh database would show an empty table.
+      && (!onlyMoves.checked || parseFloat(tr.dataset.vel) !== 0);
     tr.hidden = !ok;
     if (detail && detail.classList.contains('detail')) detail.hidden = !ok;
   });
 }
 [search, profSel, expSel].forEach(el => el.addEventListener('input', applyFilters));
-[onlyPos, onlyFirm].forEach(el => el.addEventListener('change', applyFilters));
+[onlyPos, onlyFirm, onlyMoves].forEach(el => el.addEventListener('change', applyFilters));
 applyFilters();   // honour the expansion the page opened on
 
 const rSearch = document.getElementById('rq');
@@ -2238,7 +2466,8 @@ def render_dashboard(results: list, cfg: dict, taken_at: int, skipped: dict,
             f'data-maybe="{1 if best and best > r.cost else 0}" '
             f'data-margin="{r.margin:.0f}" '
             f'data-pct="{r.margin_pct:.2f}" data-cost="{r.cost:.0f}" '
-            f'data-rev="{r.revenue:.0f}" data-supply="{r.output_supply}">'
+            f'data-rev="{r.revenue:.0f}" data-supply="{r.output_supply}" '
+            f'data-vel="{-1 if r.output_sold_per_day is None else r.output_sold_per_day:.4f}">'
             f'<td class="num meta">{i}</td>'
             f'<td><div class="name">{esc(r.crafted_item_name)}{rank_badge}</div>'
             f'<div class="meta">{esc(r.profession)} &middot; {esc(r.skill_tier)}</div></td>'
@@ -2246,9 +2475,12 @@ def render_dashboard(results: list, cfg: dict, taken_at: int, skipped: dict,
             f'<td class="num">{copper_to_gold_str(r.revenue)}</td>'
             f'<td class="num {cls}">{copper_to_gold_str(r.margin)}</td>'
             f'<td class="num {cls}">{r.margin_pct:+.0f}%</td>'
+            f'<td class="num {velocity_cls(r.output_sold_per_day)}" '
+            f'data-tip="{esc(velocity_tip(r.output_sold_per_day))}">'
+            f'{velocity_str(r.output_sold_per_day)}</td>'
             f'<td class="num meta">{r.output_supply:,}</td>'
             f'<td>{render_spark(history.get(r.recipe_id, []))}</td></tr>'
-            f'<tr class="detail"><td></td><td colspan="7"><details>'
+            f'<tr class="detail"><td></td><td colspan="8"><details>'
             f'<summary>reagent bill for {batch} crafts (gold)</summary>'
             f'<div class="reagents">{reagent_bill}</div></details></td></tr>')
 
@@ -2381,6 +2613,7 @@ below the cut, scan it on its own with <code>--tier</code>, or raise
 <select id="exp"><option value=""{craft_all_sel}>All expansions</option>{exp_opts}</select>
 <label><input id="pos" type="checkbox" checked> Profitable only</label>
 <label><input id="firm" type="checkbox"> Fully costed only</label>
+<label title="Hides crafts whose output has not shifted a single unit across the stored days. Rows with no measurement yet are kept."><input id="moves" type="checkbox"> Actually sells</label>
 </div>
 <table><thead><tr>
 <th class="num">#</th><th data-key="name">Item</th>
@@ -2388,6 +2621,7 @@ below the cut, scan it on its own with <code>--tier</code>, or raise
 <th class="num" data-key="rev">Revenue (g)</th>
 <th class="num" data-key="margin">Margin (g)</th>
 <th class="num" data-key="pct">Margin %</th>
+<th class="num" data-key="vel">Sells/day</th>
 <th class="num" data-key="supply">Supply</th>
 <th>History</th>
 </tr></thead><tbody id="rows">{''.join(rows_html)}</tbody></table>
@@ -3681,6 +3915,12 @@ DEFAULT_CONFIG = {
     # 7 means a week of daily readings. 0 keeps everything, which grows the
     # database indefinitely.
     "history_days": 7,
+    # "market" smooths the sell price over the stored history, weighted
+    # towards recent days, so one seller undercutting hard for an hour does
+    # not become the price. "current" uses this scan's reading alone, which is
+    # what the tool did before. Only the sell side is smoothed either way -
+    # reagents are bought at today's asking prices.
+    "price_basis": "market",
     # Where `pull` fetches from - the GitHub Pages site the scan workflow
     # publishes to. Set this and you never need credentials, a recipe cache or
     # a scheduled scan on this machine; `pull` downloads what the workflow
