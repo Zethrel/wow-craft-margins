@@ -584,6 +584,25 @@ These are real gaps, not hedging:
   sale in the second signal. Auctions that vanish on `SHORT` are not counted at
   all, since those may simply have run out.
 
+  That uncertainty has been measured rather than guessed at. Across two live
+  commodity snapshots an hour apart — 348,927 auctions against 339,173 — 24% of
+  the disappearances had an identical relisting appear in the same interval,
+  but those accounted for only **5% of the units**. Reposting concentrates in
+  small postings; the large disappearances are unpaired and look like real
+  trade. So the figures run about 5% high, and that is a lower bound, since a
+  seller who cancels 500 and reposts it as two lots of 250 leaves no matching
+  pair.
+
+  Subtracting them is deliberately *not* done: pairing on quantity would also
+  remove genuine sales that happen to coincide with a new posting of the same
+  size, and trading a measured 5% overcount for an unmeasured false-negative
+  rate is a poor bargain.
+
+  The same snapshots explain why both signals are needed. Only 795 of 308,737
+  surviving auctions had fewer units on them — 0.26% — because commodity buying
+  consumes postings whole from the cheapest end rather than nibbling them. On
+  its own, the confirmed signal would measure almost nothing.
+
   The rate divides by the market time actually observed, taken from Blizzard's
   own `Last-Modified`, so a dropped cron slot slows accumulation rather than
   corrupting the figure. Nothing is shown until six hours are behind it.
