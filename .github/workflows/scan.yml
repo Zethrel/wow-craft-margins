@@ -62,15 +62,34 @@ jobs:
         env:
           BNET_CLIENT_ID: ${{ secrets.BNET_CLIENT_ID }}
           BNET_CLIENT_SECRET: ${{ secrets.BNET_CLIENT_SECRET }}
+          # Names only, never values - see the jq below. The one thing that
+          # tells a typo apart from a secret in the wrong place.
+          SECRET_NAMES: ${{ toJSON(secrets) }}
+          VAR_NAMES: ${{ toJSON(vars) }}
         run: |
           missing=""
           [ -n "$BNET_CLIENT_ID" ] || missing="$missing BNET_CLIENT_ID"
           [ -n "$BNET_CLIENT_SECRET" ] || missing="$missing BNET_CLIENT_SECRET"
-          if [ -n "$missing" ]; then
-            echo "::error::Missing repository secret(s):$missing — add them under Settings > Secrets and variables > Actions. Create the client at https://develop.battle.net/access/clients"
+          if [ -z "$missing" ]; then
+            echo "client id is ${#BNET_CLIENT_ID} chars, secret ${#BNET_CLIENT_SECRET} chars"
+            exit 0
+          fi
+
+          echo "Secrets this job can see:"
+          printf '%s' "$SECRET_NAMES" | jq -r 'keys[]' | sed 's/^/  - /'
+          echo "Variables this job can see:"
+          printf '%s' "$VAR_NAMES" | jq -r 'keys[]' | sed 's/^/  - /'
+
+          # Settings > Secrets and variables > Actions has two tabs, and a
+          # client secret pasted into the Variables one is stored in clear and
+          # printable. Say so rather than quietly reading it.
+          if printf '%s' "$VAR_NAMES" | jq -e 'has("BNET_CLIENT_ID") or has("BNET_CLIENT_SECRET")' >/dev/null; then
+            echo "::error::BNET_* is set under Variables, not Secrets. Variables are stored in clear and show up in logs - delete them there and re-add under the Secrets tab."
             exit 1
           fi
-          echo "client id is ${#BNET_CLIENT_ID} chars, secret ${#BNET_CLIENT_SECRET} chars"
+
+          echo "::error::Missing repository secret(s):$missing — add them under Settings > Secrets and variables > Actions, on the Secrets tab. The names must match exactly. Create the client at https://develop.battle.net/access/clients"
+          exit 1
 
       - name: Scan
         env:
