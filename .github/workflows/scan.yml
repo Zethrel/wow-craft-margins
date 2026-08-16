@@ -1,12 +1,18 @@
 name: hourly scan
 
-# Blizzard refreshes auction data once an hour. GitHub's cron is best-effort
-# and can run late under load, which does not matter here: snapshots are keyed
-# on Blizzard's own Last-Modified, so a late run stores the same snapshot
-# rather than a duplicate, and an early one is a no-op.
+# Blizzard refreshes auction data once an hour, at about :19 past. Scanning a
+# few minutes after that gets the fresh snapshot; a late run is harmless
+# because snapshots are keyed on Blizzard's own Last-Modified, so it stores
+# the same snapshot rather than a duplicate, and an early one is a no-op.
+#
+# :23 rather than a round number on purpose. GitHub's scheduler is explicitly
+# best-effort and queues everything behind the on-the-hour and :00/:15/:30/:45
+# crowd - the first week on :20 fired once, half an hour late. An odd minute
+# is the standard way out. Pullers are set to :05 and :35 so they still
+# collect a publish that arrives up to forty minutes behind schedule.
 on:
   schedule:
-    - cron: "20 * * * *"
+    - cron: "23 * * * *"
   # Patch day: tick `init` to re-cache recipe definitions before scanning.
   # Deliberately part of this workflow rather than one of its own, so the
   # `pages` concurrency group serialises it against the hourly cron - two jobs

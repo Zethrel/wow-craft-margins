@@ -195,8 +195,15 @@ pull.cmd
 ```
 
 Swap the scheduled task's **Execute** from `run-scan.cmd` to `pull.cmd` and it
-keeps running hourly, minus the credentials and the API calls. `/reload` in
+keeps running on a timer, minus the credentials and the API calls. `/reload` in
 game picks up new prices.
+
+**Pull twice an hour, at :05 and :35.** GitHub's scheduler is best-effort and
+routinely runs late — the workflow's first week on a round `:20` fired once,
+half an hour behind. Pulling every thirty minutes means a publish that arrives
+forty minutes late is still collected within the hour instead of being missed
+entirely. An unchanged pull costs one 693-byte manifest fetch, so the extra
+runs are free.
 
 ### The database, and why there is a seed
 
