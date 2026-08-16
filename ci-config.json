@@ -10,5 +10,7 @@
   "skill_tiers": [],
   "_addon_path": "Empty on purpose. There is no WoW install on a CI runner; --publish writes PriceData.lua into the site directory instead.",
   "addon_path": "",
-  "history_days": 7
+  "history_days": 7,
+  "_timezone": "MUST match the timezone of the machine that runs `pull`. History is one row per day bucketed at LOCAL midnight, so a runner left on UTC keys 16 August as 00:00 UTC while a PC on CEST keys it as 00:00 CEST - the same day stored twice, forever. An IANA name; the workflow exports it as TZ before scanning.",
+  "timezone": "Europe/Oslo"
 }

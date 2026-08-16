@@ -22,6 +22,7 @@ import os
 import sqlite3
 import tempfile
 import threading
+import time
 
 import wowcraft as W
 
@@ -125,6 +126,13 @@ manifest = json.load(open(os.path.join(site, W.MANIFEST_NAME)))
 must("manifest records Blizzard's data time, not ours",
      manifest["data_time"] == 1_700_000_000)
 must("manifest names the realm", manifest["realm_slug"] == "argent-dawn")
+# Day buckets are local midnight, so publisher and puller must agree on where
+# midnight is or the same calendar day lands under two different keys.
+must("manifest records the publisher's UTC offset",
+     manifest["utc_offset"] == -(time.altzone if time.daylight
+                                 and time.localtime().tm_isdst
+                                 else time.timezone))
+must("manifest names the publisher's zone", bool(manifest["tz_name"]))
 must("manifest covers every published file",
      set(manifest["files"]) == published - {W.MANIFEST_NAME})
 must("manifest hashes match the bytes on disk",
@@ -190,9 +198,12 @@ must("pull writes PriceData.lua into the addon folder",
      os.path.exists(os.path.join(addon, "PriceData.lua")))
 must("pull writes the dashboard", os.path.exists(local_dash))
 must("pull writes the database", os.path.exists(local_db))
+# Closed explicitly. A leaked connection keeps a handle on the file, and on
+# Windows that alone is enough to make a later pull fail to swap it.
+_c = sqlite3.connect(local_db)
 must("pulled database is usable",
-     sqlite3.connect(local_db).execute(
-         "SELECT COUNT(*) FROM price_snapshot").fetchone()[0] > 0)
+     _c.execute("SELECT COUNT(*) FROM price_snapshot").fetchone()[0] > 0)
+_c.close()
 must("pull remembers what it fetched",
      os.path.exists(os.path.join(local, W.PULL_STATE)))
 
@@ -220,6 +231,161 @@ inv = sqlite3.connect(local_db)
 rows = dict(inv.execute("SELECT item_id, quantity FROM inventory"))
 inv.close()
 must("a forced pull keeps local inventory", rows == {2001: 42, 2002: 7})
+
+# ---- 6b. local price history survives too ----------------------------
+# Past auction snapshots cannot be re-fetched once Blizzard moves on, and the
+# publisher's window starts the day it first ran. Days it does not cover have
+# to survive the swap or they are gone for good.
+DAY = 86400
+today = W.day_bucket(int(time.time()))
+hist = sqlite3.connect(local_db)
+theirs = {r[0] for r in hist.execute("SELECT DISTINCT taken_at FROM price_snapshot")}
+# Three days the publisher has never seen, and one it has - the shared day
+# must NOT be overwritten by the local copy.
+shared_day = max(theirs)
+shared_before = hist.execute(
+    "SELECT COUNT(*) FROM price_snapshot WHERE taken_at=?",
+    (shared_day,)).fetchone()[0]
+for back in (1, 2, 3):
+    day = today - back * DAY
+    hist.execute("INSERT OR REPLACE INTO price_snapshot(taken_at,item_id,"
+                 "source,sell_unit_price,min_unit_price,total_quantity,"
+                 "listing_count) VALUES (?,?,?,?,?,?,?)",
+                 (day, 2001, "commodity", 111.0 * back, 100.0, 50, 5))
+# A day well outside any retention window, to prove the carry respects it.
+ancient = today - 400 * DAY
+hist.execute("INSERT OR REPLACE INTO price_snapshot(taken_at,item_id,source,"
+             "sell_unit_price,min_unit_price,total_quantity,listing_count) "
+             "VALUES (?,?,?,?,?,?,?)", (ancient, 2001, "commodity", 9.0, 9.0, 1, 1))
+# And a local row inside a day the publisher already covers, which must lose.
+hist.execute("INSERT OR REPLACE INTO price_snapshot(taken_at,item_id,source,"
+             "sell_unit_price,min_unit_price,total_quantity,listing_count) "
+             "VALUES (?,?,?,?,?,?,?)",
+             (shared_day, 424242, "commodity", 5.0, 5.0, 1, 1))
+hist.commit()
+hist.close()
+
+with contextlib.redirect_stderr(plog := io.StringIO()):
+    with contextlib.redirect_stdout(quiet):
+        rc = W.cmd_pull(url, dict(local_cfg, history_days=7), local_db,
+                        local_dash, force=True)
+# The swap itself is the thing most likely to fail silently: attaching the
+# destination leaves a handle on it, and Windows refuses to rename onto an
+# open file. That surfaced as "2 file(s) updated" over an untouched database.
+must("the pull reports success", rc == 0)
+must("nothing warned about writing the database",
+     "could not write" not in plog.getvalue())
+for _l in plog.getvalue().splitlines():
+    if "warn" in _l or "FAILED" in _l:
+        print("   >>", _l)
+
+hist = sqlite3.connect(local_db)
+after = {r[0] for r in hist.execute("SELECT DISTINCT taken_at FROM price_snapshot")}
+must("local-only days are carried across",
+     all(today - b * DAY in after for b in (1, 2, 3)))
+must("the published day is still there", shared_day in after)
+must("days beyond the retention window are dropped", ancient not in after)
+must("a day the publisher covers is not spliced with local rows",
+     hist.execute("SELECT COUNT(*) FROM price_snapshot WHERE taken_at=? "
+                  "AND item_id=424242", (shared_day,)).fetchone()[0] == 0)
+must("the publisher's own rows for that day are untouched",
+     hist.execute("SELECT COUNT(*) FROM price_snapshot WHERE taken_at=?",
+                  (shared_day,)).fetchone()[0] == shared_before)
+must("carried rows keep their values",
+     abs(hist.execute("SELECT sell_unit_price FROM price_snapshot WHERE "
+                      "taken_at=? AND item_id=2001",
+                      (today - 2 * DAY,)).fetchone()[0] - 222.0) < 1e-6)
+must("inventory still survives alongside the history",
+     dict(hist.execute("SELECT item_id, quantity FROM inventory"))
+     == {2001: 42, 2002: 7})
+hist.close()
+
+# history_days=0 means keep everything, including the ancient day.
+hist = sqlite3.connect(local_db)
+hist.execute("INSERT OR REPLACE INTO price_snapshot(taken_at,item_id,source,"
+             "sell_unit_price,min_unit_price,total_quantity,listing_count) "
+             "VALUES (?,?,?,?,?,?,?)", (ancient, 2001, "commodity", 9.0, 9.0, 1, 1))
+hist.commit()
+hist.close()
+with contextlib.redirect_stdout(quiet):
+    W.cmd_pull(url, dict(local_cfg, history_days=0), local_db, local_dash,
+               force=True)
+hist = sqlite3.connect(local_db)
+must("history_days=0 carries everything",
+     hist.execute("SELECT COUNT(*) FROM price_snapshot WHERE taken_at=?",
+                  (ancient,)).fetchone()[0] == 1)
+hist.close()
+
+# A local database written before a column existed must not break the carry.
+old_schema = os.path.join(tmp, "legacy.sqlite3")
+leg = sqlite3.connect(old_schema)
+leg.execute("CREATE TABLE price_snapshot (taken_at INTEGER NOT NULL, "
+            "item_id INTEGER NOT NULL, source TEXT NOT NULL, "
+            "sell_unit_price REAL, min_unit_price REAL, total_quantity "
+            "INTEGER, listing_count INTEGER, PRIMARY KEY (taken_at, item_id, "
+            "source))")
+leg.execute("INSERT INTO price_snapshot VALUES (?,?,?,?,?,?,?)",
+            (today - 5 * DAY, 2001, "commodity", 77.0, 70.0, 9, 2))
+leg.commit()
+leg.close()
+with contextlib.redirect_stdout(quiet):
+    W._install_prices_db(open(os.path.join(site, W.PRICES_NAME), "rb").read(),
+                         old_schema, 7)
+leg = sqlite3.connect(old_schema)
+must("a legacy schema without the range columns still carries",
+     leg.execute("SELECT COUNT(*) FROM price_snapshot WHERE taken_at=?",
+                 (today - 5 * DAY,)).fetchone()[0] == 1)
+must("the columns it never had come through empty, not broken",
+     leg.execute("SELECT sell_low FROM price_snapshot WHERE taken_at=?",
+                 (today - 5 * DAY,)).fetchone()[0] is None)
+leg.close()
+
+# ---- 6c. something holding the database open -------------------------
+# pricecheck is meant to be left open on a second monitor, and on Windows an
+# open handle is enough to make os.replace fail. The pull must say so and
+# leave the old database intact, not report success over stale prices.
+holder = sqlite3.connect(local_db)
+holder.execute("SELECT COUNT(*) FROM price_snapshot").fetchone()
+intact = open(local_db, "rb").read()
+with contextlib.redirect_stderr(hlog := io.StringIO()):
+    with contextlib.redirect_stdout(quiet):
+        rc = W.cmd_pull(url, local_cfg, local_db, local_dash, force=True)
+holder.close()
+if os.name == "nt":
+    must("a held database makes the pull fail, not succeed quietly", rc == 3)
+    must("the failure says what to close",
+         "pricecheck" in hlog.getvalue())
+    must("the old database is left intact",
+         open(local_db, "rb").read() == intact)
+else:
+    # POSIX renames over open files happily; there is nothing to survive.
+    must("a held database is not a problem off Windows", rc == 0)
+leftover = [n for n in os.listdir(local) if n.endswith(".sqlite3")
+            and n != "wowcraft.sqlite3"]
+must("a blocked swap leaves no temporary databases behind", leftover == [])
+
+# ---- 6d. a timezone mismatch is announced, not absorbed ---------------
+# Rewrite the manifest to claim a different zone, and check the pull says so.
+# Nothing about a mismatch fails on its own - that is exactly why it needs
+# saying out loud.
+mpath = os.path.join(site, W.MANIFEST_NAME)
+original = open(mpath, encoding="utf-8").read()
+skewed = json.loads(original)
+skewed["utc_offset"] = skewed["utc_offset"] + 3600
+skewed["tz_name"] = "Elsewhere"
+open(mpath, "w", encoding="utf-8").write(json.dumps(skewed))
+with contextlib.redirect_stderr(zlog := io.StringIO()):
+    with contextlib.redirect_stdout(quiet):
+        W.cmd_pull(url, local_cfg, local_db, local_dash)
+must("a timezone mismatch is warned about", "WARNING" in zlog.getvalue())
+must("the warning names the publisher's zone", "Elsewhere" in zlog.getvalue())
+must("the warning explains the consequence", "stored twice" in zlog.getvalue())
+open(mpath, "w", encoding="utf-8").write(original)
+
+with contextlib.redirect_stderr(zlog := io.StringIO()):
+    with contextlib.redirect_stdout(quiet):
+        W.cmd_pull(url, local_cfg, local_db, local_dash)
+must("matching timezones say nothing", "WARNING" not in zlog.getvalue())
 
 # ---- 7. an interrupted pull leaves the old database alone ------------
 good = open(local_db, "rb").read()

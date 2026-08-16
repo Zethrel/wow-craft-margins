@@ -2870,6 +2870,13 @@ def publish(out_dir: str, store: Store, cfg: dict, dashboard_path: str,
         "data_time": data_time or taken_at,
         "realm_slug": cfg.get("realm_slug", ""),
         "region": cfg.get("region", ""),
+        # History is bucketed at local midnight, so a publisher and a puller
+        # in different zones key the same calendar day differently and the
+        # database ends up with two rows per day. Publish the offset so the
+        # puller can see the mismatch instead of quietly accumulating it.
+        "utc_offset": -(time.altzone if time.daylight and time.localtime().tm_isdst
+                        else time.timezone),
+        "tz_name": time.strftime("%Z"),
         "files": files,
     }
     with open(os.path.join(out_dir, MANIFEST_NAME), "w", encoding="utf-8") as fh:
@@ -2906,16 +2913,101 @@ def _fetch(url: str, timeout: int = 120) -> bytes:
         return resp.read()
 
 
-def _install_prices_db(blob: bytes, db_path: str) -> None:
+HISTORY_TABLES = ("price_snapshot", "margin_snapshot")
+
+
+def _columns(db: sqlite3.Connection, table: str, schema: str = "main") -> list:
+    return [r[1] for r in db.execute(f"PRAGMA {schema}.table_info({table})")]
+
+
+def _carry_history(db: sqlite3.Connection, keep_days: int) -> dict:
+    """Copy whole days of history the downloaded database does not have.
+
+    Whole days, never part of one. A day's readings come from a single scan
+    lineage, and splicing local rows into a day the publisher also covered
+    would produce a row that is half one machine's view and half another's -
+    a number nobody could account for later.
+
+    Days the publisher does have always win: it is the one still scanning.
+    """
+    cutoff = 0
+    if keep_days > 0:
+        # Same window `scan` prunes to, so carrying history cannot smuggle
+        # back days that retention is meant to have dropped.
+        cutoff = day_bucket(int(time.time())) - (keep_days - 1) * 86400
+
+    present = {r[0] for r in db.execute(
+        "SELECT name FROM old.sqlite_master WHERE type='table'")}
+    carried = {}
+    for table in HISTORY_TABLES:
+        if table not in present:
+            continue
+        theirs = {r[0] for r in db.execute(
+            f"SELECT DISTINCT taken_at FROM {table}")}
+        mine = {r[0] for r in db.execute(
+            f"SELECT DISTINCT taken_at FROM old.{table}")}
+        missing = sorted(d for d in mine - theirs if d >= cutoff)
+        if not missing:
+            continue
+        # Intersect the column lists rather than trusting SELECT *: a database
+        # written by an older version is missing columns this one added, and
+        # the migration that fills them has not run on it.
+        shared = [c for c in _columns(db, table)
+                  if c in set(_columns(db, table, "old"))]
+        cols = ", ".join(f'"{c}"' for c in shared)
+        marks = ", ".join("?" * len(missing))
+        cur = db.execute(
+            f"INSERT OR IGNORE INTO {table} ({cols}) SELECT {cols} "
+            f"FROM old.{table} WHERE taken_at IN ({marks})", missing)
+        rows = cur.rowcount
+        # Close it explicitly. An unfinalised statement keeps sqlite3's handle
+        # on the file open, and on Windows that makes the os.replace below
+        # fail with "Access is denied" - a pull that reports success over a
+        # database it never actually swapped.
+        cur.close()
+        if rows > 0:
+            carried[table] = (len(missing), rows)
+    return carried
+
+
+def _replace_with_retry(src: str, dst: str, attempts: int = 6,
+                        delay: float = 0.5) -> None:
+    """os.replace, with patience for Windows file locking.
+
+    On Windows a rename onto an open file fails outright - no waiting, no
+    sharing. Anything holding the database blocks the swap: pricecheck left
+    open on a second monitor, a backup agent, a search indexer. Most of those
+    let go within a second or two, so retry briefly before giving up, and say
+    what to close when it really is held.
+    """
+    last = None
+    for attempt in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError as exc:
+            last = exc
+            if attempt < attempts - 1:
+                time.sleep(delay)
+    raise OSError(
+        f"could not replace {dst} after {attempts} attempts - something has "
+        f"it open. Close the price lookup window (pricecheck) and any "
+        f"database browser, then pull again. ({last})")
+
+
+def _install_prices_db(blob: bytes, db_path: str, keep_days: int = 0) -> None:
     """Swap a downloaded price database in, keeping what only this PC knows.
 
-    inventory comes from your own SavedVariables and exists nowhere else, so
-    replacing the file wholesale would quietly delete it and every craft would
-    go back to being scored as though you own nothing. Carry it across first,
-    then swap - and swap by rename, so an interrupted pull leaves the old
-    database intact rather than a half-written one.
+    Two things live here and nowhere else. inventory came off your own
+    SavedVariables, so replacing the file wholesale would quietly delete it and
+    every craft would go back to being scored as though you own nothing. Price
+    history is the other: past auction snapshots cannot be re-fetched once
+    Blizzard moves on, and the publisher's own window starts the day it first
+    ran. Carry both across, then swap by rename - so an interrupted pull leaves
+    the old database intact rather than a half-written one.
     """
     import gzip
+    import shutil
     import tempfile
 
     folder = os.path.dirname(os.path.abspath(db_path)) or "."
@@ -2929,26 +3021,43 @@ def _install_prices_db(blob: bytes, db_path: str) -> None:
         with open(tmp, "wb") as fh:
             fh.write(gzip.decompress(blob))
 
-        carried = 0
+        inventory = 0
+        history = {}
         if os.path.exists(db_path):
-            db = sqlite3.connect(tmp)
+            # Read the old database through a copy rather than attaching the
+            # destination directly. Attaching leaves a handle on it, and on
+            # Windows os.replace onto an open file fails with "Access is
+            # denied" - which surfaced as a pull that reported success and
+            # quietly kept the old prices.
+            fd2, old_copy = tempfile.mkstemp(suffix=".sqlite3", dir=folder)
+            os.close(fd2)
             try:
-                db.execute("ATTACH DATABASE ? AS old", (db_path,))
-                have = db.execute(
-                    "SELECT name FROM old.sqlite_master WHERE type='table' "
-                    "AND name='inventory'").fetchone()
-                if have:
-                    db.execute("INSERT OR REPLACE INTO inventory "
-                               "SELECT * FROM old.inventory")
-                    carried = db.execute(
-                        "SELECT COUNT(*) FROM inventory").fetchone()[0]
-                db.commit()
-                db.execute("DETACH DATABASE old")
+                shutil.copyfile(db_path, old_copy)
+                db = sqlite3.connect(tmp)
+                try:
+                    db.execute("ATTACH DATABASE ? AS old", (old_copy,))
+                    have = db.execute(
+                        "SELECT name FROM old.sqlite_master WHERE type='table'"
+                        " AND name='inventory'").fetchone()
+                    if have:
+                        db.execute("INSERT OR REPLACE INTO inventory "
+                                   "SELECT * FROM old.inventory")
+                        inventory = db.execute(
+                            "SELECT COUNT(*) FROM inventory").fetchone()[0]
+                    history = _carry_history(db, keep_days)
+                    db.commit()
+                    db.execute("DETACH DATABASE old")
+                finally:
+                    db.close()
             finally:
-                db.close()
-        os.replace(tmp, db_path)
-        if carried:
-            log(f"  kept {carried} inventory rows from the local database")
+                if os.path.exists(old_copy):
+                    os.remove(old_copy)
+        _replace_with_retry(tmp, db_path)
+        if inventory:
+            log(f"  kept {inventory} inventory rows from the local database")
+        for table, (days, rows) in sorted(history.items()):
+            log(f"  kept {days} day(s) of local {table} ({rows:,} rows) "
+                "that the published data does not cover")
     except BaseException:
         if os.path.exists(tmp):
             os.remove(tmp)
@@ -2980,6 +3089,21 @@ def cmd_pull(url: str, cfg: dict, db_path: str, out_path: str,
     log(f"  published data is {age // 60} minutes old "
         f"({manifest.get('realm_slug', '?')} {manifest.get('region', '?')})")
 
+    # A silent timezone mismatch is the worst kind of bug here: nothing fails,
+    # the numbers all look right, and the database quietly grows two rows for
+    # every calendar day because the two machines disagree on when midnight is.
+    theirs = manifest.get("utc_offset")
+    if theirs is not None:
+        mine = -(time.altzone if time.daylight and time.localtime().tm_isdst
+                 else time.timezone)
+        if theirs != mine:
+            log(f"  WARNING: the publisher is on {manifest.get('tz_name', '?')} "
+                f"(UTC{theirs / 3600:+g}) and this machine is on "
+                f"{time.strftime('%Z')} (UTC{mine / 3600:+g}).")
+            log("  History buckets on local midnight, so the same day will be "
+                "stored twice. Set \"timezone\" in ci-config.json to this "
+                "machine's zone and re-run the workflow.")
+
     state_path = os.path.join(os.path.dirname(os.path.abspath(db_path)),
                               PULL_STATE)
     state = {}
@@ -3001,6 +3125,7 @@ def cmd_pull(url: str, cfg: dict, db_path: str, out_path: str,
     }
 
     changed = 0
+    failed = 0
     for name, dest in targets.items():
         entry = manifest.get("files", {}).get(name)
         if not entry:
@@ -3018,10 +3143,12 @@ def cmd_pull(url: str, cfg: dict, db_path: str, out_path: str,
             blob = _fetch(base + name)
         except (urllib.error.URLError, OSError) as exc:
             log(f"  warn: {name} failed: {exc}")
+            failed += 1
             continue
         try:
             if name == PRICES_NAME:
-                _install_prices_db(blob, db_path)
+                _install_prices_db(blob, db_path,
+                                   int(cfg.get("history_days", 7) or 0))
             else:
                 os.makedirs(os.path.dirname(os.path.abspath(dest)) or ".",
                             exist_ok=True)
@@ -3030,6 +3157,7 @@ def cmd_pull(url: str, cfg: dict, db_path: str, out_path: str,
             log(f"    -> {dest}")
         except OSError as exc:
             log(f"  warn: could not write {dest}: {exc}")
+            failed += 1
             continue
         state[name] = entry["sha256"]
         changed += 1
@@ -3039,6 +3167,14 @@ def cmd_pull(url: str, cfg: dict, db_path: str, out_path: str,
             json.dump(state, fh, indent=2)
     except OSError:
         pass  # Only costs a redundant download next time.
+
+    # A file that would not write is not a successful pull, whatever else
+    # landed. Reporting it as one is how a stale database goes unnoticed.
+    if failed:
+        log(f"pull FAILED: {failed} file(s) could not be updated"
+            + (f" ({changed} did)" if changed else "")
+            + ". The old copies are untouched.")
+        return 3
 
     if changed:
         log(f"pull complete: {changed} file(s) updated. /reload in game to "

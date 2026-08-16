@@ -96,6 +96,13 @@ jobs:
           BNET_CLIENT_ID: ${{ secrets.BNET_CLIENT_ID }}
           BNET_CLIENT_SECRET: ${{ secrets.BNET_CLIENT_SECRET }}
         run: |
+          # History is one row per day bucketed at LOCAL midnight. A runner
+          # left on UTC keys the same calendar day differently from a PC on
+          # CEST, and the pulled database ends up with two entries per day
+          # forever. Adopt the timezone the puller uses.
+          TZ="$(python -c "import json;print(json.load(open('ci-config.json')).get('timezone') or 'UTC')")"
+          export TZ
+          echo "bucketing days in $TZ (now: $(date))"
           python wowcraft.py scan -c ci-config.json --publish site 2> scan.log || {
             echo "::error::scan failed - last lines follow"
             tail -30 scan.log

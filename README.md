@@ -217,15 +217,41 @@ refetched every run anyway.
 The workflow saves a fresh ~18 MB cache each hour and prunes all but the newest
 three, so this does not quietly grow until GitHub starts evicting caches.
 
+### Set the timezone, or you get every day twice
+
+`ci-config.json` has a `timezone` field, and it **must match the machine that
+runs `pull`**. History is one row per day bucketed at *local* midnight, so a
+runner left on UTC keys 16 August as `00:00 UTC` while a PC on CEST keys it as
+`00:00 CEST` — two rows, same day, forever, with sparklines drawing each day
+twice. Nothing errors; it just quietly accumulates.
+
+The workflow exports it as `TZ` before scanning, and the manifest carries the
+publisher's UTC offset so `pull` warns loudly if the two ever drift apart.
+
 ### What stays local
 
-Inventory-aware scoring and the undercut helper read your SavedVariables, which
-a runner cannot see. `pull` therefore **carries your `inventory` rows across**
-rather than replacing the database wholesale — those rows exist nowhere else,
-and losing them would silently re-score every craft as though you own nothing.
-It swaps by rename, so an interrupted pull leaves the old database intact.
+Two things live on your PC and nowhere else, so `pull` carries both across
+rather than replacing the database wholesale:
 
-Keep running `addon_import.py` locally for that side; it is unaffected.
+- **`inventory`** — read from your SavedVariables by `addon_import.py`. Losing
+  it would silently re-score every craft as though you own nothing.
+- **Price history the publisher does not have.** Past auction snapshots cannot
+  be re-fetched once Blizzard moves on, and the publisher's own window starts
+  the day it first ran — so a cutover would otherwise throw away everything
+  before it.
+
+History is carried a **whole day at a time**, and only for days the publisher
+has no data for. A day it does cover always wins: splicing local rows into a
+day the publisher also scanned would produce a row that is half one machine's
+view and half another's. Carried days still respect `history_days`, so this
+cannot smuggle back history retention is meant to have dropped.
+
+The swap is by rename, so an interrupted pull leaves the old database intact.
+On Windows a rename onto an open file fails outright, so `pull` retries for a
+few seconds and then tells you to close `pricecheck` — leaving the old database
+untouched and exiting non-zero rather than reporting success over stale prices.
+
+Keep running `addon_import.py` locally for the inventory side; it is unaffected.
 
 `test_cloud.py` covers the whole round trip — publish, serve, pull — against a
 fake API and a local HTTP server, including the inventory hand-off and a
