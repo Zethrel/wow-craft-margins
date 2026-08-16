@@ -173,15 +173,35 @@ must("unmeasured rows sort to the bottom, not the top",
      'data-vel="-1.0000"' in html2)
 must("and read as a dash, not a zero", "&ndash;" in html2)
 
-# Formatting: a dash and a zero must not look alike.
+# Three states, and they must not look alike: not measured, measured and
+# nothing left the market, measured and something did.
 must("unmeasured renders as a dash", "&ndash;" in W.velocity_str(None))
-must("zero renders as zero", W.velocity_str(0.0) == "0")
-must("fractions keep two places", W.velocity_str(0.25) == "0.25")
-must("busy items round off", W.velocity_str(1234.0) == "1,234")
+must("nothing having moved reads as static", W.velocity_str(0.0) == "static")
+must("something having moved reads as moves", W.velocity_str(0.25) == "moves")
+must("a large figure still only reads as moves",
+     W.velocity_str(1234.0) == "moves")
+
+# No rate is printed, at any magnitude. The first version of this column
+# summed max(0, previous - current) across scans and published units per day,
+# which on live data had 15% of items shifting more than their whole standing
+# supply within seven hours - a one-sided sum over a noisy series measures
+# volatility, not trade. The sign survives that; the magnitude does not, and
+# must not find its way back onto the page.
+for value in (0.25, 12.5, 1234.0, 2684177.3):
+    rendered = W.velocity_str(value)
+    must(f"no number leaks out for {value:g}",
+         not any(ch.isdigit() for ch in rendered))
+
 must("the tip explains an unmeasured row",
-     "needs a full day" in W.velocity_tip(None))
-must("the tip warns that cancellations look like sales",
-     "Cancellations" in W.velocity_tip(50.0))
+     "needs several hours" in W.velocity_tip(None))
+must("the tip explains what static really means",
+     "nothing left the market" in W.velocity_tip(0.0))
+must("the tip admits the static blind spot",
+     "restocked faster" in W.velocity_tip(0.0))
+must("the tip refuses to claim a quantity",
+     "cannot be had" in W.velocity_tip(50.0))
+must("the tip says cancellations are indistinguishable",
+     "cancellations look identical" in W.velocity_tip(50.0).lower())
 
 print()
 if fails:

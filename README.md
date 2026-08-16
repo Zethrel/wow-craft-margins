@@ -560,15 +560,24 @@ These are real gaps, not hedging:
   mistake — the first version of this badge reported that a lone 2.6M listing on
   old PvP gear made a craft worth 2.48M. On a live scan the honest count is 7
   rows out of 5,919, three of which show a loss that may not be one.
-- **Whether anything actually sold.** The API publishes what is *listed*, never
-  what changed hands. The **Sells/day** column is the nearest thing available:
-  the fall in listed quantity between one scan and the next, divided by the
-  market time those observations actually span. It counts cancellations as
-  sales, and misses sales masked by somebody posting more in the same interval
-  — so read it as "this moves" versus "this sits", not as a sales figure. A
-  dash means not measured yet, which is not the same as zero; a rate needs six
-  hours of observation behind it before it is shown at all. For commodities the
-  figure is region-wide, because commodity auctions are.
+- **How much sold.** Not available, and worth being precise about why. The API
+  publishes what is *listed*, never what changed hands. The **Moves** column
+  therefore reports only a direction: whether the listed quantity ever fell
+  across the observed window, which means units left the market, against
+  *static*, which means nothing did.
+
+  It deliberately gives no rate. The first version of this column did — it
+  summed `max(0, previous − current)` across scans and printed units per day —
+  and the number was nonsense. That sum takes every downward move and no upward
+  one, so for a quantity that oscillates it grows with volatility and with how
+  often you look, not with trade. Measured against live data, **15% of items
+  "sold" more than their entire standing supply within seven hours**, one of
+  them 1,200 units of an item with a single listing.
+
+  Even the direction has a blind spot, and the tooltip says so: an item
+  restocked faster than it sells never shows a fall and reads as static. A dash
+  means not measured yet, which is a third thing again. For commodities the
+  observation is region-wide, because commodity auctions are.
 - **Cooldowns.** Reagent costs take the cheaper of buying a reagent or making
   it (see below), and the biggest savings it finds are transmutes — which are
   precisely the crafts limited to one a day. Nothing in the API says so. A row

@@ -1056,12 +1056,16 @@ class MarginResult:
     # end 99% of the time, so where these differ the margin shown is a floor.
     output_variant_count: int = 1
     output_variant_high: float = 0.0
-    # Units of the output leaving the auction house per day, from the drop in
-    # listed quantity between scans. None means not measured yet, which is a
-    # different thing from zero: a fresh database has no history to diff.
-    # A big margin on something that shifts twice a month is worth less than a
-    # small one on something that shifts fifty times a day, and this is the
-    # only handle the API gives on which is which.
+    # Whether units of the output ever left the market, from the listed
+    # quantity falling between scans. Positive means something left; zero means
+    # nothing did across the whole window; None means not measured yet, which
+    # is a different thing again.
+    #
+    # Treat only the sign as meaningful. The magnitude is a sum of downward
+    # moves in a noisy series and measured, on live data, at up to a thousand
+    # times an item's entire supply - see velocity_str for the full account.
+    # It is retained for sorting and for the "actually sells" filter, both of
+    # which only need "did anything happen".
     output_sold_per_day: Optional[float] = None
     # What this craft's cost assumes you will make rather than buy, and what
     # that assumption saves against buying the lot. Only actionable if you
@@ -1782,11 +1786,12 @@ def cmd_scan(client: BlizzardClient, store: Store, cfg: dict, out_path: str,
 
     velocity = store.sale_velocity(days=keep_days or 7)
     if velocity:
-        moving = sum(1 for v in velocity.values() if v >= 1.0)
-        log(f"sale rate measured for {len(velocity):,} items; "
-            f"{moving:,} shift at least one a day")
+        moving = sum(1 for v in velocity.values() if v > 0)
+        log(f"market movement measured for {len(velocity):,} items; "
+            f"{moving:,} had units leave, {len(velocity) - moving:,} never "
+            "moved at all")
     else:
-        log("no sale rate yet -- it needs a full day of scans behind it")
+        log("no movement data yet -- it needs several hours of scans behind it")
 
     results, skipped = compute_margins(recipes, prices, names, batch=batch,
                                        min_listings=min_listings, owned=owned,
@@ -1844,45 +1849,50 @@ def cmd_scan(client: BlizzardClient, store: Store, cfg: dict, out_path: str,
 # Dashboard rendering
 # --------------------------------------------------------------------------
 
-def velocity_str(per_day: Optional[float]) -> str:
-    """How fast it moves, or a dash when we have not watched long enough.
+# The rate this used to print was wrong, and wrong in a way worth recording so
+# nobody rebuilds it. It summed max(0, previous - current) over every scan: all
+# the downward moves, none of the upward ones. For a quantity that oscillates -
+# which is every traded item - that sum grows with volatility and with how
+# often you look, not with how much sold. Measured against live data it had
+# 15% of items "selling" more than their entire standing supply inside seven
+# hours, one of them 1,200 units of an item with a single listing.
+#
+# What survives is the direction, not the magnitude: if the listed quantity
+# never once fell across the whole window, nothing left the market. So the
+# column reports that, and nothing it cannot support. Even this has a known
+# blind spot, stated in the tooltip: an item restocked faster than it sells
+# never shows a fall, and reads as static.
 
-    A dash and a zero mean very different things and must not look alike:
-    one is "no full day of scans behind this yet", the other is "watched, and
-    nothing shifted".
-    """
+
+def velocity_str(per_day: Optional[float]) -> str:
     if per_day is None:
         return '<span class="meta">&ndash;</span>'
-    if per_day >= 10:
-        return f"{per_day:,.0f}"
-    if per_day >= 1:
-        return f"{per_day:.1f}"
-    if per_day > 0:
-        return f"{per_day:.2f}"
-    return "0"
+    return "moves" if per_day > 0 else "static"
 
 
 def velocity_cls(per_day: Optional[float]) -> str:
     if per_day is None:
         return "meta"
-    return "pos" if per_day >= 1.0 else "neg" if per_day <= 0 else "num"
+    return "pos" if per_day > 0 else "neg"
 
 
 def velocity_tip(per_day: Optional[float]) -> str:
     if per_day is None:
-        return ("Not measured yet. Sale rate is the drop in listed quantity "
-                "between scans, so it needs a full day of scans behind it.")
-    base = (f"About {per_day:,.2f} of these leave the auction house per day, "
-            "measured as the fall in listed quantity between scans.")
+        return ("Not measured yet. This watches the listed quantity fall "
+                "between scans, so it needs several hours of scans behind it.")
     if per_day <= 0:
-        return base + (" Nothing has shifted while we have been watching - a "
-                       "margin you cannot realise is not a margin.")
-    if per_day < 1:
-        return base + (" Fewer than one a day: the margin is real but you "
-                       "will wait for it.")
-    return base + (" Cancellations look like sales here and simultaneous "
-                   "posting hides some, so read it as a rough rate, not a "
-                   "sales count.")
+        return ("The listed quantity never fell across the whole window, so "
+                "nothing left the market: no sales, and no cancellations "
+                "either. A margin you cannot realise is not a margin. The "
+                "blind spot: something restocked faster than it sells never "
+                "shows a fall, and lands here too.")
+    return ("The listed quantity fell at some point, so units did leave the "
+            "market. How MANY cannot be had from this API: cancellations look "
+            "identical to sales, and a seller posting more between two scans "
+            "hides whatever went in between. An earlier version of this "
+            "column printed a units-per-day figure and it was nonsense - "
+            "items 'sold' a thousand times their own supply - so it now says "
+            "only what it can support.")
 
 
 def _variant_floor(r) -> Optional[float]:
@@ -2773,7 +2783,7 @@ below the cut, scan it on its own with <code>--tier</code>, or raise
 <th class="num" data-key="rev">Revenue (g)</th>
 <th class="num" data-key="margin">Margin (g)</th>
 <th class="num" data-key="pct">Margin %</th>
-<th class="num" data-key="vel">Sells/day</th>
+<th class="num" data-key="vel">Moves</th>
 <th class="num" data-key="supply">Supply</th>
 <th>History</th>
 </tr></thead><tbody id="rows">{''.join(rows_html)}</tbody></table>
