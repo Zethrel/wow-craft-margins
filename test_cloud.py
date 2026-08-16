@@ -532,6 +532,105 @@ must("the token is not in the persisted state", "tok" not in json.dumps(
 W._dispatch_workflow = real_dispatch
 open(mpath2, "w", encoding="utf-8").write(orig2)
 
+# ---- 6f. doctor, pull side -------------------------------------------
+# Diagnosing a refused dispatch by hand took three rounds of guessing at
+# which box was unticked. The point of these is that the report says it.
+import urllib.error
+
+
+def http_error(code, headers=None):
+    return urllib.error.HTTPError("u", code, "msg", headers or {}, None)
+
+
+def probe_returning(exc):
+    real = urllib.request.urlopen
+
+    def fake(*a, **k):
+        raise exc
+    urllib.request.urlopen = fake
+    try:
+        return W._probe_dispatch("o/r", "scan.yml", "tok_SECRET_VALUE")
+    finally:
+        urllib.request.urlopen = real
+
+
+verdict, detail = probe_returning(http_error(422))
+must("a rejected probe ref means the permission is there", verdict == "OK")
+verdict, detail = probe_returning(
+    http_error(403, {"x-accepted-github-permissions": "actions=write"}))
+must("403 is reported as a permission failure", verdict == "FAIL")
+must("and names the mode that cannot ever grant it",
+     "Public repositories" in detail and "Read and write" in detail)
+verdict, _ = probe_returning(http_error(401))
+must("401 is reported as an expired or bad token", verdict == "FAIL")
+verdict, _ = probe_returning(http_error(404))
+must("404 is reported as the wrong repository", verdict == "FAIL")
+
+# The probe must never start a workflow: it dispatches a ref that cannot
+# exist, so the request is refused before anything runs.
+must("the probe ref is one nobody would create",
+     "does-not-exist" in W.DOCTOR_PROBE_REF)
+
+# The whole report has to be safe to paste into an issue.
+report = []
+real_probe = W._probe_dispatch          # captured BEFORE stubbing
+W._probe_dispatch = lambda *a: ("OK", "actions:write granted")
+try:
+    W._doctor_cloud(
+        dict(local_cfg, pull_url=url, dispatch_when_stale_minutes=90,
+             github_token="tok_SECRET_VALUE",
+             dispatch_repo="zethrel/wow-craft-margins"),
+        local_db, report.append)
+finally:
+    W._probe_dispatch = real_probe
+text = "\n".join(report)
+must("the doctor report never contains the token",
+     "tok_SECRET_VALUE" not in text)
+must("it reports the token's length instead", "93 chars" in text
+     or "%d chars" % len("tok_SECRET_VALUE") in text)
+must("it covers the published site", "[C1]" in text)
+must("it covers time zones", "[C2]" in text)
+must("it covers local state", "[C3]" in text)
+must("it covers self-dispatch", "[C4]" in text)
+
+# No pull_url at all is a normal state, not an error.
+report = []
+W._doctor_cloud(dict(local_cfg, pull_url=""), local_db, report.append)
+must("no pull_url is reported as not-configured, not as a failure",
+     "not configured" in "\n".join(report)
+     and "FAIL" not in "\n".join(report))
+
+# No token, with dispatch enabled, should say so plainly.
+report = []
+os.environ.pop("WOWCRAFT_GITHUB_TOKEN", None)
+os.environ.pop("GITHUB_TOKEN", None)
+W._doctor_cloud(dict(local_cfg, pull_url=url, dispatch_when_stale_minutes=90,
+                     github_token=""), local_db, report.append)
+must("a missing token is called out", "no token found" in "\n".join(report))
+
+# Two entries on one calendar date is the timezone bug visible in the data.
+dupe_db = os.path.join(tmp, "dupes.sqlite3")
+dd = W.Store(dupe_db)
+noon = W.day_bucket(int(time.time()))
+for stamp in (noon, noon + 7200):          # same date, two buckets
+    dd.db.execute("INSERT INTO price_snapshot(taken_at,item_id,source,"
+                  "sell_unit_price,min_unit_price,total_quantity,"
+                  "listing_count) VALUES (?,?,?,?,?,?,?)",
+                  (stamp, 1, "commodity", 1.0, 1.0, 1, 1))
+dd.db.commit()
+dd.close()
+report = []
+W._doctor_cloud(dict(local_cfg, pull_url="", addon_path=""), dupe_db,
+                report.append)
+# pull_url empty returns before [C3], so check the database branch directly
+# with a configured site instead.
+report = []
+W._probe_dispatch = lambda *a: ("OK", "fine")
+W._doctor_cloud(dict(local_cfg, pull_url=url, dispatch_when_stale_minutes=0),
+                dupe_db, report.append)
+must("a calendar date stored twice is reported",
+     "stored more than once" in "\n".join(report))
+
 # ---- 7. an interrupted pull leaves the old database alone ------------
 good = open(local_db, "rb").read()
 try:

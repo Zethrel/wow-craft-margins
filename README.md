@@ -242,6 +242,35 @@ Leave `github_token` empty and none of this happens — `pull` says it noticed
 the staleness and carries on. Set `dispatch_when_stale_minutes` to `0` to
 switch it off entirely.
 
+### When any of it misbehaves
+
+```bash
+python3 wowcraft.py doctor
+```
+
+`doctor` now covers the pull side as well as the API, and **runs without
+Battle.net credentials** — which is the normal state once scanning moved to
+CI, and exactly when you want a diagnostic. It reports:
+
+- **[C1]** the published site: manifest reachable, data age against your
+  staleness threshold, every published file and its size
+- **[C2]** timezones: publisher versus this machine, since a mismatch stores
+  every calendar day twice and nothing else complains
+- **[C3]** local state: database size, recipe count, days of history, whether
+  any date is stored twice, and when `PriceData.lua` was last written
+- **[C4]** self-dispatch: the token's source and length, the target repo and
+  workflow, and whether the token can actually dispatch
+
+That last check **starts no workflow**. It dispatches a ref that cannot exist,
+because GitHub validates the permission before it resolves the ref: `403` means
+the permission is missing, `422` means the permission is fine and only the
+branch was bogus. A `403` also prints the two settings that cause it — the
+*Public repositories* access mode is read-only and can never grant
+`actions=write`, which GitHub's own error never mentions.
+
+The report contains no credentials and no token — only lengths and sources —
+so it stays safe to paste anywhere.
+
 ### The database, and why there is a seed
 
 `scan` needs the recipe cache `init` builds — 9,725 recipes, about fifteen
@@ -508,7 +537,7 @@ Run `doctor` first.
 | `pull` | Download a published scan instead of running one — no credentials |
 | `seed` | Export the recipe cache for the CI workflow to cold-start from |
 | `demo` | Run the whole pipeline on synthetic data, no credentials |
-| `doctor` | Probe every endpoint, write a shareable diagnostic report |
+| `doctor` | Probe every endpoint *and* the pull side, write a shareable report |
 | `names` | Look up names for every priced item that has none (one-off, ~6 min) |
 
 Blizzard allows 36,000 requests an hour. A full `init` plus a full `names` is

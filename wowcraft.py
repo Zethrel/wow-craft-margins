@@ -2366,7 +2366,8 @@ def cmd_names(client: BlizzardClient, store: Store, cfg: dict) -> None:
 
 
 def cmd_doctor(client: BlizzardClient, store: Store, cfg: dict,
-               out_path: str = "doctor-report.txt") -> None:
+               out_path: str = "doctor-report.txt",
+               db_path: str = "wowcraft.sqlite3") -> None:
     """Probe every endpoint the tool depends on and write a shareable report.
 
     The report contains NO credentials - only API response shapes - so it is
@@ -2651,15 +2652,234 @@ def cmd_doctor(client: BlizzardClient, store: Store, cfg: dict,
 
     w("")
     w("=" * 68)
+    w("CLOUD / PULL SIDE")
+    w("=" * 68)
+    _doctor_cloud(cfg, db_path, w)
+
+    w("")
+    w("=" * 68)
     w("END OF REPORT - safe to share, contains no credentials")
     w("=" * 68)
     _write_report(out, out_path)
+
+
+def cmd_doctor_cloud(cfg: dict, db_path: str,
+                     out_path: str = "doctor-report.txt") -> int:
+    """The pull side alone, for a machine that has no Blizzard credentials.
+
+    Which is the normal state once the scanning moved to CI - `doctor` should
+    still work there rather than refusing at the credential gate.
+    """
+    out: list = []
+
+    def w(line: str = "") -> None:
+        out.append(line)
+        print(line, flush=True)
+
+    w("=" * 68)
+    w("wowcraft doctor report (pull side only)")
+    w(f"generated : {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    w(f"python    : {sys.version.split()[0]} on {sys.platform}")
+    w("no Blizzard credentials on this machine, which is expected when the")
+    w("scanning happens in CI. Run `doctor` where the credentials are to")
+    w("check the API side.")
+    w("(no credentials or tokens appear anywhere in this file)")
+    w("=" * 68)
+
+    _doctor_cloud(cfg, db_path, w)
+
+    w("")
+    w("=" * 68)
+    w("END OF REPORT - safe to share, contains no credentials")
+    w("=" * 68)
+    _write_report(out, out_path)
+    return 0
 
 
 def _write_report(lines: list, path: str) -> None:
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
     log(f"wrote {path}")
+
+
+# A branch nobody will ever create. Dispatching at it tests the token's
+# actions:write permission without starting a workflow: GitHub checks the
+# permission before it resolves the ref, so 403 means "not allowed" and 422
+# means "allowed, and that branch does not exist" - which is the answer.
+DOCTOR_PROBE_REF = "wowcraft-doctor-probe-does-not-exist"
+
+
+def _probe_dispatch(repo: str, workflow: str, token: str) -> tuple:
+    """(verdict, detail) for the token's ability to dispatch. Starts nothing."""
+    url = (f"https://api.github.com/repos/{repo}/actions/workflows/"
+           f"{workflow}/dispatches")
+    req = urllib.request.Request(
+        url, data=json.dumps({"ref": DOCTOR_PROBE_REF}).encode(),
+        method="POST", headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": USER_AGENT,
+        })
+    try:
+        with urllib.request.urlopen(req, timeout=30):
+            # Should be unreachable: that ref does not exist.
+            return "ODD", ("the probe ref somehow dispatched - create no "
+                           f"branch called {DOCTOR_PROBE_REF}")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 422:
+            return "OK", "actions:write granted (probe ref rejected, as it should be)"
+        if exc.code == 401:
+            return "FAIL", "token rejected outright - expired, revoked or mistyped"
+        if exc.code == 403:
+            want = exc.headers.get("x-accepted-github-permissions") or "actions=write"
+            return "FAIL", (
+                f"no permission to dispatch; GitHub wants '{want}'. On a "
+                "fine-grained token check BOTH: Repository access must be "
+                "'Only select repositories' (the 'Public repositories' mode "
+                "is read-only and can never grant this), and Repository "
+                "permissions > Actions must be 'Read and write'.")
+        if exc.code == 404:
+            return "FAIL", (f"cannot see {repo} or its {workflow} - wrong "
+                            "repository, or the token does not cover it")
+        return "FAIL", f"HTTP {exc.code}"
+    except (urllib.error.URLError, OSError) as exc:
+        return "WARN", f"could not reach GitHub: {exc}"
+
+
+def _doctor_cloud(cfg: dict, db_path: str, w) -> None:
+    """Everything the pull side depends on, in one pass.
+
+    Written because diagnosing a refused dispatch by hand took three rounds of
+    guessing at which box was unticked, and because the token has an expiry
+    date that will arrive long after anyone remembers setting it.
+    """
+    url = cfg.get("pull_url") or ""
+    w("")
+    w("[C1] PUBLISHED SITE")
+    if not url:
+        w("    not configured - pull_url is empty, so this machine scans for")
+        w("    itself and the rest of this section does not apply.")
+        return
+    w(f"    url: {url}")
+    base = url.rstrip("/") + "/"
+    manifest = None
+    try:
+        manifest = json.loads(_fetch(base + MANIFEST_NAME, timeout=30))
+        w("    OK - manifest fetched and parsed")
+    except urllib.error.HTTPError as exc:
+        w(f"    FAIL - HTTP {exc.code}. Check the URL, that Pages is enabled")
+        w("           with source 'GitHub Actions', and that the workflow has")
+        w("           published at least once.")
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        w(f"    FAIL - {exc}")
+
+    if manifest:
+        age = int(time.time()) - int(manifest.get("data_time") or 0)
+        stale = int(cfg.get("dispatch_when_stale_minutes", 0) or 0)
+        w(f"    realm    : {manifest.get('realm_slug')} "
+          f"({manifest.get('region')})")
+        w(f"    data age : {age // 60} min"
+          + (f"  (threshold {stale} min)" if stale else ""))
+        if stale and age > stale * 60:
+            w("               past the threshold - a pull now would ask for a scan")
+        gen = int(time.time()) - int(manifest.get("generated_at") or 0)
+        w(f"    published: {gen // 60} min ago")
+        for name, entry in sorted(manifest.get("files", {}).items()):
+            w(f"      {name:<22} {entry.get('size', 0) // 1024:>6} KB")
+
+        w("")
+        w("[C2] TIME ZONES")
+        theirs = manifest.get("utc_offset")
+        mine = -(time.altzone if time.daylight and time.localtime().tm_isdst
+                 else time.timezone)
+        w(f"    this machine : {time.strftime('%Z')} (UTC{mine / 3600:+g})")
+        if theirs is None:
+            w("    publisher    : not stated (published by an older version)")
+        else:
+            w(f"    publisher    : {manifest.get('tz_name', '?')} "
+              f"(UTC{theirs / 3600:+g})")
+            if theirs == mine:
+                w("    OK - both agree on when midnight is")
+            else:
+                w("    FAIL - history buckets on LOCAL midnight, so the same")
+                w("           calendar day is stored twice, forever. Set")
+                w("           'timezone' in ci-config.json to this machine's")
+                w("           zone and re-run the workflow.")
+
+    w("")
+    w("[C3] LOCAL STATE")
+    w(f"    database : {db_path}")
+    if os.path.exists(db_path):
+        try:
+            db = sqlite3.connect(db_path)
+            days = [r[0] for r in db.execute(
+                "SELECT DISTINCT taken_at FROM price_snapshot ORDER BY taken_at")]
+            w(f"    OK - {os.path.getsize(db_path) // (1 << 20)} MB, "
+              f"{db.execute('SELECT COUNT(*) FROM recipe').fetchone()[0]} "
+              f"recipes, {len(days)} day(s) of history")
+            # Two entries on one calendar date is the timezone bug showing up
+            # in the data rather than in a config file.
+            dates = [time.strftime("%Y-%m-%d", time.localtime(d)) for d in days]
+            dupes = sorted({d for d in dates if dates.count(d) > 1})
+            if dupes:
+                w(f"    FAIL - {', '.join(dupes)} stored more than once. That")
+                w("           is the [C2] timezone mismatch in the data.")
+            db.close()
+        except sqlite3.Error as exc:
+            w(f"    FAIL - {exc}")
+    else:
+        w("    absent - the first pull will create it")
+
+    addon = cfg.get("addon_path") or ""
+    if not addon:
+        w("    addon_path is empty, so no prices are written into the game")
+    elif not os.path.isdir(addon):
+        w(f"    FAIL - addon_path does not exist: {addon}")
+    else:
+        lua = os.path.join(addon, "PriceData.lua")
+        if os.path.exists(lua):
+            old = (time.time() - os.path.getmtime(lua)) / 60
+            w(f"    OK - PriceData.lua {os.path.getsize(lua) // 1024} KB, "
+              f"written {int(old)} min ago")
+        else:
+            w("    PriceData.lua not written yet - run a pull, then /reload")
+
+    w("")
+    w("[C4] SELF-DISPATCH")
+    stale = int(cfg.get("dispatch_when_stale_minutes", 0) or 0)
+    if stale <= 0:
+        w("    disabled (dispatch_when_stale_minutes is 0). A dropped cron")
+        w("    slot just means waiting for the next one.")
+        return
+    w(f"    triggers when published data is over {stale} min old")
+
+    source = ("WOWCRAFT_GITHUB_TOKEN" if os.environ.get("WOWCRAFT_GITHUB_TOKEN")
+              else "GITHUB_TOKEN" if os.environ.get("GITHUB_TOKEN")
+              else "config.json" if cfg.get("github_token") else "")
+    token = (os.environ.get("WOWCRAFT_GITHUB_TOKEN")
+             or os.environ.get("GITHUB_TOKEN")
+             or cfg.get("github_token") or "")
+    if not token:
+        w("    FAIL - no token found. Set WOWCRAFT_GITHUB_TOKEN, or")
+        w("           github_token in config.json. Without one, a dropped")
+        w("           slot simply waits for the next cron.")
+        return
+    # Length and source only. The value never reaches this report, which is
+    # the whole reason the report is safe to paste anywhere.
+    w(f"    token from {source}, {len(token)} chars, "
+      f"{'fine-grained' if token.startswith('github_pat_') else 'classic'}")
+
+    repo = cfg.get("dispatch_repo") or _derive_repo(url)
+    if not repo:
+        w("    FAIL - cannot work out the repository from pull_url. Set")
+        w("           dispatch_repo to \"owner/name\" in config.json.")
+        return
+    workflow = cfg.get("dispatch_workflow", "scan.yml") or "scan.yml"
+    w(f"    target: {repo} / {workflow} @ {cfg.get('dispatch_ref', 'main')}")
+
+    verdict, detail = _probe_dispatch(repo, workflow, token)
+    w(f"    {verdict} - {detail}")
 
 
 # --------------------------------------------------------------------------
@@ -3503,6 +3723,12 @@ def main(argv: Optional[list] = None) -> int:
             return 1
         return cmd_pull(url, cfg, args.db, args.out, args.force)
 
+    # A pull-only machine has no Blizzard credentials by design, and that is
+    # exactly when you most want a diagnostic. Report on what it does have.
+    if args.command == "doctor" and not (cfg["client_id"]
+                                         and cfg["client_secret"]):
+        return cmd_doctor_cloud(cfg, args.db)
+
     if not cfg["client_id"] or not cfg["client_secret"]:
         log("Missing credentials. Put client_id/client_secret in config.json, "
             "or set BNET_CLIENT_ID / BNET_CLIENT_SECRET. "
@@ -3523,7 +3749,7 @@ def main(argv: Optional[list] = None) -> int:
             run_cfg["professions"] = _split_list(args.profession)
 
         if args.command == "doctor":
-            cmd_doctor(client, store, cfg)
+            cmd_doctor(client, store, cfg, db_path=args.db)
         elif args.command == "init":
             cmd_init(client, store, run_cfg)
         elif args.command == "names":

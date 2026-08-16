@@ -10,17 +10,29 @@ permissions:
 
 jobs:
   tests:
-    runs-on: ubuntu-latest
+    # Windows is not decoration here. The two nastiest bugs this project has
+    # had were both Windows-only - an open sqlite3 handle making os.replace
+    # fail with "Access is denied" while the pull reported success - and a
+    # Linux runner can never catch them, because POSIX renames over open files
+    # happily. test_cloud.py branches on os.name for exactly that reason.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      # test_addon.py drives the addon's Lua for real and skips cleanly
-      # without lupa. Installing it here is the only place that dependency
-      # is worth having.
+      # test_addon.py and test_prices.py drive the addon's Lua for real and
+      # skip cleanly without lupa. This is the only place that dependency is
+      # worth having.
       - run: pip install lupa
       - name: Run every suite
+        # Explicit, because the default shell on windows-latest is pwsh and
+        # this loop is bash.
+        shell: bash
         run: |
           failed=""
           for f in test_*.py; do
@@ -31,7 +43,23 @@ jobs:
           # Each suite prints its own PASS/FAIL lines; without this you have to
           # open every group to find out which one actually went red.
           if [ -n "$failed" ]; then
-            echo "::error::failing suites:$failed"
+            echo "::error::failing suites on ${{ matrix.os }}:$failed"
             exit 1
           fi
           echo "all suites pass"
+
+  # Catches the two workflow bugs this repo has already shipped: a dispatch
+  # input interpolated straight into a run: block (expression injection), and
+  # an unquoted shell variable that would split on a value containing a space.
+  # actionlint runs shellcheck over run: blocks, so both are its bread and
+  # butter, and it also rejects invalid if:/needs: expressions that otherwise
+  # only fail at run time.
+  lint-workflows:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # Pinned rather than :latest - the point of a linter is that it gives
+      # the same answer today and in a year. Published by actionlint's author.
+      - uses: docker://rhysd/actionlint:1.7.12
+        with:
+          args: -color
