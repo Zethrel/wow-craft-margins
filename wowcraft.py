@@ -84,6 +84,22 @@ CRAFTED_CLIENT = "client"
 # does not define the market.
 SELL_PERCENTILE = 0.15
 
+# How far apart the dearest and the priced variant must be before the
+# dashboard says so. Bonus lists encode item level and quality, and a full
+# scan found most multi-variant items list every variant at the same price;
+# badging those would be noise that teaches you to ignore badges. 1.5 keeps it
+# to gaps big enough to change what you would craft. Measured on 29,232 priced
+# items: 11% of crafted outputs have variants at all, and the pooled price
+# lands at the cheap end 99% of the time, so this flags understatement.
+VARIANT_SPREAD = 1.5
+
+# ...and how many listings the dearer variant needs before it is quoted at
+# all. One listing is not a market: the first version of this badge cheerfully
+# reported that a 2.6M lone listing on old PvP gear made a craft worth 2.48M,
+# which is precisely the fiction min_listings exists to keep out of the
+# headline figures. A price nobody else is asking is not a price.
+VARIANT_MIN_LISTINGS = 2
+
 GOLD = 10000  # copper per gold
 
 
@@ -773,6 +789,15 @@ class ItemPrice:
     listing_count: int
     # (unit_price, quantity) sorted ascending - used for accurate buy costing
     ladder: list = field(default_factory=list, repr=False)
+    # How many distinct bonus-list variants were pooled into this price, and
+    # the cheapest listing of the dearest one. Bonus lists encode item level
+    # and quality, and the recipe endpoint never says which variant a craft
+    # produces - so they cannot be priced apart. What they CAN do is say when
+    # a price is ambiguous: pooling puts sell_unit_price at the cheap end
+    # ~99% of the time, which understates revenue rather than inventing it,
+    # and this is how the dashboard admits to that instead of hiding it.
+    variant_count: int = 1
+    variant_high: float = 0.0
 
     def buy_cost(self, units: int) -> Optional[float]:
         """Actual copper cost to buy `units` from the cheapest listings up."""
@@ -797,6 +822,8 @@ def build_price_index(auctions: list, source: str) -> dict:
     a per-unit price, then build a supply ladder.
     """
     ladders: dict = {}
+    # item id -> {bonus-list signature: cheapest listing of that variant}
+    variants: dict = {}
     for a in auctions:
         item = a.get("item") or {}
         iid = item.get("id")
@@ -814,6 +841,12 @@ def build_price_index(auctions: list, source: str) -> dict:
         if unit <= 0:
             continue
         ladders.setdefault(iid, []).append((float(unit), int(qty)))
+        # Commodities never carry bonus lists, so this stays a single empty
+        # signature for every reagent and costs nothing there.
+        sig = tuple(sorted(item.get("bonus_lists") or []))
+        seen = variants.setdefault(iid, {})
+        cheapest, count = seen.get(sig, (float(unit), 0))
+        seen[sig] = (min(cheapest, float(unit)), count + 1)
 
     prices: dict = {}
     for iid, entries in ladders.items():
@@ -828,6 +861,10 @@ def build_price_index(auctions: list, source: str) -> dict:
             if running >= target:
                 sell = price
                 break
+        seen = variants.get(iid, {})
+        # Only variants somebody else is also selling. A lone listing is a
+        # price nobody has agreed to.
+        traded = [p for p, n in seen.values() if n >= VARIANT_MIN_LISTINGS]
         prices[iid] = ItemPrice(
             item_id=iid,
             source=source,
@@ -836,6 +873,8 @@ def build_price_index(auctions: list, source: str) -> dict:
             total_quantity=total_qty,
             listing_count=len(entries),
             ladder=entries,
+            variant_count=len(seen),
+            variant_high=max(traded) if traded else 0.0,
         )
     return prices
 
@@ -881,6 +920,14 @@ class MarginResult:
     # when you hold nothing, which is also the default when no inventory has
     # been imported - so the headline never quietly improves on its own.
     cost_to_finish: float = 0.0
+    # The output listed under several bonus-list variants - different item
+    # levels or qualities of the same id - priced together because the recipe
+    # endpoint never says which one this craft makes. `output_variant_high` is
+    # the cheapest listing of the dearest variant. Measured on a full scan:
+    # 11% of crafted outputs are affected, the pooled price lands at the cheap
+    # end 99% of the time, so where these differ the margin shown is a floor.
+    output_variant_count: int = 1
+    output_variant_high: float = 0.0
 
 
 def _col(row: Any, key: str, default: Any = None) -> Any:
@@ -1015,6 +1062,8 @@ def compute_margins(recipes: list, prices: dict, item_names: dict,
                 reagent_breakdown=breakdown,
                 output_supply=out_price.total_quantity,
                 output_listings=out_price.listing_count,
+                output_variant_count=out_price.variant_count,
+                output_variant_high=out_price.variant_high,
                 crafted_source=_col(r, "crafted_source", CRAFTED_API),
                 cost_complete=True,
                 optionals_filled=optionals,
@@ -1082,6 +1131,8 @@ def compute_margins(recipes: list, prices: dict, item_names: dict,
             reagent_breakdown=breakdown,
             output_supply=out_price.total_quantity,
             output_listings=out_price.listing_count,
+            output_variant_count=out_price.variant_count,
+            output_variant_high=out_price.variant_high,
             crafted_source=_col(r, "crafted_source", CRAFTED_API),
             cost_complete=not _col(r, "uses_slots", 0),
             cost_to_finish=to_buy,
@@ -1504,6 +1555,22 @@ def cmd_scan(client: BlizzardClient, store: Store, cfg: dict, out_path: str,
 # --------------------------------------------------------------------------
 # Dashboard rendering
 # --------------------------------------------------------------------------
+
+def _variant_floor(r) -> Optional[float]:
+    """Revenue at the dearest traded variant, when that is worth saying.
+
+    None unless the output is listed under several bonus-list variants AND
+    they are far enough apart to change a decision. Measured on a full scan:
+    619 outputs differ by 1.5x or more counting every listing, but only 127 do
+    once each variant needs a second seller - 79% of the effect was one person
+    fishing for a mistake. Hence VARIANT_MIN_LISTINGS, applied upstream.
+    """
+    if r.output_variant_count <= 1 or r.revenue <= 0 or not r.crafted_qty:
+        return None
+    priced_at = r.revenue / (r.crafted_qty * (1.0 - AH_CUT))
+    if priced_at <= 0 or r.output_variant_high < VARIANT_SPREAD * priced_at:
+        return None
+    return r.output_variant_high * r.crafted_qty * (1.0 - AH_CUT)
 
 CSS = """
 :root { color-scheme: light dark; }
@@ -2051,6 +2118,19 @@ def render_dashboard(results: list, cfg: dict, taken_at: int, skipped: dict,
             seen.add(r.recipe_id)
     for extra in per_expansion.values():
         shown += extra
+
+    # Rows whose revenue is known to be understated get a place too. They are
+    # ranked on a price taken from the cheapest variant, so the ranking is the
+    # very thing that excluded them - and on a full scan all seven of them
+    # fell outside the table, which made the badge invisible and the feature
+    # pointless. Three of the seven showed a loss that may not be one.
+    for r in results:
+        if r.recipe_id in seen:
+            continue
+        if _variant_floor(r):
+            shown.append(r)
+            seen.add(r.recipe_id)
+
     shown.sort(key=lambda x: (x.cost_complete, x.margin), reverse=True)
     profs = sorted({r.profession for r in shown if r.profession})
 
@@ -2119,6 +2199,22 @@ def render_dashboard(results: list, cfg: dict, taken_at: int, skipped: dict,
                 'finishing reagent slots. Blizzard publishes neither what goes '
                 'in them nor how much, so this cost is a floor and the margin '
                 'is a ceiling you cannot actually reach.">cost is a floor</span>')
+        # The mirror image of "cost is a floor": there the cost is understated
+        # and the margin flatters, here the revenue is understated and the
+        # margin is pessimistic. Only shown when the gap is worth acting on -
+        # most multi-variant items list every variant at the same price, and
+        # badging those would be noise that teaches you to ignore badges.
+        best = _variant_floor(r)
+        if best:
+            rank_badge += (
+                f'<span class="badge" data-tip="This item is listed under '
+                f'{r.output_variant_count} bonus-list variants - different item '
+                f'levels or qualities of the same id - and Blizzard&amp;#39;s '
+                f'recipe endpoint never says which one this craft makes, so '
+                f'they are priced together at the cheap end. The dearest '
+                f'variant would make this {copper_to_gold_str(best - r.cost)} '
+                f'instead. Check the auction house before dismissing it.">'
+                f'revenue is a floor</span>')
         reagent_bill = "".join(
             f'<span>{esc(b["name"])} &times;{b["qty"]} '
             f'<em>{copper_to_gold_str(b["total"])}</em>'

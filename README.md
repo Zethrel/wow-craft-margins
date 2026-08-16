@@ -483,6 +483,26 @@ These are real gaps, not hedging:
   bills. Rather than list them as separate opportunities, the tool collapses them
   to the cheapest recipe per output item and tags the row **"N ranks"**. Read those
   rows as *"the floor cost of making this at some rank"*, not as a specific craft.
+- **Which item level a craft produces.** A separate ambiguity from the one above:
+  the same item id is listed on the auction house under several *bonus lists* —
+  different item levels or qualities — and the recipe endpoint never says which
+  one a craft makes. They are therefore priced together, and since the sell price
+  is a low percentile of the pooled ladder, it lands at the cheap end. Measured on
+  a full scan: 11% of crafted outputs have more than one variant, and the pooled
+  price sits at the cheap end **3,755 times against 21 at the dear end** — so this
+  understates revenue rather than inventing it. It makes the tool *miss*
+  profitable crafts, not recommend bad ones.
+
+  Where the gap is big enough to change a decision, the row is badged
+  **"revenue is a floor"** and the tooltip says what the dearest variant would
+  pay. Those rows are also given a guaranteed place in the table, because the
+  understated price is exactly what would otherwise rank them out of sight.
+
+  The dearer variant must have **at least two listings** before it is quoted. It
+  turned out 79% of the apparent effect was a single seller fishing for a
+  mistake — the first version of this badge reported that a lone 2.6M listing on
+  old PvP gear made a craft worth 2.48M. On a live scan the honest count is 7
+  rows out of 5,919, three of which show a loss that may not be one.
 - **Inspiration, resourcefulness, multicraft.** All of these move real profit and
   none are visible to the API. They generally push margins *up*.
 - **Crafting orders.** Personal and patron orders often beat the open market
