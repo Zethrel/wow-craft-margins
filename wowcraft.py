@@ -3008,8 +3008,9 @@ def cmd_pull(url: str, cfg: dict, db_path: str, out_path: str,
         if dest is None:
             log(f"  skipping {name} (no addon_path set in config)")
             continue
-        if state.get(name) == entry["sha256"] and os.path.exists(
-                dest if name != PRICES_NAME else db_path):
+        # The hash says we already have it, but only if it is still on disk -
+        # deleting the addon file by hand should get it back, not skipped.
+        if state.get(name) == entry["sha256"] and os.path.exists(dest):
             log(f"  {name} unchanged")
             continue
         log(f"  downloading {name} ({entry['size'] // 1024} KB)")
