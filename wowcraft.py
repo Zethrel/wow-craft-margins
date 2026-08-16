@@ -1063,6 +1063,11 @@ class MarginResult:
     # small one on something that shifts fifty times a day, and this is the
     # only handle the API gives on which is which.
     output_sold_per_day: Optional[float] = None
+    # What this craft's cost assumes you will make rather than buy, and what
+    # that assumption saves against buying the lot. Only actionable if you
+    # actually have the professions involved, so it is stated rather than
+    # folded silently into the margin.
+    crafted_savings: float = 0.0
 
 
 def _col(row: Any, key: str, default: Any = None) -> Any:
@@ -1132,11 +1137,98 @@ def cost_from_slots(slots: list, prices: dict, item_names: dict,
     return cost, bill, fills, False, to_buy
 
 
+# How deep to chase "craft the reagent instead". Real chains are short - ore
+# to bar to plate is three - and every extra level multiplies the chance that
+# one understated reagent list quietly flatters everything above it.
+MAX_CRAFT_DEPTH = 3
+
+
+class ReagentSourcer:
+    """Cheapest way to obtain a reagent: buy it, or craft it yourself.
+
+    TSM's `Crafting` price source does this, and it changes rankings: a craft
+    that looks marginal at market reagent prices is often comfortable once the
+    intermediate is made rather than bought.
+
+    The danger is specific and one-directional. Blizzard's reagent lists are
+    known to be incomplete on modern tiers - the addon measured roughly three
+    times fewer required reagents than the client reports - so a sub-craft's
+    cost can be understated. Substituting an understated cost makes the parent
+    look cheaper, which makes its margin look better. Errors compound in the
+    flattering direction, which is the one that loses money.
+
+    So the rule is: only substitute a sub-craft whose cost is *complete*. A
+    recipe with optional or finishing slots has a floor for a cost, and a
+    floor is exactly what must not be propagated upwards.
+    """
+
+    def __init__(self, recipes: list, prices: dict, item_names: dict):
+        self.prices = prices
+        self.item_names = item_names
+        self.producers: dict = {}
+        for r in recipes:
+            out = r["crafted_item_id"]
+            # A recipe whose own cost is a floor cannot price anything above it.
+            if not out or _col(r, "uses_slots", 0):
+                continue
+            qty = max(1, int(r["crafted_qty_min"] or 1))
+            try:
+                reagents = json.loads(r["reagents_json"] or "[]")
+            except ValueError:
+                continue
+            if not reagents:
+                continue
+            self.producers.setdefault(out, []).append((r, qty, reagents))
+        self._memo: dict = {}
+
+    def obtain(self, item_id: int, units: int, _stack: tuple = ()) -> tuple:
+        """(cost, how) for `units` of an item. how is "buy" or a recipe name.
+
+        cost is None when it can be neither bought in that quantity nor made.
+        """
+        key = (item_id, units)
+        if key in self._memo:
+            return self._memo[key]
+        # A cycle - transmutes that convert both ways will do this - and the
+        # depth guard. Fall back to buying rather than looping.
+        if item_id in _stack or len(_stack) >= MAX_CRAFT_DEPTH:
+            price = self.prices.get(item_id)
+            return ((price.buy_cost(units), "buy") if price else (None, None))
+
+        price = self.prices.get(item_id)
+        best = price.buy_cost(units) if price else None
+        how = "buy" if best is not None else None
+
+        for r, per_craft, reagents in self.producers.get(item_id, []):
+            crafts = -(-units // per_craft)          # ceil: you cannot half-craft
+            total = 0.0
+            ok = True
+            for reg in reagents:
+                rid, rqty = reg.get("id"), reg.get("quantity") or 0
+                if not rid or rqty <= 0:
+                    continue
+                sub, _ = self.obtain(rid, rqty * crafts, _stack + (item_id,))
+                if sub is None:
+                    ok = False
+                    break
+                total += sub
+            if not ok:
+                continue
+            # Strictly cheaper, not merely equal: buying is simpler, and a tie
+            # should not send you to the forge.
+            if best is None or total < best:
+                best, how = total, r["name"]
+
+        self._memo[key] = (best, how)
+        return self._memo[key]
+
+
 def compute_margins(recipes: list, prices: dict, item_names: dict,
                     batch: int = 1, min_supply: int = 1,
                     min_listings: int = 1,
                     owned: Optional[dict] = None,
-                    velocity: Optional[dict] = None) -> tuple:
+                    velocity: Optional[dict] = None,
+                    source_reagents: bool = True) -> tuple:
     """Return (results, skipped) for every recipe we can fully price.
 
     `batch` = how many crafts you would do, which matters because buying 200
@@ -1146,6 +1238,8 @@ def compute_margins(recipes: list, prices: dict, item_names: dict,
     results: list = []
     skipped: dict = {"no_output_price": 0, "no_reagent_price": 0,
                      "insufficient_supply": 0, "thin_market": 0}
+    sourcer = (ReagentSourcer(recipes, prices, item_names)
+               if source_reagents else None)
 
     for r in recipes:
         out_id = r["crafted_item_id"]
@@ -1213,6 +1307,7 @@ def compute_margins(recipes: list, prices: dict, item_names: dict,
         breakdown = []
         missing = False
         to_buy = 0.0
+        crafted_savings = 0.0
         for reg in reagents:
             rid, rqty = reg["id"], reg["quantity"]
             if rqty <= 0:
@@ -1220,20 +1315,21 @@ def compute_margins(recipes: list, prices: dict, item_names: dict,
                 # parse_recipe started dropping these still contain them.
                 continue
             rp = prices.get(rid)
-            if rp is None:
-                missing = True
-                break
             needed = rqty * batch
-            c = rp.buy_cost(needed)
+            bought = rp.buy_cost(needed) if rp else None
+            if sourcer is not None:
+                c, how = sourcer.obtain(rid, needed)
+            else:
+                c, how = bought, "buy"
             if c is None:
-                # Not enough listed supply to actually buy this many.
+                # Neither purchasable in that quantity nor craftable.
                 missing = True
                 break
             cost += c
             have = (owned or {}).get(rid, 0)
             short = max(0, needed - have)
             to_buy += c * (short / needed) if needed else 0.0
-            breakdown.append({
+            entry = {
                 "id": rid,
                 "name": item_names.get(rid, f"item {rid}"),
                 "qty": needed,
@@ -1241,7 +1337,15 @@ def compute_margins(recipes: list, prices: dict, item_names: dict,
                 "total": c,
                 "have": have,
                 "short": short,
-            })
+            }
+            if how and how != "buy":
+                # Say which craft, and what it saves against simply buying -
+                # the number is only actionable if you know the profession.
+                entry["made_by"] = how
+                if bought is not None:
+                    entry["saved"] = bought - c
+                    crafted_savings += bought - c
+            breakdown.append(entry)
         if missing:
             skipped["no_reagent_price"] += 1
             continue
@@ -1271,6 +1375,7 @@ def compute_margins(recipes: list, prices: dict, item_names: dict,
             output_variant_count=out_price.variant_count,
             output_variant_high=out_price.variant_high,
             output_sold_per_day=(velocity or {}).get(out_id),
+            crafted_savings=crafted_savings,
             crafted_source=_col(r, "crafted_source", CRAFTED_API),
             cost_complete=not _col(r, "uses_slots", 0),
             cost_to_finish=to_buy,
@@ -2439,6 +2544,17 @@ def render_dashboard(results: list, cfg: dict, taken_at: int, skipped: dict,
         # margin is pessimistic. Only shown when the gap is worth acting on -
         # most multi-variant items list every variant at the same price, and
         # badging those would be noise that teaches you to ignore badges.
+        if r.crafted_savings > 0:
+            rank_badge += (
+                f'<span class="badge" data-tip="This cost assumes you make one '
+                f'or more reagents rather than buying them, which is '
+                f'{copper_to_gold_str(r.crafted_savings)} cheaper. Two things '
+                f'it cannot check: whether you have the professions, and '
+                f'whether the sub-craft has a cooldown. Transmutes are where '
+                f'the biggest savings turn up and are exactly the ones limited '
+                f'to one a day, so a saving that needs twenty of them is a '
+                f'twenty-day plan. Open the reagent bill for the craft names.">'
+                f'sourced by crafting</span>')
         best = _variant_floor(r)
         if best:
             rank_badge += (
@@ -2456,6 +2572,12 @@ def render_dashboard(results: list, cfg: dict, taken_at: int, skipped: dict,
             + (f' <span class="meta">have {b["have"]}, buy {b["short"]}</span>'
                if b.get("have") else '')
             + (' <span class="meta">(optional)</span>' if b.get("optional") else '')
+            # Priced as made, not bought - say so, and say what it saves, so
+            # the number is checkable rather than merely lower.
+            + (f' <span class="meta">made via {esc(b["made_by"])}'
+               + (f', saves {copper_to_gold_str(b["saved"])}'
+                  if b.get("saved") else '')
+               + '</span>' if b.get("made_by") else '')
             + '</span>'
             for b in r.reagent_breakdown) or "<span>no reagents listed</span>"
         rows_html.append(

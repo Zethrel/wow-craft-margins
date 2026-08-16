@@ -368,6 +368,41 @@ scan's reading alone.
 ladder, because that is what you would actually pay this minute; averaging them
 would quote a bill nobody can settle.
 
+## Buy the reagent, or make it?
+
+A reagent is costed at the cheaper of its market price and what it costs to
+craft — TSM's `Crafting` price source, and it moves things. On a full scan:
+
+| | |
+|---|---|
+| recipes sourcing at least one reagent by crafting | 874 (14%) |
+| median cost reduction on those | 13% |
+| crafts that flip from loss to profit | 73 |
+| recipes priceable *only* because a reagent can be made | +208 |
+
+Those last ones had a reagent nobody was selling, so they could not be costed
+at all before.
+
+The chains it finds are the ones you would pick yourself — *Transmute: Primal
+Might*, *Spellcloth*, *Smelt Khorium* — which is the best evidence it is
+working rather than compounding noise.
+
+**Why it refuses some substitutions.** Blizzard's reagent lists are incomplete
+on modern tiers, so a sub-craft's cost can be understated — and substituting an
+understated cost makes the parent look cheaper and its margin better. Errors
+compound in the flattering direction, the one that loses money. So a recipe
+whose own cost is only a floor (it has optional or finishing slots) is never
+used to price anything above it; that reagent is simply bought.
+
+Depth is capped at three, cycles terminate rather than hang (transmutes that
+convert both ways will produce one), and quantities round up because you cannot
+half-craft. Set `"source_reagents"` off in the code if you want the old
+market-only costing; `compute_margins(..., source_reagents=False)`.
+
+Rows using it are badged **"sourced by crafting"**, and the reagent bill names
+the sub-craft and what it saved — so the number is checkable rather than merely
+lower.
+
 ---
 
 ## How the numbers are worked out
@@ -534,6 +569,11 @@ These are real gaps, not hedging:
   dash means not measured yet, which is not the same as zero; a rate needs six
   hours of observation behind it before it is shown at all. For commodities the
   figure is region-wide, because commodity auctions are.
+- **Cooldowns.** Reagent costs take the cheaper of buying a reagent or making
+  it (see below), and the biggest savings it finds are transmutes — which are
+  precisely the crafts limited to one a day. Nothing in the API says so. A row
+  badged **"sourced by crafting"** whose saving depends on twenty transmutes is
+  a twenty-day plan, not a shopping list.
 - **Inspiration, resourcefulness, multicraft.** All of these move real profit and
   none are visible to the API. They generally push margins *up*.
 - **Crafting orders.** Personal and patron orders often beat the open market
