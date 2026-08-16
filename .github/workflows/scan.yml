@@ -56,11 +56,33 @@ jobs:
                                open('wowcraft.sqlite3','wb'))"
           echo "cold start: seeded from seed/recipes.sqlite3.gz"
 
+      # Without this a missing secret is just "exit code 1" in a collapsed log
+      # group. Checked as lengths so nothing about the values reaches the log.
+      - name: Check the credentials are configured
+        env:
+          BNET_CLIENT_ID: ${{ secrets.BNET_CLIENT_ID }}
+          BNET_CLIENT_SECRET: ${{ secrets.BNET_CLIENT_SECRET }}
+        run: |
+          missing=""
+          [ -n "$BNET_CLIENT_ID" ] || missing="$missing BNET_CLIENT_ID"
+          [ -n "$BNET_CLIENT_SECRET" ] || missing="$missing BNET_CLIENT_SECRET"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secret(s):$missing — add them under Settings > Secrets and variables > Actions. Create the client at https://develop.battle.net/access/clients"
+            exit 1
+          fi
+          echo "client id is ${#BNET_CLIENT_ID} chars, secret ${#BNET_CLIENT_SECRET} chars"
+
       - name: Scan
         env:
           BNET_CLIENT_ID: ${{ secrets.BNET_CLIENT_ID }}
           BNET_CLIENT_SECRET: ${{ secrets.BNET_CLIENT_SECRET }}
-        run: python wowcraft.py scan -c ci-config.json --publish site
+        run: |
+          python wowcraft.py scan -c ci-config.json --publish site 2> scan.log || {
+            echo "::error::scan failed - last lines follow"
+            tail -30 scan.log
+            exit 1
+          }
+          cat scan.log
 
       - name: Save the database
         uses: actions/cache/save@v6
