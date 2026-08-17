@@ -118,7 +118,10 @@ jobs:
           done
           echo "package looks right"
 
-      - uses: actions/upload-artifact@v4
+      # v4 targets Node 20, which GitHub is removing; v7 is the current major.
+      # This is how you get the built zip out of a dry run - the release steps
+      # below are skipped without a tag, so the artifact is the only copy.
+      - uses: actions/upload-artifact@v7
         with:
           name: WowCraftExport
           path: |
