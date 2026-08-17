@@ -1,0 +1,164 @@
+name: release addon
+
+# Tag and push, and the addon is packaged and published:
+#
+#     git tag v0.2 && git push origin v0.2
+#
+# Run it from the Actions tab instead to build the zip and check it without
+# publishing anything - useful for confirming the package is right before a
+# tag exists, since a tag is awkward to take back once people have fetched it.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build and check the zip, publish nothing"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write        # only to create the release
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0        # release notes need the history
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      # The addon's Lua is exercised against a stubbed client. Releasing a
+      # broken addon to other people is worse than releasing late, and these
+      # are the only tests that touch what actually ships in the zip.
+      - name: Test the addon
+        run: |
+          pip install lupa
+          failed=""
+          for f in test_addon.py test_prices.py test_trade.py; do
+            echo "::group::$f"
+            python "$f" || failed="$failed $f"
+            echo "::endgroup::"
+          done
+          if [ -n "$failed" ]; then
+            echo "::error::addon tests failed:$failed - not packaging"
+            exit 1
+          fi
+
+      - name: Work out the version
+        id: version
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            TAG="v0.0-dev"
+          fi
+          # v0.2 -> 0.2. The .toc carries the number without the v.
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "packaging $TAG (version $VERSION)"
+
+      # An addon that reports one version in game and another on the release
+      # page is a support problem that only shows up once somebody files a bug
+      # against the wrong one. Cheap to prevent, tedious to unpick later.
+      - name: Check the .toc version matches the tag
+        if: github.ref_type == 'tag'
+        env:
+          WANT: ${{ steps.version.outputs.version }}
+        run: |
+          TOC="addon/WowCraftExport/WowCraftExport.toc"
+          HAVE="$(grep -i '^## Version:' "$TOC" | sed 's/.*:[[:space:]]*//' | tr -d '\r')"
+          if [ "$HAVE" != "$WANT" ]; then
+            echo "::error::$TOC says '## Version: $HAVE' but the tag is $WANT. Edit the .toc, commit, and move the tag."
+            exit 1
+          fi
+          echo "both say $WANT"
+
+      - name: Build the package
+        id: package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # WoW unpacks into Interface/AddOns, so the zip must contain a
+          # single top-level folder named exactly as the addon. Zipping the
+          # contents instead scatters lua files across the AddOns directory.
+          ZIP="WowCraftExport-${VERSION}.zip"
+          cd addon
+          # PriceData.lua is generated and never committed; excluded anyway so
+          # a stale local copy can never be shipped as though it were current.
+          zip -r "../$ZIP" WowCraftExport -x '*/PriceData.lua' '*/.*'
+          cd ..
+          echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+          sha256sum "$ZIP" | tee SHA256SUMS.txt
+
+      - name: Check what is actually in the zip
+        env:
+          ZIP: ${{ steps.package.outputs.zip }}
+        run: |
+          unzip -l "$ZIP"
+          # The layout people get wrong, checked rather than assumed.
+          unzip -l "$ZIP" | grep -q "WowCraftExport/WowCraftExport.toc" || {
+            echo "::error::the .toc is not at WowCraftExport/ in the zip"; exit 1; }
+          # Every file the .toc loads has to be present, or it fails in game
+          # with an error most people will read as "the addon is broken".
+          for f in $(grep -E '^[A-Za-z0-9_]+\.lua' addon/WowCraftExport/WowCraftExport.toc | tr -d '\r'); do
+            if [ "$f" = "PriceData.lua" ]; then continue; fi
+            unzip -l "$ZIP" | grep -q "WowCraftExport/$f" || {
+              echo "::error::$f is listed in the .toc but missing from the zip"; exit 1; }
+          done
+          # The install path for anyone who is not you.
+          for f in sync.cmd sync-hourly.cmd; do
+            unzip -l "$ZIP" | grep -q "WowCraftExport/$f" || {
+              echo "::error::$f missing - friends would have no way to fetch prices"; exit 1; }
+          done
+          echo "package looks right"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WowCraftExport
+          path: |
+            ${{ steps.package.outputs.zip }}
+            SHA256SUMS.txt
+
+      # Notes are assembled here rather than left to --generate-notes, which
+      # cannot be combined with supplied notes in a way worth relying on, and
+      # a heredoc inside a YAML block scalar is one indentation slip from
+      # producing a release whose body is half shell script.
+      - name: Write the release notes
+        if: github.ref_type == 'tag'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          {
+            echo "**Install:** unzip into \`World of Warcraft\\_retail_\\Interface\\AddOns\\\` so the path ends \`AddOns\\WowCraftExport\\\`."
+            echo
+            echo "**Prices:** the addon cannot fetch them itself - WoW's Lua has no network access at all. Edit the \`REALM\` line at the top of \`sync.cmd\`, then double-click it whenever you want fresh prices, or run \`sync-hourly.cmd\` once to have it happen on its own. Nothing to install: \`curl\` ships with Windows."
+            echo
+            echo "\`/reload\` in game afterwards."
+            echo
+            PREV="$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)"
+            if [ -n "$PREV" ]; then
+              echo "### Changes since $PREV"
+              echo
+              git log --no-merges --format='- %s' "$PREV..$TAG" -- addon/ || true
+            else
+              echo "First release."
+            fi
+          } > notes.md
+          cat notes.md
+
+      - name: Publish the release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          ZIP: ${{ steps.package.outputs.zip }}
+        run: |
+          gh release create "$TAG" "$ZIP" SHA256SUMS.txt \
+            --title "WowCraftExport $TAG" \
+            --notes-file notes.md
