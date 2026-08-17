@@ -2,7 +2,7 @@
 ## Title: WowCraft Export
 ## Notes: Exports the open profession's recipe schematics to SavedVariables, for the wowcraft margin scanner. Collection only - reads C_TradeSkillUI, touches nothing protected.
 ## Author: Zethrel - Argent Dawn EU
-## Version: 0.1
+## Version: 0.9
 ## SavedVariables: WowCraftExportDB
 ## IconTexture: Interface\Icons\Trade_BlackSmithing
 
