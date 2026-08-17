@@ -1796,6 +1796,19 @@ def cmd_scan(client: BlizzardClient, store: Store, cfg: dict, out_path: str,
         return
     log(f"{len(recipes)} cached recipes to evaluate  (scope: {scope})")
 
+    # History is keyed on the item, not on the realm, so pointing a second
+    # realm at a database that already holds a first one silently averages two
+    # markets together - and the result looks entirely reasonable. Cheap to
+    # detect, impossible to spot afterwards.
+    stored_realm = store.get_meta("realm_slug")
+    if stored_realm and stored_realm != cfg["realm_slug"]:
+        log(f"error: {store.path} holds {stored_realm} data and this run is "
+            f"for {cfg['realm_slug']}.")
+        log("Give each realm its own database (-d wowcraft-<realm>.sqlite3). "
+            "Sharing one would blend their prices with no sign that it had.")
+        raise SystemExit(1)
+    store.set_meta("realm_slug", cfg["realm_slug"])
+
     cr_id = resolve_connected_realm(client, store, cfg["realm_slug"])
 
     log("fetching region commodity auctions (large payload, be patient)...")
@@ -4304,6 +4317,14 @@ def main(argv: Optional[list] = None) -> int:
                          "Alchemy. Repeatable, comma-separated accepted, and "
                          "must match the full name. Overrides professions in "
                          "config.json for this run only.")
+    ap.add_argument("-R", "--realm", metavar="SLUG", default="",
+                    help="scan this realm instead of the one in the config. "
+                         "Commodity prices are region-wide and identical "
+                         "either way; this changes the realm auction house, "
+                         "which is where crafted gear is priced. Give each "
+                         "realm its own --db: history is stored per item, "
+                         "not per realm, so sharing one database between two "
+                         "realms would blend their prices together.")
     ap.add_argument("--publish", metavar="DIR", default="",
                     help="on `scan`, also write the publishable set (addon "
                          "prices, dashboard, price database, manifest) into "
@@ -4366,6 +4387,8 @@ def main(argv: Optional[list] = None) -> int:
         # picks the view; on `init` it picks what to (re-)cache, which is how
         # you top up a single expansion after a patch without redoing the lot.
         run_cfg = dict(cfg)
+        if args.realm:
+            run_cfg["realm_slug"] = args.realm
         if args.tier:
             run_cfg["skill_tiers"] = _split_list(args.tier)
         if args.profession:

@@ -65,23 +65,34 @@ jobs:
 
       # The database carries the recipe cache and the rolling price history.
       # Restoring the newest one is what makes an hourly run cheap.
-      - name: Restore the database
+      # One database per realm. History is keyed on the item and not on the
+      # realm, so a shared one would blend two markets together invisibly.
+      - name: Restore the databases
         id: cache
         uses: actions/cache/restore@v6
         with:
-          path: wowcraft.sqlite3
+          path: wowcraft-*.sqlite3
           key: wowcraft-db-${{ github.run_id }}
           restore-keys: wowcraft-db-
 
-      # First run ever, or the cache expired. The seed holds what `init`
-      # spent fifteen minutes building, so this costs a second instead.
-      - name: Seed from the committed recipe cache
-        if: steps.cache.outputs.cache-matched-key == ''
+      # A realm with no database yet - first run, a new realm added to the
+      # config, or an expired cache - starts from the committed recipe cache
+      # rather than repeating the fifteen minutes `init` takes.
+      - name: Seed any realm that has no database
         run: |
-          python -c "import gzip,shutil; \
-            shutil.copyfileobj(gzip.open('seed/recipes.sqlite3.gz','rb'), \
-                               open('wowcraft.sqlite3','wb'))"
-          echo "cold start: seeded from seed/recipes.sqlite3.gz"
+          python - <<'PY'
+          import gzip, json, os, shutil
+          realms = json.load(open("ci-config.json")).get("realms") or []
+          for slug in realms:
+              path = f"wowcraft-{slug}.sqlite3"
+              if os.path.exists(path):
+                  print(f"{slug}: database restored from cache")
+                  continue
+              with gzip.open("seed/recipes.sqlite3.gz", "rb") as src, \
+                   open(path, "wb") as dst:
+                  shutil.copyfileobj(src, dst)
+              print(f"{slug}: cold start, seeded from seed/recipes.sqlite3.gz")
+          PY
 
       # Without this a missing secret is just "exit code 1" in a collapsed log
       # group. Only lengths are ever printed, never any part of a value.
@@ -130,12 +141,18 @@ jobs:
           # injection, dressed up as a convenience.
           TIER: ${{ inputs.tier }}
         run: |
+          # Recipes and item names are realm-independent, so this runs once
+          # against the first realm's database and is copied into the others
+          # afterwards. Running it per realm would multiply fifteen minutes by
+          # the number of realms to fetch identical answers.
+          DB="wowcraft-$(python -c "import json;print(json.load(open('ci-config.json'))['realms'][0])").sqlite3"
+          echo "caching into $DB"
           if [ -n "$TIER" ]; then
             echo "init, tiers matching '$TIER'"
-            python wowcraft.py init -c ci-config.json --tier "$TIER"
+            python wowcraft.py init -c ci-config.json -d "$DB" --tier "$TIER"
           else
             echo "init, every expansion - this takes about fifteen minutes"
-            python wowcraft.py init -c ci-config.json
+            python wowcraft.py init -c ci-config.json -d "$DB"
           fi
 
       # New items arrive unnamed, and pricecheck searches by name.
@@ -146,11 +163,36 @@ jobs:
           BNET_CLIENT_SECRET: ${{ secrets.BNET_CLIENT_SECRET }}
           TIER: ${{ inputs.tier }}
         run: |
+          DB="wowcraft-$(python -c "import json;print(json.load(open('ci-config.json'))['realms'][0])").sqlite3"
           if [ -n "$TIER" ]; then
-            python wowcraft.py names -c ci-config.json --tier "$TIER"
+            python wowcraft.py names -c ci-config.json -d "$DB" --tier "$TIER"
           else
-            python wowcraft.py names -c ci-config.json
+            python wowcraft.py names -c ci-config.json -d "$DB"
           fi
+
+      # Every other realm needs the same recipes, and must not lose its price
+      # history to get them - so the tables are replaced in place rather than
+      # the database being thrown away and re-seeded.
+      - name: Copy the refreshed recipes to the other realms
+        if: inputs.init || inputs.names
+        run: |
+          python - <<'PY'
+          import json, sqlite3
+          realms = json.load(open("ci-config.json"))["realms"]
+          source = f"wowcraft-{realms[0]}.sqlite3"
+          for slug in realms[1:]:
+              target = f"wowcraft-{slug}.sqlite3"
+              db = sqlite3.connect(target)
+              db.execute("ATTACH DATABASE ? AS src", (source,))
+              for table in ("recipe", "item"):
+                  db.execute(f"DELETE FROM {table}")
+                  db.execute(f"INSERT INTO {table} SELECT * FROM src.{table}")
+              n = db.execute("SELECT COUNT(*) FROM recipe").fetchone()[0]
+              db.commit()
+              db.execute("DETACH DATABASE src")
+              db.close()
+              print(f"{slug}: {n} recipes copied from {realms[0]}")
+          PY
 
       - name: Scan
         env:
@@ -164,17 +206,40 @@ jobs:
           TZ="$(python -c "import json;print(json.load(open('ci-config.json')).get('timezone') or 'UTC')")"
           export TZ
           echo "bucketing days in $TZ (now: $(date))"
-          python wowcraft.py scan -c ci-config.json --publish site 2> scan.log || {
-            echo "::error::scan failed - last lines follow"
-            tail -30 scan.log
-            exit 1
-          }
-          cat scan.log
 
-      - name: Save the database
+          REALMS="$(python -c "import json;print(' '.join(json.load(open('ci-config.json')).get('realms') or []))")"
+          if [ -z "$REALMS" ]; then
+            echo "::error::no realms configured in ci-config.json"
+            exit 1
+          fi
+
+          FIRST=""
+          for SLUG in $REALMS; do
+            echo "::group::$SLUG"
+            python wowcraft.py scan -c ci-config.json \
+              --realm "$SLUG" \
+              --db "wowcraft-$SLUG.sqlite3" \
+              --out "dashboard-$SLUG.html" \
+              --publish "site/$SLUG" 2> "scan-$SLUG.log" || {
+                echo "::error::scan failed for $SLUG - last lines follow"
+                tail -30 "scan-$SLUG.log"
+                exit 1
+              }
+            cat "scan-$SLUG.log"
+            echo "::endgroup::"
+            # The first realm is also published at the root, so anything
+            # already pointing at the bare URL keeps working unchanged.
+            if [ -z "$FIRST" ]; then
+              FIRST="$SLUG"
+              cp site/"$SLUG"/* site/
+            fi
+          done
+          echo "published: $REALMS (root serves $FIRST)"
+
+      - name: Save the databases
         uses: actions/cache/save@v6
         with:
-          path: wowcraft.sqlite3
+          path: wowcraft-*.sqlite3
           key: wowcraft-db-${{ github.run_id }}
 
       - uses: actions/upload-pages-artifact@v5
@@ -199,7 +264,8 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           BRANCH: ${{ github.ref_name }}
         run: |
-          python wowcraft.py seed
+          DB="wowcraft-$(python -c "import json;print(json.load(open('ci-config.json'))['realms'][0])").sqlite3"
+          python wowcraft.py seed -d "$DB"
           if git diff --quiet -- seed/; then
             echo "seed unchanged - nothing to commit"
             exit 0

@@ -205,6 +205,50 @@ forty minutes late is still collected within the hour instead of being missed
 entirely. An unchanged pull costs one 693-byte manifest fetch, so the extra
 runs are free.
 
+### Sharing it with other people
+
+Someone who only wants prices in game needs **the addon folder and nothing
+else**. No Python, no scheduled task, no account, no configuration beyond their
+realm. Inside the addon folder are two batch files:
+
+| File | What it does |
+|---|---|
+| `sync.cmd` | fetches the latest `PriceData.lua` into the folder it lives in |
+| `sync-hourly.cmd` | registers a scheduled task to do that at :35 past, no admin needed |
+
+`curl.exe` ships with Windows 10 1803 and later, so there is nothing to
+install. `sync.cmd` writes into its own directory, so there is no path to
+configure — it is already in the right place. Edit the `REALM` line at the top,
+or pass a slug: `sync.cmd twisting-nether`.
+
+They will still want the game restarted or `/reload`ed to pick up new prices.
+
+**Why they cannot skip the batch file.** WoW's Lua sandbox has no sockets and
+no HTTP, deliberately, so no addon can fetch anything — `PriceData.lua` has to
+be a real file before the client loads it. Nor can GitHub push: a remote server
+cannot write into somebody's filesystem, so the transfer has to be started
+locally. This is the same reason TradeSkillMaster ships a desktop application.
+
+**Every realm you share with needs publishing.** Commodity auctions are
+region-wide, but realm auctions are not, and that is where crafted gear is
+priced. Measured across two realms scanned an hour apart:
+
+| | |
+|---|---|
+| items priced from **commodities** | 11,863 — **100% identical** across realms |
+| items priced from the **realm AH** | 14,272 — **99% different** |
+
+So a friend on another realm would get correct reagent costs and wrong sale
+prices on most crafted gear, producing margins that look authoritative and are
+not. Add their realm to `realms` in `ci-config.json`; it costs one extra API
+call and a few seconds per scan. Each realm publishes to its own folder, and
+the first is also published at the root so existing `pull_url` settings keep
+working.
+
+Each realm needs **its own database** — history is keyed on the item, not the
+realm, so sharing one would blend two markets together. The scanner refuses
+rather than allowing it, because the result would look entirely reasonable.
+
 ### Kicking a late publisher
 
 Running late is one thing; **dropped slots** are another. Of the first three
