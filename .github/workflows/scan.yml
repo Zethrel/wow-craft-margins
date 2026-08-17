@@ -83,15 +83,29 @@ jobs:
           python - <<'PY'
           import gzip, json, os, shutil
           realms = json.load(open("ci-config.json")).get("realms") or []
-          for slug in realms:
+          for i, slug in enumerate(realms):
               path = f"wowcraft-{slug}.sqlite3"
               if os.path.exists(path):
                   print(f"{slug}: database restored from cache")
                   continue
+              # A database from before realms had their own file. Adopting it
+              # keeps the history that renaming would otherwise strand.
+              if i == 0 and os.path.exists("wowcraft.sqlite3"):
+                  os.rename("wowcraft.sqlite3", path)
+                  print(f"{slug}: adopted the pre-multi-realm database")
+                  continue
               with gzip.open("seed/recipes.sqlite3.gz", "rb") as src, \
                    open(path, "wb") as dst:
                   shutil.copyfileobj(src, dst)
-              print(f"{slug}: cold start, seeded from seed/recipes.sqlite3.gz")
+              # Loud on purpose. A cold start is correct for a realm being
+              # added and a disaster for one that was already running: every
+              # stored price snapshot for it is gone, and past auction data
+              # cannot be re-fetched. Renaming the database silently caused
+              # exactly this once, and nothing said so at the time.
+              print(f"::warning::{slug} cold-started from the seed - any "
+                    "price history and sale tracking it had is gone. Expected "
+                    "for a new realm; if this realm was already running, the "
+                    "cache key or the database name has changed.")
           PY
 
       # Without this a missing secret is just "exit code 1" in a collapsed log
