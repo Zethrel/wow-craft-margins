@@ -112,6 +112,13 @@ store = W.Store(server_db)
 client = FakeClient()
 with contextlib.redirect_stdout(quiet):
     W.cmd_init(client, store, cfg)
+    # 2002 is priced and no recipe uses it - a gathered good, the case the
+    # recipe-only price file used to drop. Classed here the way `names`
+    # would, so the published file is checked on the path that actually
+    # feeds the game: publish, then pull, not a local scan.
+    store.db.execute("INSERT OR REPLACE INTO item(id,name,item_class,"
+                     "item_subclass) VALUES (2002,'Many-Eyed Flounder',7,8)")
+    store.db.commit()
     W.cmd_scan(client, store, cfg, os.path.join(tmp, "dash.html"),
                batch=5, top=50, publish_dir=site)
 
@@ -121,6 +128,11 @@ must("publishes the dashboard", "dashboard.html" in published)
 must("publishes an index so the bare URL works", "index.html" in published)
 must("publishes the price database", W.PRICES_NAME in published)
 must("publishes a manifest", W.MANIFEST_NAME in published)
+
+lua = open(os.path.join(site, "PriceData.lua"), encoding="utf-8").read()
+must("published prices carry a gathered good no recipe uses",
+     "[2002]" in lua)
+must("published prices still carry the reagents", "[2001]" in lua)
 
 manifest = json.load(open(os.path.join(site, W.MANIFEST_NAME)))
 must("manifest records Blizzard's data time, not ours",
@@ -231,6 +243,33 @@ inv = sqlite3.connect(local_db)
 rows = dict(inv.execute("SELECT item_id, quantity FROM inventory"))
 inv.close()
 must("a forced pull keeps local inventory", rows == {2001: 42, 2002: 7})
+
+# ---- 6a. locally looked-up item classes survive ----------------------
+# `pull` replaces the item table wholesale. Item classes are what put a
+# gathered good's price on a tooltip, so if a local `names` run does not
+# survive the swap, fish go back to having no price within the half hour.
+cls = sqlite3.connect(local_db)
+cls.execute("UPDATE item SET item_class=NULL, item_subclass=NULL")
+cls.execute("INSERT OR REPLACE INTO item(id,name,item_class,item_subclass) "
+            "VALUES (279100,'Many-Eyed Flounder',7,8)")
+# An item the publisher already knows about must keep the publisher's answer.
+cls.execute("INSERT OR REPLACE INTO item(id,name,item_class,item_subclass) "
+            "VALUES (2001,'Herb',99,99)")
+cls.commit(); cls.close()
+
+with contextlib.redirect_stdout(quiet):
+    W.cmd_pull(url, local_cfg, local_db, local_dash, force=True)
+cls = sqlite3.connect(local_db)
+cls.row_factory = sqlite3.Row
+got = {r["id"]: (r["item_class"], r["item_subclass"]) for r in
+       cls.execute("SELECT id,item_class,item_subclass FROM item "
+                   "WHERE id IN (279100, 2001)")}
+cls.close()
+must("a pull keeps a locally looked-up item class",
+     got.get(279100) == (7, 8))
+# The published item table has no classes yet, so there is nothing to defer
+# to and the local answer stands; the gap-fill must not have invented one.
+must("the gap-fill only fills gaps", got.get(2001) == (99, 99))
 
 # ---- 6b. local price history survives too ----------------------------
 # Past auction snapshots cannot be re-fetched once Blizzard moves on, and the

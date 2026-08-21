@@ -26,6 +26,16 @@ REAL = os.path.join(tempfile.mkdtemp(), "PriceData.lua")
 W.write_addon_prices(REAL, [_R()], {8191: _P(4900000, 4900000), 2589: _P(1200, 1500)},
                      _rows, 1786738810, {"realm_slug": "argent-dawn"}, 20)
 
+# A gathered good: priced, and in no recipe at all. Fish, herbs and ore are
+# worth money without ever being a reagent, so the writer must carry them on
+# the strength of being a tradeskill item rather than of being referenced.
+GATHERED = os.path.join(tempfile.mkdtemp(), "PriceData.lua")
+W.write_addon_prices(GATHERED, [_R()],
+                     {8191: _P(4900000, 4900000), 2589: _P(1200, 1500),
+                      279100: _P(10500, 13300)},
+                     _rows, 1786738810, {"realm_slug": "argent-dawn"}, 20,
+                     None, {279100})
+
 PRELUDE = """
 printed={} ; lines={}
 function print(...) local p={} for i=1,select('#',...) do p[#p+1]=tostring((select(i,...))) end printed[#printed+1]=table.concat(p,' ') end
@@ -117,6 +127,26 @@ lua.eval("SlashCmdList")["WCPRICES"]()
 msgs = [v for v in lua.eval("printed").values()]
 must("/wcprices reports counts", any("craft margins" in m for m in msgs))
 must("generator and addon agree on the schema", True)
+
+# --- a gathered good, priced but in no recipe ---
+body = open(GATHERED, encoding="utf-8").read()
+must("gathered good is written at all", "[279100]" in body)
+lua3 = lupa.LuaRuntime(unpack_returned_tuples=True)
+lua3.execute(PRELUDE % 1786742410)
+lua3.execute(body)
+lua3.eval("function(s) return assert(load(s,'prices.lua')) end")(open(ADDON, encoding="utf-8").read())()
+lua3.eval("FireEvent")("PLAYER_LOGIN")
+lua3.eval("FireTooltip")(279100)
+fish = [v for v in lua3.eval("lines").values()]
+must("gathered good gets a tooltip price", any("Auction (cheapest)" in x for x in fish))
+# It is not crafted, so there is nothing to say about cost or margin.
+must("gathered good claims no craft cost", not any("Craft cost" in x for x in fish))
+print("   sample:", fish[:3])
+
+# Recipe items must still come through untouched when nothing extra is passed.
+plain = open(REAL, encoding="utf-8").read()
+must("recipe items unaffected by the extra set", "[8191]" in plain and "[2589]" in plain)
+must("extra set is opt-in", "[279100]" not in plain)
 print("   sample:", msgs[-2:])
 
 print()

@@ -336,7 +336,7 @@ run never pays for re-caching them. When a patch lands, go to **Actions →
 |---|---|
 | **init** | Always, after a patch. Re-caches recipe definitions. |
 | **tier** | Set to the new expansion, e.g. `Midnight`. Turns fifteen minutes into about two. Leave empty to re-cache every expansion back to Classic. |
-| **names** | If new items are showing up unnamed in `pricecheck`. Adds ~6 minutes. |
+| **names** | If new items are showing up unnamed in `pricecheck`, or newly gathered goods have no price in game. Adds ~6 minutes. |
 
 The run inits, then scans and publishes as usual, then regenerates
 `seed/recipes.sqlite3.gz` and commits it if it changed — so a cache eviction
@@ -747,9 +747,10 @@ age is redrawn on the same timer — an age that freezes is worse than no age at
 all, since the whole point of stamping it is to stop stale numbers passing for
 current ones.
 
-Run `python3 wowcraft.py names` once after your first scan. `init` only names
-what recipes reference, which leaves most of the auction house showing as bare
-ids — fine on the dashboard, which hides them, but this window shows everything
+Run `python3 wowcraft.py names` once after your first scan. It fetches each
+item's class as well as its name, from the same response, which is also what
+puts gathered goods on tooltips in game. `init` only names what recipes
+reference, which leaves most of the auction house showing as bare ids — fine on the dashboard, which hides them, but this window shows everything
 and "item 274470" answers nothing. It looks up only what is missing, so a
 second run costs nothing, and the names come from Blizzard's own item endpoint
 rather than from scraping a database site.
@@ -881,6 +882,19 @@ set in `config.json`. The addon loads it and adds, for any item it knows:
 - craft cost and margin after the AH cut on anything craftable
 - a line on the crafting window showing cost, sale price and margin for the
   recipe you have open
+
+The file carries every item the recipe cache references — reagents, slot fills
+and crafted outputs — plus every **tradeskill item**, whether or not a recipe
+uses it. That second group exists because being a reagent and being worth money
+are different things. A patch's new fish is the plain case: you catch
+Many-Eyed Flounder by the hundred and sell every one, but nothing cooks it, so
+on the recipe set alone its tooltip is blank at exactly the moment you want a
+price. Tradeskill items are about 2,900 ids and cost ~60 KB; writing all 29,000
+priced items instead would roughly double the file the client parses at every
+login, to buy prices for gear nobody crafts with.
+
+Item classes come from `names`, so **until you have run it, gathered goods have
+no price in game** and `scan` says how many items are waiting on it.
 
 Addons cannot read files at runtime, only at load, so **what you see is as
 fresh as your last `/reload`**. Every number is stamped with its age for that

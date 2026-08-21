@@ -628,6 +628,68 @@ with contextlib.redirect_stdout(buf):
     W.cmd_init(FullClient(), store3, cfg)
 must("legacy db still usable", len(store3.recipes()) == 3)
 
+# --- `names` records item classes, which is what puts gathered goods in game ---
+class NamesClient(FakeClient):
+    """Three outcomes the item endpoint really produces, in one run:
+    a tradeskill item, an id that 404s, and an id that is rate limited."""
+    def get_many(self, paths, ns, errors=None):
+        out = {}
+        for key, _path in paths:
+            if key == 4004:                      # refused: ask again later
+                if errors is not None:
+                    errors[key] = "HTTP 429"
+                continue
+            if key == 4003:                      # 404: nothing to fetch, ever
+                continue
+            if key == 4002:                      # answers, but has no name
+                out[key] = {"id": key}
+                continue
+            out[key] = {"id": key, "name": f"Item {key}",
+                        "quality": {"type": "COMMON"}, "level": 80,
+                        "item_class": {"id": 7, "name": "Tradeskill"},
+                        "item_subclass": {"id": 8, "name": "Cooking"}}
+        return out
+
+db4 = os.path.join(tmp, "names.sqlite3")
+store4 = W.Store(db4)
+for i in (4001, 4002, 4003, 4004):
+    store4.db.execute("INSERT INTO price_snapshot(taken_at,item_id,source,"
+                      "sell_unit_price,min_unit_price) VALUES(1,?,'commodity',5,4)",
+                      (i,))
+store4.db.commit()
+with contextlib.redirect_stdout(buf):
+    W.cmd_names(NamesClient(), store4, cfg)
+
+def klass(item_id):
+    row = store4.db.execute("SELECT item_class FROM item WHERE id=?",
+                            (item_id,)).fetchone()
+    return row["item_class"] if row else None
+
+must("a tradeskill item records its class", klass(4001) == 7)
+must("tradeskill_items finds it", store4.tradeskill_items() == {4001})
+must("a nameless payload is marked looked-up", klass(4002) == -1)
+must("a 404 is marked looked-up", klass(4003) == -1)
+must("a refusal is left to be retried", klass(4004) is None)
+must("only the refusal is still outstanding",
+     store4.unclassed_priced_items() == 1)
+
+# The whole point of the -1 marker: a second run asks about the refusal and
+# nothing else, rather than dragging every dead id along behind it forever.
+asked = []
+class Recorder(NamesClient):
+    def get_many(self, paths, ns, errors=None):
+        paths = list(paths)
+        asked.extend(k for k, _ in paths)
+        return NamesClient.get_many(self, paths, ns, errors)
+with contextlib.redirect_stdout(buf):
+    W.cmd_names(Recorder(), store4, cfg)
+must("a second run re-asks only the refused id", asked == [4004])
+
+# -1 must not read as a real class. Blizzard's class 0 is Consumable, so a
+# marker of 0 would file every dead id under it.
+must("the marker is not a usable class id",
+     store4.tradeskill_items() == {4001} and klass(4003) == -1)
+
 print()
 print("ALL PASS" if not fails else f"{len(fails)} FAILURES: {fails}")
 sys.exit(1 if fails else 0)

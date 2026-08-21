@@ -57,6 +57,15 @@ MAX_WORKERS = 16
 # The auction house takes a 5% cut of the sale price.
 AH_CUT = 0.05
 
+# Blizzard's item class 7, "Tradeskill": every crafting material in the game,
+# gathered or made - fish, herbs, ore, hides, cloth, elemental, enchanting
+# dust. Worth naming because it is the one honest answer to "is this item a
+# commodity somebody buys to craft with", which is not the same question as
+# "does a recipe we have cached happen to reference it". The subclass is
+# stored alongside it but nothing reads it yet; it is what would let this be
+# narrowed to, say, herbs alone without another pass over the API.
+TRADESKILL_CLASS = 7
+
 # Rows per expansion guaranteed a place in the dashboard table, on top of the
 # global top-by-margin. Without this, filtering to current content shows almost
 # nothing, because old-world crafts win the ranking outright.
@@ -394,7 +403,15 @@ CREATE TABLE IF NOT EXISTS item (
     id INTEGER PRIMARY KEY,
     name TEXT,
     quality TEXT,
-    level INTEGER
+    level INTEGER,
+    -- Blizzard's item class/subclass ids. NULL means "never looked up", which
+    -- is what `names` uses to decide what still needs fetching. -1 means
+    -- "looked up, no answer" - a 404, an id that lingers on old listings for
+    -- an item removed from the game - so it is never asked about again. Not
+    -- 0: that is a real class (Consumable), and conflating the two would
+    -- quietly file every dead id under it.
+    item_class INTEGER,
+    item_subclass INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS recipe (
@@ -514,6 +531,12 @@ class Store:
             self.db.execute("ALTER TABLE recipe ADD COLUMN uses_slots INTEGER")
         if "slots_json" not in have:
             self.db.execute("ALTER TABLE recipe ADD COLUMN slots_json TEXT")
+        item_cols = {r["name"] for r in
+                     self.db.execute("PRAGMA table_info(item)")}
+        for column in ("item_class", "item_subclass"):
+            if column not in item_cols:
+                self.db.execute(
+                    f"ALTER TABLE item ADD COLUMN {column} INTEGER")
         price_cols = {r["name"] for r in
                       self.db.execute("PRAGMA table_info(price_snapshot)")}
         for column in ("sell_low", "sell_high", "buy_low", "buy_high"):
@@ -596,6 +619,29 @@ class Store:
     def item_names(self) -> dict:
         return {r["id"]: r["name"]
                 for r in self.db.execute("SELECT id,name FROM item")}
+
+    def tradeskill_items(self) -> set:
+        """Every item Blizzard files under Tradeskill, as ids.
+
+        The addon's price file is built from the recipe cache, which misses
+        anything gathered and sold rather than crafted with. This is the set
+        that closes that gap. Empty until `names` has run far enough to know
+        the classes, and an empty set simply leaves the old behaviour in
+        place rather than breaking anything."""
+        return {r["id"] for r in self.db.execute(
+            "SELECT id FROM item WHERE item_class = ?", (TRADESKILL_CLASS,))}
+
+    def unclassed_priced_items(self) -> int:
+        """How many priced items have never had their class looked up.
+
+        `scan` says so rather than silently leaving them out of the addon
+        file: "your fish have no price" is a confusing symptom, and "3,000
+        items have not been classified, run `names`" is a fixable one."""
+        row = self.db.execute(
+            "SELECT COUNT(*) AS n FROM (SELECT DISTINCT item_id FROM "
+            "price_snapshot) p LEFT JOIN item i ON i.id = p.item_id "
+            "WHERE i.item_class IS NULL").fetchone()
+        return row["n"] if row else 0
 
     def prune_history(self, days: int) -> int:
         """Drop snapshots older than `days` days. Returns days removed.
@@ -1939,11 +1985,20 @@ def cmd_scan(client: BlizzardClient, store: Store, cfg: dict, out_path: str,
     if addon_path:
         try:
             target = os.path.join(addon_path, "PriceData.lua")
+            gathered = store.tradeskill_items()
             size = write_addon_prices(target, results, prices, recipes,
                                       taken_at, cfg, batch,
-                                      store.price_ranges(taken_at))
+                                      store.price_ranges(taken_at), gathered)
             log(f"wrote {target} ({size // 1024} KB) -- /reload in game to "
                 "pick it up")
+            # Said here rather than left to be discovered in game, where the
+            # only symptom is a tooltip that shows nothing at all.
+            unclassed = store.unclassed_priced_items()
+            if unclassed:
+                log(f"note: {unclassed:,} priced items have no item class "
+                    "recorded, so any gathered goods among them are left out "
+                    "of the addon file. Run `wowcraft.py names` to fetch "
+                    "them; it is a one-off.")
         except OSError as exc:
             log(f"warn: could not write addon prices: {exc}")
 
@@ -2507,7 +2562,8 @@ def render_reagents(reagents: list) -> str:
 
 def write_addon_prices(path: str, results: list, prices: dict, recipes: list,
                        taken_at: int, cfg: dict, batch: int,
-                       ranges: Optional[dict] = None) -> int:
+                       ranges: Optional[dict] = None,
+                       extra_ids: Optional[set] = None) -> int:
     """Write PriceData.lua into the addon folder so prices show up in game.
 
     The return leg of the addon bridge. Addons cannot fetch anything at
@@ -2521,6 +2577,15 @@ def write_addon_prices(path: str, results: list, prices: dict, recipes: list,
     and crafted outputs), not all 29,000 priced items, because the rest would
     be weight the client parses at every login for nothing.
 
+    `extra_ids` widens that beyond the recipe set, and exists because being a
+    reagent is not the same as being worth money. A patch's new fish are the
+    plain case: you catch Many-Eyed Flounder by the hundred and sell every one
+    of them, but no recipe cooks it, so on the recipe set alone its tooltip
+    stays blank at exactly the moment you want a price. `scan` passes the
+    tradeskill items - fish, herbs, ore, leather, the gathered goods - which
+    is a few thousand ids rather than the twenty-one thousand that writing
+    every priced item would cost.
+
     Margins are keyed by crafted item id rather than by recipe id: the client
     numbers recipes differently from the API, but both sides agree on items,
     and rank variants are already collapsed to one row per output."""
@@ -2532,6 +2597,7 @@ def write_addon_prices(path: str, results: list, prices: dict, recipes: list,
             wanted.add(reagent["id"])
         for slot in json.loads(_col(row, "slots_json", "") or "null") or []:
             wanted.update(slot.get("items") or [])
+    wanted.update(extra_ids or ())
 
     lines = ["-- Generated by wowcraft.py scan. Do not edit; it is overwritten.",
              "-- Prices are copper per unit, from the region/realm auction house.",
@@ -2926,6 +2992,17 @@ def _sample(obj: Any, limit: int = 3) -> Any:
     return obj
 
 
+def _class_id(block: Any) -> int:
+    """An item class id out of Blizzard's {id, name, key} block.
+
+    -1 for a block that is missing or malformed, matching the marker `names`
+    writes for an id the API has nothing for: either way we asked and came
+    away without a class, and both should stop us asking again."""
+    if isinstance(block, dict) and isinstance(block.get("id"), int):
+        return block["id"]
+    return -1
+
+
 def cmd_names(client: BlizzardClient, store: Store, cfg: dict) -> None:
     """Look up names for every priced item we cannot name.
 
@@ -2934,22 +3011,30 @@ def cmd_names(client: BlizzardClient, store: Store, cfg: dict) -> None:
     lookup window shows everything and "item 274470" is not an answer to
     anything.
 
+    The same response carries the item's class, which is what tells a fish
+    from a sword, so this fetches both. That matters beyond the lookup
+    window: the addon's price file is built from the recipe cache, and an
+    item nothing crafts with - a fish you catch and sell - is invisible in
+    game until we know it is a tradeskill item. Databases written before
+    that was recorded have names but no classes, so "already done" means
+    both, and those items get one more pass.
+
     Names never change, so this is a one-off per item: a second run has
     nothing left to do. No scraping involved - Blizzard publishes the names,
     and we are already authenticated for them."""
-    named = {r["id"] for r in store.db.execute(
-        "SELECT id FROM item WHERE name IS NOT NULL AND name <> ''")}
+    known = {r["id"] for r in store.db.execute(
+        "SELECT id FROM item WHERE item_class IS NOT NULL")}
     priced = {r["item_id"] for r in store.db.execute(
         "SELECT DISTINCT item_id FROM price_snapshot")}
-    missing = sorted(priced - named)
+    missing = sorted(priced - known)
     if not missing:
-        log("every priced item already has a name")
+        log("every priced item already has a name and a class")
         return
 
-    log(f"{len(priced):,} priced items, {len(named):,} already named")
-    log(f"looking up {len(missing):,} names "
+    log(f"{len(priced):,} priced items, {len(known):,} already known")
+    log(f"looking up {len(missing):,} names and classes "
         f"(~{len(missing) / RATE_LIMIT_PER_SEC / 60:.0f} min, one time -- "
-        "names do not change)")
+        "neither changes)")
     refusals: dict = {}
     payloads = client.get_many(
         ((i, f"/data/wow/item/{i}") for i in missing), "static", refusals)
@@ -2960,13 +3045,34 @@ def cmd_names(client: BlizzardClient, store: Store, cfg: dict) -> None:
         if isinstance(name, str) and name:
             rows.append((item_id, name,
                          (payload.get("quality") or {}).get("type"),
-                         payload.get("level")))
+                         payload.get("level"),
+                         _class_id(payload.get("item_class")),
+                         _class_id(payload.get("item_subclass"))))
     store.db.executemany(
-        "INSERT INTO item(id,name,quality,level) VALUES(?,?,?,?) "
+        "INSERT INTO item(id,name,quality,level,item_class,item_subclass) "
+        "VALUES(?,?,?,?,?,?) "
         "ON CONFLICT(id) DO UPDATE SET name=excluded.name, "
-        "quality=excluded.quality, level=excluded.level", rows)
+        "quality=excluded.quality, level=excluded.level, "
+        "item_class=excluded.item_class, "
+        "item_subclass=excluded.item_subclass", rows)
+
+    # Ids the server was definite about and had nothing for: a 404, or a
+    # payload with no name. Marked as looked-up so they stop being asked
+    # about - this is what makes "re-running will not change them", said
+    # below since the first version of this command, actually true. A refusal
+    # is the opposite case and is deliberately left alone, because that one
+    # IS worth asking again. get_many separates the two for exactly this.
+    got = {r[0] for r in rows}
+    dead = [(i,) for i in missing if i not in refusals and i not in got]
+    store.db.executemany(
+        "INSERT INTO item(id,item_class,item_subclass) VALUES(?,-1,-1) "
+        "ON CONFLICT(id) DO UPDATE SET item_class=-1, item_subclass=-1",
+        dead)
     store.db.commit()
-    log(f"named {len(rows):,} items")
+    tradeskill = sum(1 for r in rows if r[4] == TRADESKILL_CLASS)
+    log(f"named {len(rows):,} items, {tradeskill:,} of them tradeskill "
+        "materials -- those now get a price in game whether or not a recipe "
+        "uses them")
     # Three different outcomes, and conflating them turns "these items do not
     # exist" into "the server is throttling you", which sends you off retrying
     # something that will never change.
@@ -3695,7 +3801,8 @@ def publish(out_dir: str, store: Store, cfg: dict, dashboard_path: str,
 
     lua_path = os.path.join(out_dir, "PriceData.lua")
     write_addon_prices(lua_path, results, prices, recipes, taken_at, cfg,
-                       batch, store.price_ranges(taken_at))
+                       batch, store.price_ranges(taken_at),
+                       store.tradeskill_items())
 
     if dashboard_path and os.path.exists(dashboard_path):
         shutil.copyfile(dashboard_path, os.path.join(out_dir, "dashboard.html"))
@@ -3768,6 +3875,52 @@ HISTORY_TABLES = ("price_snapshot", "margin_snapshot")
 
 def _columns(db: sqlite3.Connection, table: str, schema: str = "main") -> list:
     return [r[1] for r in db.execute(f"PRAGMA {schema}.table_info({table})")]
+
+
+def _carry_item_classes(db: sqlite3.Connection) -> int:
+    """Keep item classes the published database has not learned yet.
+
+    `pull` replaces the item table wholesale, so without this a local `names`
+    run is undone inside the half hour and gathered goods lose their price in
+    game again - which looks exactly like the bug it fixed. Gaps only: where
+    the published data knows a class it wins, on the same principle as the
+    rest of the pull.
+
+    The published database will not even have the column until the publisher
+    is running a version that records it, so the column is added here if it
+    is missing. Otherwise this would be dead code precisely during the
+    changeover it exists to cover.
+    """
+    have = db.execute(
+        "SELECT name FROM old.sqlite_master WHERE type='table' AND name='item'"
+    ).fetchone()
+    if not have:
+        return 0
+    theirs = {r[1] for r in db.execute("PRAGMA old.table_info(item)")}
+    if "item_class" not in theirs:
+        return 0
+    mine = {r[1] for r in db.execute("PRAGMA table_info(item)")}
+    for column in ("item_class", "item_subclass"):
+        if column not in mine:
+            db.execute(f"ALTER TABLE item ADD COLUMN {column} INTEGER")
+    # Counted before the write rather than from rowcount, which also counts
+    # rows the upsert touched and left exactly as they were.
+    carried = db.execute(
+        "SELECT COUNT(*) FROM old.item o LEFT JOIN item n ON n.id = o.id "
+        "WHERE o.item_class IS NOT NULL "
+        "  AND (n.id IS NULL OR n.item_class IS NULL)").fetchone()[0]
+    # An insert, not an update: an item this machine has priced and looked up
+    # may not be in the published table at all, and updating would silently
+    # drop exactly those. On a row that is already there the publisher's own
+    # answer wins, so this only ever fills a hole.
+    db.execute(
+        "INSERT INTO item(id,name,quality,level,item_class,item_subclass) "
+        "SELECT o.id,o.name,o.quality,o.level,o.item_class,o.item_subclass "
+        "FROM old.item o WHERE o.item_class IS NOT NULL "
+        "ON CONFLICT(id) DO UPDATE SET "
+        "  item_class = COALESCE(item.item_class, excluded.item_class), "
+        "  item_subclass = COALESCE(item.item_subclass, excluded.item_subclass)")
+    return carried
 
 
 def _carry_history(db: sqlite3.Connection, keep_days: int) -> dict:
@@ -3872,6 +4025,7 @@ def _install_prices_db(blob: bytes, db_path: str, keep_days: int = 0) -> None:
             fh.write(gzip.decompress(blob))
 
         inventory = 0
+        classes = 0
         history = {}
         if os.path.exists(db_path):
             # Read the old database through a copy rather than attaching the
@@ -3894,6 +4048,7 @@ def _install_prices_db(blob: bytes, db_path: str, keep_days: int = 0) -> None:
                                    "SELECT * FROM old.inventory")
                         inventory = db.execute(
                             "SELECT COUNT(*) FROM inventory").fetchone()[0]
+                    classes = _carry_item_classes(db)
                     history = _carry_history(db, keep_days)
                     db.commit()
                     db.execute("DETACH DATABASE old")
@@ -3905,6 +4060,9 @@ def _install_prices_db(blob: bytes, db_path: str, keep_days: int = 0) -> None:
         _replace_with_retry(tmp, db_path)
         if inventory:
             log(f"  kept {inventory} inventory rows from the local database")
+        if classes:
+            log(f"  kept {classes:,} item classes the published data has not "
+                "looked up yet")
         for table, (days, rows) in sorted(history.items()):
             log(f"  kept {days} day(s) of local {table} ({rows:,} rows) "
                 "that the published data does not cover")
