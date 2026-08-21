@@ -690,6 +690,16 @@ must("a second run re-asks only the refused id", asked == [4004])
 must("the marker is not a usable class id",
      store4.tradeskill_items() == {4001} and klass(4003) == -1)
 
+# An id that stopped being listed weeks ago is not something a `names` run
+# can fix, so counting it would nag forever about nothing. 4005 is priced
+# only in the older snapshot; 4004 is the refusal, still on sale today.
+store4.db.execute("INSERT INTO price_snapshot(taken_at,item_id,source,"
+                  "sell_unit_price,min_unit_price) "
+                  "VALUES(0,4005,'commodity',5,4)")
+store4.db.commit()
+must("an id only in an older snapshot is not counted",
+     store4.unclassed_priced_items() == 1)
+
 print()
 print("ALL PASS" if not fails else f"{len(fails)} FAILURES: {fails}")
 sys.exit(1 if fails else 0)

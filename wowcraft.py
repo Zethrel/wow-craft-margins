@@ -632,14 +632,23 @@ class Store:
             "SELECT id FROM item WHERE item_class = ?", (TRADESKILL_CLASS,))}
 
     def unclassed_priced_items(self) -> int:
-        """How many priced items have never had their class looked up.
+        """How many items on sale right now have no class looked up.
 
         `scan` says so rather than silently leaving them out of the addon
         file: "your fish have no price" is a confusing symptom, and "3,000
-        items have not been classified, run `names`" is a fixable one."""
+        items have not been classified, run `names`" is a fixable one.
+
+        The newest snapshot only, not the whole history. Ids drop off the
+        auction house and linger in stored days for as long as retention
+        keeps them, and counting those would put a number in front of you
+        that no `names` run can ever bring down - a standing instruction to
+        fix something that is not broken. What is for sale today is the part
+        a missing class can still cost you a price on."""
         row = self.db.execute(
             "SELECT COUNT(*) AS n FROM (SELECT DISTINCT item_id FROM "
-            "price_snapshot) p LEFT JOIN item i ON i.id = p.item_id "
+            "price_snapshot WHERE taken_at = "
+            "  (SELECT MAX(taken_at) FROM price_snapshot)) p "
+            "LEFT JOIN item i ON i.id = p.item_id "
             "WHERE i.item_class IS NULL").fetchone()
         return row["n"] if row else 0
 
