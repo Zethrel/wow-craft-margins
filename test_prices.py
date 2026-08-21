@@ -141,6 +141,30 @@ fish = [v for v in lua3.eval("lines").values()]
 must("gathered good gets a tooltip price", any("Auction (cheapest)" in x for x in fish))
 # It is not crafted, so there is nothing to say about cost or margin.
 must("gathered good claims no craft cost", not any("Craft cost" in x for x in fish))
+
+# A day's range whose swing is not a whole percent. "%d" on a float is fine
+# under the 5.1 the client runs and raises under every later Lua, so without
+# truncating first this passes in game and takes the tooltip down anywhere
+# else - including in this test harness, which is the only place it can be
+# caught.
+RANGED = os.path.join(tempfile.mkdtemp(), "PriceData.lua")
+W.write_addon_prices(RANGED, [_R()],
+                     {8191: _P(4900000, 4900000), 2589: _P(1200, 1500),
+                      279100: _P(10500, 13300)},
+                     _rows, 1786738810, {"realm_slug": "argent-dawn"}, 20,
+                     {279100: (10500, 13300)}, {279100})
+must("the day's range is written", "range = {[279100]" in
+     open(RANGED, encoding="utf-8").read())
+lua4 = lupa.LuaRuntime(unpack_returned_tuples=True)
+lua4.execute(PRELUDE % 1786742410)
+lua4.execute(open(RANGED, encoding="utf-8").read())
+lua4.eval("function(s) return assert(load(s,'prices.lua')) end")(open(ADDON, encoding="utf-8").read())()
+lua4.eval("FireEvent")("PLAYER_LOGIN")
+lua4.eval("FireTooltip")(279100)          # raised before pct was truncated
+ranged = [v for v in lua4.eval("lines").values()]
+must("a fractional swing renders instead of raising",
+     any("Today's range" in x for x in ranged))
+print("   sample:", [x for x in ranged if "range" in x])
 print("   sample:", fish[:3])
 
 # Recipe items must still come through untouched when nothing extra is passed.

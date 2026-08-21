@@ -65,6 +65,12 @@ local function addItemLines(tooltip, itemID)
         -- means steady rather than unknown.
         local low, high = span[1], span[2]
         local pct = (low and low > 0) and ((high - low) / low * 100) or 0
+        -- Truncated here rather than left to "%d". A division is a float, and
+        -- only the 5.1 the client runs quietly truncates one for an integer
+        -- format; every later Lua raises "number has no integer
+        -- representation" instead, which would take the whole tooltip down.
+        -- Toward zero, so what shows is what "%d" has always shown.
+        pct = pct >= 0 and math.floor(pct) or math.ceil(pct)
         tooltip:AddDoubleLine("Today's range",
                               string.format("%s - %s (%+d%%)",
                                             money(low), money(high), pct),
