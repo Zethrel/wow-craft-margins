@@ -2,7 +2,7 @@
 
 Needs lupa; skips without it, like test_addon.py.
 """
-import json, os, sys
+import json, os, re, sys
 try:
     import lupa
 except ImportError:
@@ -20,6 +20,18 @@ class _P:
 class _R:
     crafted_item_id = 8191; cost = 3474020.0; revenue = 9305060.0
     margin_pct = 168.0; cost_complete = True; optionals_filled = 1
+    gold_per_day = 1250000.0; restock_units = 6
+
+
+class _RNone(_R):
+    """No sale rate for this output - the state that must not print a zero."""
+    gold_per_day = None; restock_units = 0
+
+
+class _RLoss(_R):
+    """It sells, and at a loss. Both halves have to survive the trip."""
+    revenue = 1000000.0; margin_pct = -71.0
+    gold_per_day = -430000.0; restock_units = 0
 _rows = [{"crafted_item_id": 8191, "reagents_json": '[{"id": 2589, "quantity": 4}]',
           "slots_json": None}]
 REAL = os.path.join(tempfile.mkdtemp(), "PriceData.lua")
@@ -100,9 +112,50 @@ must("tooltip added lines", len(out) > 0)
 must("shows a cheapest price", any("Auction (cheapest)" in x for x in out))
 must("shows craft cost", any("Craft cost" in x for x in out))
 must("shows margin after cut", any("Margin after AH cut" in x for x in out))
+must("shows what the craft is worth per day",
+     any("Expected per day" in x for x in out))
+must("and how many to make now", any("Make now :: 6" in x for x in out))
 must("stamps the age", any("wowcraft - " in x for x in out))
 must("age is human readable", any(("m ago" in x or "h ago" in x or "just now" in x) for x in out))
 print("   sample:", [x for x in out][:4])
+
+# The three states of the forecast, which must not look alike on a tooltip:
+# measured and worth something (above), measured at zero, and never measured.
+def price_file(result):
+    path = os.path.join(tempfile.mkdtemp(), "PriceData.lua")
+    W.write_addon_prices(path, [result],
+                         {8191: _P(4900000, 4900000), 2589: _P(1200, 1500)},
+                         _rows, 1786738810, {"realm_slug": "argent-dawn"}, 20)
+    return path
+
+
+def tooltip_lines(path, item_id=8191):
+    state = lupa.LuaRuntime(unpack_returned_tuples=True)
+    state.execute(PRELUDE % 1786742410)
+    state.execute(open(path, encoding="utf-8").read())
+    state.eval("function(s) return assert(load(s,'prices.lua')) end")(
+        open(ADDON, encoding="utf-8").read())()
+    state.eval("FireEvent")("PLAYER_LOGIN")
+    state.eval("FireTooltip")(item_id)
+    return [v for v in state.eval("lines").values()]
+
+
+unmeasured = tooltip_lines(price_file(_RNone()))
+must("an unmeasured craft says nothing about gold per day",
+     not any("Expected per day" in x for x in unmeasured))
+must("and offers no quantity to make",
+     not any("Make now" in x for x in unmeasured))
+must("but still shows the margin it does know",
+     any("Margin after AH cut" in x for x in unmeasured))
+
+losing = tooltip_lines(price_file(_RLoss()))
+must("a craft that sells at a loss says so rather than showing a figure",
+     any("a loss at these prices" in x for x in losing))
+must("and never suggests making any", not any("Make now" in x for x in losing))
+# A negative used to render as "-", the same string as "no price at all", on
+# the one line where the sign is the entire message.
+must("a negative margin keeps its sign",
+     any(re.search(r"Margin after AH cut :: -\d", x) for x in losing))
 
 # an item with no data must add nothing
 lua.execute("lines={}")

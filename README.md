@@ -449,6 +449,108 @@ lower.
 
 ---
 
+## What to craft, and how many
+
+A margin is what one craft pays **if it sells**. Ranking on it alone puts a
++800% craft that shifts a unit a fortnight above a +12% craft that shifts forty
+a day, which is backwards — the second one is the business. So the table ranks
+on **Gold/day**, and says how many to make.
+
+```
+gold/day = margin per unit  ×  units a day the market takes  ×  your share of it
+Craft    = that, over cover_days, less what you already hold
+```
+
+Both numbers are on every row, and hovering either shows that arithmetic filled
+in with the row's own figures, so it can be argued with rather than believed.
+`--rank margin` restores the old ordering.
+
+**Your share is modelled, not measured.** It is `1 / (listings + 1)` — you as
+one more seller among those already posted, so ten listings gives you a tenth
+and a crowded market promises you less without any tuning. The alternative, a
+flat percentage, is wrong in both directions at once: too generous on staples,
+too stingy where you are the only crafter. It is still a model. One seller
+holding five postings reads as five competitors, and undercutting hard takes
+more than your share. `--market-share 0.25` overrides it, `market_share` in
+`config.json` sets it permanently.
+
+**The sale rate is capped, because it counts cancellations as sales.** The rate
+itself comes from individual auctions and is sound in principle — a posting
+that survived with fewer units on it was bought from, one that vanished with
+hours still to run cannot have expired — but nothing separates a cancelled
+auction from a sold one, and undercut wars cancel constantly. Measured on a
+live seven-day database of 30,170 items:
+
+| | |
+|---|---|
+| median item's daily turnover of its standing supply | 4% |
+| items under one full turnover a day | 93% |
+| worst offender | Leylight Shard, 2.1M units/day against 200k listed across 88 postings |
+
+Ten turnovers a day is not demand, it is the same few stacks being pulled and
+reposted. So the rate is held at one full turnover of standing supply a day,
+which leaves the honest 93% untouched, and rows where it bit say **capped**.
+Of the 6,894 crafted outputs with a measured rate, 15% are capped and 21% read
+zero — nothing left the market at all across the whole week.
+
+`demand_cap_turnover` in `config.json` changes the multiple; 0 turns it off.
+
+**The cap is a bound, not a fix — so the real one is being measured.** A
+commodity ladder is consumed from the cheapest end, which gives a test the
+snapshot can actually answer: take the cheapest posting that survived *both*
+scans, and count only the units that vanished from **below** it. Anything that
+went while a cheaper listing stood there untouched was not bought — the buyer
+would have taken the cheaper one first — so what is left is a cancellation.
+
+Every scan now records that figure as `sold_swept` alongside the older
+`sold_likely`, and prints how much of the hour's "sold" units the ladder test
+accounts for and how much of it left a cheaper listing standing — the second
+number being undercut churn counted as trade. The same comparison over the
+whole stored window is one line further down, and `Store.sale_signal_summary`
+answers it from the columns for any database at any time.
+
+**No figure is quoted here yet, because none has been collected yet.** The
+column starts at zero on every existing row — it has to, nothing measured them
+— so the scan counts from the first whole day after the upgrade rather than
+reporting a week of history it never saw as 100% cancellation.
+
+Nothing is ranked on it yet. `sale_basis` in `config.json` is `"likely"` — the
+old measure — until there are enough days behind the new one to say what
+changing it does, because swapping a number on an argument rather than on a
+measurement is how the discredited aggregate version got shipped in the first
+place. Set it to `"swept"` to switch; a scan that finds no whole day of the new
+signal falls back and says so rather than emptying the table.
+
+Two known limits. The test is honest on commodities and weaker on realm gear,
+where an auction is a single item and variants are not interchangeable. And an
+item whose *entire* ladder turned over inside one hour is left out rather than
+counted: one buyer clearing the lot and one seller pulling everything leave the
+same trace.
+
+**The restock target fails towards crafting nothing.** No sale rate means no
+target rather than a target of zero — the two are not the same and the ranking
+keeps them apart, with unmeasured crafts sorted below every measured one. A
+craft that loses money gets no target however fast it moves. Anything slower
+than one unit across the cover window rounds to nothing to make now, not to
+one. What you already hold, from the addon's inventory export, is deducted.
+
+`--cover-days N` sets the window (default 3). Short is deliberate: an undercut
+war or a patch should not catch you holding a month of inventory.
+
+**What it still cannot see.** Your own auctions, above all — nothing in the API
+or the addon reports what you already have posted, so a restock you have
+already made and listed will be suggested a second time. Nor whether you can
+hit the crafting quality that sets the price, nor that a transmute-sourced
+reagent is limited to one a day. And the forecast inherits every flaw in the
+price under it: on an output with one or two listings the margin is mostly
+somebody's asking price, and multiplying a fiction by a sale rate produces a
+larger fiction. Those rows are badged **thin market** and there is a *Liquid
+markets only* checkbox to put them aside, but they are not hidden — thin is not
+the same as wrong, and transmog markets are genuinely thin.
+
+Treat Gold/day as a better question than "which margin is biggest", not as an
+answer.
+
 ## How the numbers are worked out
 
 This is the part worth understanding, because it's where naive versions of this
@@ -659,8 +761,13 @@ These are real gaps, not hedging:
   none are visible to the API. They generally push margins *up*.
 - **Crafting orders.** Personal and patron orders often beat the open market
   entirely, and aren't in the API at all.
-- **Whether it sells.** A margin is a listing-price difference. Supply and listing
-  counts are shown so you can judge liquidity, but nothing here predicts velocity.
+- **Whether it sells — now estimated, still not known.** A margin is a
+  listing-price difference. The **Gold/day** and **Craft** columns turn it into
+  a projection using the measured sale rate and a modelled share of the market
+  (see *What to craft, and how many* above), which is a better question than
+  margin alone — but it rests on a rate that cannot tell a cancellation from a
+  sale and a share that is arithmetic rather than observation. Supply and
+  listing counts are still on the page so you can judge liquidity yourself.
 - **Your skill level.** Every recipe in the tier is evaluated whether or not you
   can make it.
 
@@ -880,8 +987,18 @@ set in `config.json`. The addon loads it and adds, for any item it knows:
 
 - cheapest and realistic auction price on reagent tooltips
 - craft cost and margin after the AH cut on anything craftable
+- **what the craft is worth a day, and how many to make** — the same two
+  numbers the dashboard ranks on, on the tooltip and on the crafting window,
+  because standing at the crafting table is where "how many" actually gets
+  decided
 - a line on the crafting window showing cost, sale price and margin for the
   recipe you have open
+
+The forecast has three states in game and they are deliberately not alike: a
+figure and a quantity when there is a measured sale rate, *nothing selling*
+when the rate is a measured zero, and **no line at all** when the output has
+never been measured. A craft nobody has been seen buying and a craft nobody has
+looked at are different things, and neither is worth zero gold a day.
 
 The file carries every item the recipe cache references — reagents, slot fills
 and crafted outputs — plus every **tradeskill item**, whether or not a recipe

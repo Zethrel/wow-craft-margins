@@ -1,12 +1,13 @@
 """Sale rate and smoothed market value - the two things TSM has that a single
 scan cannot give you.
 
-The API never reports a sale. The only signal available is that units which
-were listed are not listed any more, so sale rate here is the fall in listed
-quantity between scans, accumulated per day. It undercounts (somebody posting
-more between two scans hides what went) and overcounts (a cancellation looks
-like a sale), and what it is actually good for is telling "this moves" apart
-from "this sits" - which margin alone cannot.
+The API never reports a sale, so it has to be inferred from individual
+auctions: one that survived between two scans with fewer units on it was
+bought from, and one that vanished with hours still to run cannot have
+expired. It undercounts (a seller posting more between two scans hides what
+went) and overcounts (a cancellation looks exactly like a sale), which is why
+the rate is capped at a full turnover of standing supply a day before anything
+is ranked on it.
 
 Market value is the other half: one scan's price is one moment, and TSM
 averages fourteen days precisely because a single reading is one seller having
@@ -82,9 +83,17 @@ s.close()
 sf = W.Store(os.path.join(tmp, "flow.sqlite3"))
 
 
-def auc(aid, item, qty, left="VERY_LONG"):
-    return {"id": aid, "item": {"id": item}, "quantity": qty,
-            "time_left": left}
+def auc(aid, item, qty, left="VERY_LONG", price=None, buyout=None):
+    """One auction. `price` is a commodity unit price, `buyout` the total for
+    a realm listing - the ladder test has to cope with both, and with neither
+    (a bid-only listing, which has no price anybody can buy at)."""
+    row = {"id": aid, "item": {"id": item}, "quantity": qty,
+           "time_left": left}
+    if price is not None:
+        row["unit_price"] = price
+    if buyout is not None:
+        row["buyout"] = buyout
+    return row
 
 
 # First sight of the market: nothing to compare against, so no sales claimed.
@@ -98,11 +107,11 @@ flow = sf.record_auction_flow([
     # auction 2 (40 units, VERY_LONG) has gone: sold or cancelled, not expired
     # auction 4 (1 unit, SHORT) has gone: might simply have run out
 ])
-confirmed, likely = flow[50]
+confirmed, likely, swept = flow[50]
 must("a shrunken listing is a confirmed purchase", confirmed == 30.0)
 must("a vanished listing with hours left counts as sold", likely == 40.0)
 must("an auction that vanished on SHORT is not counted",
-     60 not in flow or flow[60] == (0.0, 0.0))
+     60 not in flow or flow[60] == (0.0, 0.0, 0.0))
 
 # Reposting is the case the aggregate got wrong: quantity swings down and up
 # while nothing sells. Ids make it obvious - the old auction is gone but a
@@ -111,7 +120,7 @@ sf2 = W.Store(os.path.join(tmp, "repost.sqlite3"))
 sf2.record_auction_flow([auc(10, 70, 500, "SHORT")])
 churn = sf2.record_auction_flow([auc(11, 70, 500)])
 must("cancel-and-relist on a short auction is not a sale",
-     churn.get(70, (0.0, 0.0)) == (0.0, 0.0))
+     churn.get(70, (0.0, 0.0, 0.0)) == (0.0, 0.0, 0.0))
 sf2.close()
 
 # Growing a stack is not a negative sale.
@@ -125,6 +134,76 @@ sf3.close()
 kept = sf.db.execute("SELECT COUNT(*) FROM auction_prev").fetchone()[0]
 must("only the latest scan's auctions are kept", kept == 2)
 sf.close()
+
+# ---- 1b. the ladder test: which of those "sold" units a buyer explains --
+#
+# A commodity ladder is consumed from the cheapest end. So a posting that
+# vanished while a CHEAPER posting survived the interval was not bought - the
+# buyer would have taken the cheaper one first - and what is left is a
+# cancellation. Everything below the cheapest survivor is consistent with a
+# purchase and counts as swept.
+lad = W.Store(os.path.join(tmp, "ladder.sqlite3"))
+lad.record_auction_flow([auc(1, 90, 10, price=100),
+                         auc(2, 90, 20, price=200),
+                         auc(3, 90, 30, price=300)])
+swept_flow = lad.record_auction_flow([auc(2, 90, 20, price=200),
+                                      auc(3, 90, 30, price=300)])
+_c, likely, swept = swept_flow[90]
+must("the bottom of the ladder going is a purchase", swept == 10.0)
+must("and it is a subset of what merely vanished", likely == 10.0)
+
+# The mirror case, which is the whole point: the dear listing went while the
+# cheap ones stood there untouched. Nobody bought at 300 with 100 available.
+lad2 = W.Store(os.path.join(tmp, "ladder2.sqlite3"))
+lad2.record_auction_flow([auc(1, 91, 10, price=100),
+                          auc(2, 91, 20, price=200),
+                          auc(3, 91, 30, price=300)])
+cancel = lad2.record_auction_flow([auc(1, 91, 10, price=100),
+                                   auc(2, 91, 20, price=200)])
+_c, likely, swept = cancel[91]
+must("a listing that went while cheaper ones survived is not a sale",
+     swept == 0.0)
+must("but the old measure still counts it", likely == 30.0)
+
+# Everything gone at once says nothing either way: one buyer clearing the
+# ladder and one seller pulling their postings leave the same trace.
+lad3 = W.Store(os.path.join(tmp, "ladder3.sqlite3"))
+lad3.record_auction_flow([auc(1, 92, 10, price=100), auc(2, 92, 20, price=200)])
+empty = lad3.record_auction_flow([auc(9, 92, 5, price=150)])
+_c, likely, swept = empty[92]
+must("a ladder with no survivors is left undecided", swept == 0.0)
+must("while the old measure claims all of it", likely == 30.0)
+
+# Realm listings quote a buyout for the whole stack, so it has to be divided
+# before it can be compared with anything.
+lad4 = W.Store(os.path.join(tmp, "ladder4.sqlite3"))
+lad4.record_auction_flow([auc(1, 93, 5, buyout=500),      # 100 each
+                          auc(2, 93, 5, buyout=1500)])    # 300 each
+gear = lad4.record_auction_flow([auc(2, 93, 5, buyout=1500)])
+must("a stack buyout is read per unit", gear[93][2] == 5.0)
+
+# A bid-only listing has no price anybody can buy at, so it takes no position
+# on the ladder - it must neither count as swept nor become the floor.
+lad5 = W.Store(os.path.join(tmp, "ladder5.sqlite3"))
+lad5.record_auction_flow([auc(1, 94, 7),                  # bid only
+                          auc(2, 94, 5, price=200),
+                          auc(3, 94, 5, price=300)])
+bidonly = lad5.record_auction_flow([auc(1, 94, 7), auc(3, 94, 5, price=300)])
+must("a bid-only listing is not swept", bidonly[94][2] == 5.0)
+
+for store in (lad, lad2, lad3, lad4, lad5):
+    store.close()
+
+# The summary is what decides whether the default should change, so it has to
+# be answerable from the stored columns rather than only from a log line.
+sumry = W.Store(os.path.join(tmp, "summary.sqlite3"))
+sumry.save_prices(today, {1: px(100, 500)}, flow={1: (5.0, 100.0, 40.0)},
+                  elapsed=3600)
+report = sumry.sale_signal_summary(days=7)
+must("the summary totals what was stored",
+     (report["likely"], report["swept"]) == (100.0, 40.0))
+must("and states the churn share", abs(report["churn"] - 0.6) < 1e-9)
+sumry.close()
 
 # ---- 2. velocity is units per unit of OBSERVED time ------------------
 s = W.Store(os.path.join(tmp, "rate.sqlite3"))
@@ -228,31 +307,36 @@ must("and read as a dash, not a zero", "&ndash;" in html2)
 # nothing left the market, measured and something did.
 must("unmeasured renders as a dash", "&ndash;" in W.velocity_str(None))
 must("nothing having moved reads as static", W.velocity_str(0.0) == "static")
-must("something having moved reads as moves", W.velocity_str(0.25) == "moves")
-must("a large figure still only reads as moves",
-     W.velocity_str(1234.0) == "moves")
+must("a small rate keeps its precision", W.velocity_str(0.25) == "0.25")
+must("a middling rate reads to one decimal", W.velocity_str(5.5) == "5.5")
+must("a rate in double figures drops the decimal",
+     W.velocity_str(12.5) == "12")
+must("a large rate is whole and grouped", W.velocity_str(1234.0) == "1,234")
 
-# No rate is printed, at any magnitude. The first version of this column
-# summed max(0, previous - current) across scans and published units per day,
-# which on live data had 15% of items shifting more than their whole standing
-# supply within seven hours - a one-sided sum over a noisy series measures
-# volatility, not trade. The sign survives that; the magnitude does not, and
-# must not find its way back onto the page.
-for value in (0.25, 12.5, 1234.0, 2684177.3):
-    rendered = W.velocity_str(value)
-    must(f"no number leaks out for {value:g}",
-         not any(ch.isdigit() for ch in rendered))
-
+# The magnitude is printed again, and that is a reversal worth stating.
+# It was withdrawn when the rate came from summing every fall in the
+# aggregate listed quantity: a one-sided sum over a noisy series measures
+# volatility rather than trade, and on live data 15% of items "sold" more
+# than their entire standing supply within seven hours. That method is gone.
+# The rate now comes from individual auctions - one that survived with fewer
+# units on it was bought from, one that vanished with hours left cannot have
+# expired - which is a real per-day figure. What it still cannot do is
+# separate a cancellation from a sale, so it is capped before it is shown and
+# the tooltip says so. Those two guards are what the assertions below hold in
+# place; without them the number must not be on the page.
 must("the tip explains an unmeasured row",
      "needs several hours" in W.velocity_tip(None))
 must("the tip explains what static really means",
      "nothing left the market" in W.velocity_tip(0.0))
 must("the tip admits the static blind spot",
      "restocked faster" in W.velocity_tip(0.0))
-must("the tip refuses to claim a quantity",
-     "cannot be had" in W.velocity_tip(50.0))
-must("the tip says cancellations are indistinguishable",
-     "cancellations look identical" in W.velocity_tip(50.0).lower())
+must("the tip says a cancellation is indistinguishable from a sale",
+     "cancellation" in W.velocity_tip(50.0).lower())
+must("the tip calls the figure an upper bound",
+     "upper bound" in W.velocity_tip(50.0).lower())
+must("the tip says when the cap bit",
+     "capped" in W.velocity_tip(50.0, capped=True).lower()
+     and "capped" not in W.velocity_tip(50.0).lower())
 
 print()
 if fails:

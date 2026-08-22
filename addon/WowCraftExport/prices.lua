@@ -12,16 +12,22 @@
 local GOLD_TEX = "|cffffd100g|r"
 
 local function money(copper)
-    if not copper or copper <= 0 then return "-" end
+    -- Negatives print as negatives. They used to fall into the same "-" as
+    -- nil, so a craft losing 20g and a craft nobody has priced looked
+    -- identical on the line where it matters most - and the sign is the whole
+    -- message.
+    if not copper or copper == 0 then return "-" end
+    local sign = ""
+    if copper < 0 then sign, copper = "-", -copper end
     local gold = copper / 10000
     if gold >= 1000000 then
-        return string.format("%.1fM%s", gold / 1000000, GOLD_TEX)
+        return sign .. string.format("%.1fM%s", gold / 1000000, GOLD_TEX)
     elseif gold >= 1000 then
-        return string.format("%.1fk%s", gold / 1000, GOLD_TEX)
+        return sign .. string.format("%.1fk%s", gold / 1000, GOLD_TEX)
     elseif gold >= 10 then
-        return string.format("%.0f%s", gold, GOLD_TEX)
+        return sign .. string.format("%.0f%s", gold, GOLD_TEX)
     end
-    return string.format("%.2f%s", gold, GOLD_TEX)
+    return sign .. string.format("%.2f%s", gold, GOLD_TEX)
 end
 
 local function ageText(updated)
@@ -77,10 +83,20 @@ local function addItemLines(tooltip, itemID)
                               0.6, 0.8, 1, 0.9, 0.8, 0.4)
     end
     if margin then
-        -- {cost, revenue, marginPct, costComplete, optionalsFilled}
+        -- {cost, revenue, marginPct, costComplete, optionalsFilled,
+        --  haveRate, goldPerDay, restockUnits}
+        --
+        -- haveRate is a flag rather than a sentinel in goldPerDay, because
+        -- every value that could serve as a sentinel is one gold/day can
+        -- honestly take: negative on a craft losing money at a rate, zero on
+        -- one whose output nobody has been seen buying. A PriceData.lua
+        -- written before these existed has nil here, which reads the same as
+        -- "no rate" - which is what it is.
         local cost, revenue, pct, complete, optionals = margin[1], margin[2],
                                                         margin[3], margin[4],
                                                         margin[5]
+        local haveRate = margin[6] == 1
+        local perDay, restock = margin[7] or 0, margin[8] or 0
         local r, g, b = 0.4, 0.9, 0.4
         if (pct or 0) < 0 then r, g, b = 0.95, 0.4, 0.4 end
         tooltip:AddDoubleLine("Craft cost", money(cost), 0.6, 0.8, 1, 1, 1, 1)
@@ -89,6 +105,23 @@ local function addItemLines(tooltip, itemID)
                                             money((revenue or 0) - (cost or 0)),
                                             pct or 0),
                               0.6, 0.8, 1, r, g, b)
+        if haveRate then
+            -- Margin is what one craft pays if it sells. This is what the
+            -- craft is worth to you, which is the number that decides whether
+            -- to make it at all - and how many.
+            local shown, sr, sg, sb = money(perDay), r, g, b
+            if perDay == 0 then
+                shown, sr, sg, sb = "nothing selling", 0.7, 0.7, 0.7
+            elseif perDay < 0 then
+                shown, sr, sg, sb = "a loss at these prices", 0.95, 0.4, 0.4
+            end
+            tooltip:AddDoubleLine("Expected per day", shown,
+                                  0.6, 0.8, 1, sr, sg, sb)
+            if restock > 0 then
+                tooltip:AddDoubleLine("Make now", string.format("%d", restock),
+                                      0.6, 0.8, 1, 1, 1, 1)
+            end
+        end
         if complete == 0 then
             tooltip:AddLine("Cost is a floor - reagent slots not modelled",
                             0.95, 0.6, 0.3, true)
@@ -232,11 +265,23 @@ local function refresh()
     end
     local cost, revenue, pct, complete, optionals =
         margin[1], margin[2], margin[3], margin[4], margin[5]
+    local haveRate = margin[6] == 1
+    local perDay, restock = margin[7] or 0, margin[8] or 0
     local profit = (revenue or 0) - (cost or 0)
     local colour = profit >= 0 and "|cff66dd66" or "|cffee6666"
     local text = string.format(
         "cost %s  sale %s  %s%s (%+d%%)|r",
         money(cost), money(revenue), colour, money(profit), pct or 0)
+    -- Standing at the crafting table is where "how many" actually gets
+    -- decided, so the quantity belongs here and not only on the dashboard.
+    if haveRate and perDay > 0 then
+        text = text .. string.format("  |cffffd100%s/day|r", money(perDay))
+        if restock > 0 then
+            text = text .. string.format("  |cffffd100make %d|r", restock)
+        end
+    elseif haveRate and perDay == 0 then
+        text = text .. "  |cff808080no sales seen|r"
+    end
     if complete == 0 then
         text = text .. "  |cffddaa55floor|r"
     elseif (optionals or 0) > 0 then
@@ -248,10 +293,22 @@ local function refresh()
     end
     label:SetText(text .. "  |cff808080" .. ageText(d.updated) .. "|r")
     -- The full, unabbreviated version on hover, since the line can clip.
+    local expected = "no sale rate for this output yet"
+    if haveRate and perDay > 0 then
+        expected = string.format(
+            "expected %s a day at your share of the market", money(perDay))
+        expected = expected .. (restock > 0
+            and string.format("\nmake %d to cover the next few days", restock)
+            or "\nnothing to make now - what you hold covers it")
+    elseif haveRate and perDay == 0 then
+        expected = "nothing has left the market for this output all week"
+    elseif haveRate then
+        expected = "it sells, but at a loss at today's prices"
+    end
     label.tipText = string.format(
-        "wowcraft\ncost %s per craft\nsells for %s\nmargin %s (%+d%%)\n%s\n"
+        "wowcraft\ncost %s per craft\nsells for %s\nmargin %s (%+d%%)\n%s\n%s\n"
         .. "prices %s",
-        money(cost), money(revenue), money(profit), pct or 0,
+        money(cost), money(revenue), money(profit), pct or 0, expected,
         (complete == 0) and "cost is a floor - reagent slots not modelled"
           or ((optionals or 0) > 0
               and string.format("includes %d optional slot(s) at cheapest fill",

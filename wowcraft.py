@@ -109,6 +109,41 @@ VARIANT_SPREAD = 1.5
 # headline figures. A price nobody else is asking is not a price.
 VARIANT_MIN_LISTINGS = 2
 
+# --- Turning a margin into gold per day -----------------------------------
+#
+# A margin is what one craft pays IF it sells. Ranking on it puts a +800%
+# craft that shifts one unit a fortnight above a +12% craft that shifts forty
+# a day, which is backwards: the second one is the business. So the table
+# ranks on margin x how many you could actually sell, and says how many to
+# make.
+#
+# Three assumptions go into that, all of them stated on the page rather than
+# buried here, because each is arguable.
+
+# How many days of stock a restock target covers. Three is short enough that
+# an undercut war or a patch does not catch you holding a month of inventory,
+# and long enough to be worth a crafting session.
+COVER_DAYS = 3.0
+
+# The measured sale rate is capped at this many times the item's standing
+# supply per day. The rate comes from auctions that vanished with hours left
+# to run, which cannot have expired - but a seller who cancels to undercut
+# looks exactly the same, and on thin listings with huge stacks that churn
+# dominates. Measured on a live 7-day database (30,170 items): the median item
+# turns over 4% of its supply per day and 93% stay under 100%, but the top of
+# the list claims ten times its own supply daily - Leylight Shard at 2.1M
+# units against 200k listed across 88 postings. Those are cancellations, not
+# customers. Capping at one full turnover a day leaves the honest 93%
+# untouched and stops the churn tail dictating what to craft; rows where it
+# bit say so.
+DEMAND_CAP_TURNOVER = 1.0
+
+# Below this many listings, "your share of the market" is arithmetic rather
+# than a market: one listing means one seller, and undercutting them takes the
+# lot or none of it. The share model still applies - it just should not be
+# read as a forecast.
+SHARE_THIN_LISTINGS = 3
+
 GOLD = 10000  # copper per gold
 
 
@@ -481,6 +516,18 @@ CREATE TABLE IF NOT EXISTS price_snapshot (
     --     item that either goes whole or does not go.
     sold_confirmed REAL DEFAULT 0,
     sold_likely    REAL DEFAULT 0,
+    --   sold_swept - the subset of sold_likely that a buyer can actually
+    --     account for. On a commodity the ladder is consumed from the
+    --     cheapest end, so a posting that vanished while a CHEAPER posting
+    --     survived both scans was not bought: the buyer would have taken the
+    --     cheaper one first. That leaves a cancellation. Counting only what
+    --     went from below the cheapest survivor is therefore the one test
+    --     that separates the two, and sold_likely minus sold_swept is a
+    --     direct measure of how much of the signal is undercut churn.
+    --     Collected alongside the others rather than replacing them, because
+    --     replacing a number on an argument is how the aggregate version got
+    --     shipped in the first place.
+    sold_swept     REAL DEFAULT 0,
     -- The original, kept only so old databases still read. It summed every
     -- downward move in the aggregate quantity, which measures volatility
     -- rather than trade - on live data it had items shifting a thousand times
@@ -552,11 +599,24 @@ class Store:
         if "seconds_covered" not in price_cols:
             self.db.execute("ALTER TABLE price_snapshot ADD COLUMN "
                             "seconds_covered REAL DEFAULT 0")
-        for column in ("sold_confirmed", "sold_likely"):
+        for column in ("sold_confirmed", "sold_likely", "sold_swept"):
             if column not in price_cols:
                 self.db.execute(
                     f"ALTER TABLE price_snapshot ADD COLUMN {column} "
                     "REAL DEFAULT 0")
+        if "sold_swept" not in price_cols:
+            # Every existing row now reads sold_swept = 0, which is exactly
+            # what "nothing was bought" looks like - so without a marker the
+            # ladder test would appear to reject 100% of a week of history it
+            # never saw. Count from the next whole day: today's row already
+            # holds hours of sold_likely with no swept beside it, and mixing
+            # the two would overstate the churn it exists to measure.
+            #
+            # A database created after this column existed never takes this
+            # branch, has no legacy rows, and needs no marker.
+            self.db.execute(
+                "INSERT OR IGNORE INTO meta(key,value) VALUES('swept_from',?)",
+                (str(day_bucket(int(time.time())) + 86400),))
         if "sell_low" not in price_cols:
             # Seed the range from what is already stored: one reading is a
             # range of zero width, which is honest until the day's next scan.
@@ -773,18 +833,19 @@ class Store:
                 removed = max(0.0, float(previous[iid] - p.total_quantity))
                 obs = 1
                 covered = span
-            confirmed, likely = (flow or {}).get(iid, (0.0, 0.0))
+            confirmed, likely, swept = (flow or {}).get(
+                iid, (0.0, 0.0, 0.0))
             rows.append((taken_at, iid, p.source, p.sell_unit_price,
                          p.min_unit_price, p.total_quantity, p.listing_count,
                          p.sell_unit_price, p.sell_unit_price,
                          p.min_unit_price, p.min_unit_price,
-                         removed, obs, covered, confirmed, likely))
+                         removed, obs, covered, confirmed, likely, swept))
         self.db.executemany("""
             INSERT INTO price_snapshot(taken_at,item_id,source,sell_unit_price,
                 min_unit_price,total_quantity,listing_count,
                 sell_low,sell_high,buy_low,buy_high,units_removed,removal_obs,
-                seconds_covered,sold_confirmed,sold_likely)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                seconds_covered,sold_confirmed,sold_likely,sold_swept)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(taken_at,item_id,source) DO UPDATE SET
                 units_removed=COALESCE(price_snapshot.units_removed,0)
                               + excluded.units_removed,
@@ -796,6 +857,8 @@ class Store:
                                + excluded.sold_confirmed,
                 sold_likely=COALESCE(price_snapshot.sold_likely,0)
                             + excluded.sold_likely,
+                sold_swept=COALESCE(price_snapshot.sold_swept,0)
+                           + excluded.sold_swept,
                 sell_unit_price=excluded.sell_unit_price,
                 min_unit_price=excluded.min_unit_price,
                 total_quantity=excluded.total_quantity,
@@ -870,16 +933,31 @@ class Store:
         postings and cancellations too, and summing only its falls measures
         volatility. Individual auctions can, because they carry an id.
 
-        Returns {item_id: (confirmed, likely)} in units.
+        Returns {item_id: (confirmed, likely, swept)} in units, where `swept`
+        is the subset of `likely` that survives the ladder test - see the
+        schema comment on sold_swept. Nothing is subtracted here: all three
+        are stored so the difference between them can be measured on live
+        data before anything is ranked on it.
         """
         db = self.db
         db.execute("CREATE TABLE IF NOT EXISTS auction_prev ("
                    "id INTEGER PRIMARY KEY, item_id INTEGER, qty INTEGER, "
-                   "time_left TEXT)")
+                   "time_left TEXT, price REAL)")
+        # Databases from before the ladder test have no price column, and
+        # there is nothing to migrate: this table is a one-scan scratchpad,
+        # not history. Rebuilding it costs exactly one hour of sale signal,
+        # which is why the caller is told - an hour of "nothing sold" quietly
+        # averaged into a rate would be worse than the gap.
+        if "price" not in {r["name"] for r in
+                           db.execute("PRAGMA table_info(auction_prev)")}:
+            db.execute("DROP TABLE auction_prev")
+            db.execute("CREATE TABLE auction_prev ("
+                       "id INTEGER PRIMARY KEY, item_id INTEGER, qty INTEGER, "
+                       "time_left TEXT, price REAL)")
         db.execute("DROP TABLE IF EXISTS auc_now")
         db.execute("CREATE TEMP TABLE auc_now ("
                    "id INTEGER PRIMARY KEY, item_id INTEGER, qty INTEGER, "
-                   "time_left TEXT)")
+                   "time_left TEXT, price REAL)")
 
         rows = []
         for a in auctions:
@@ -888,11 +966,21 @@ class Store:
             iid = item.get("id")
             if not isinstance(aid, int) or not isinstance(iid, int):
                 continue
-            rows.append((aid, iid, int(a.get("quantity") or 0),
-                         str(a.get("time_left") or "")))
+            qty = int(a.get("quantity") or 0)
+            # Commodities quote a unit price; realm listings quote the buyout
+            # for the whole stack, so it has to be divided to compare like
+            # with like. Bid-only listings have no buyout and no position on
+            # the ladder anybody can buy from - price None keeps them out of
+            # the test rather than at the bottom of it.
+            unit = a.get("unit_price")
+            if unit is None:
+                buyout = a.get("buyout")
+                unit = (float(buyout) / qty) if buyout and qty else None
+            rows.append((aid, iid, qty, str(a.get("time_left") or ""),
+                         float(unit) if unit is not None else None))
         # OR IGNORE: the same id should not appear twice, but a duplicate must
         # not abort a scan over a sale statistic.
-        db.executemany("INSERT OR IGNORE INTO auc_now VALUES (?,?,?,?)", rows)
+        db.executemany("INSERT OR IGNORE INTO auc_now VALUES (?,?,?,?,?)", rows)
 
         had_previous = db.execute(
             "SELECT 1 FROM auction_prev LIMIT 1").fetchone() is not None
@@ -903,7 +991,7 @@ class Store:
                     "SELECT p.item_id, SUM(p.qty - n.qty) FROM auction_prev p "
                     "JOIN auc_now n ON n.id = p.id WHERE n.qty < p.qty "
                     "GROUP BY p.item_id"):
-                flow[iid] = (float(units or 0), 0.0)
+                flow[iid] = (float(units or 0), 0.0, 0.0)
             # Gone, with hours still to run.
             marks = ",".join("?" * len(self.SAFE_TIME_LEFT))
             for iid, units in db.execute(
@@ -911,8 +999,34 @@ class Store:
                     "LEFT JOIN auc_now n ON n.id = p.id "
                     f"WHERE n.id IS NULL AND p.time_left IN ({marks}) "
                     "GROUP BY p.item_id", self.SAFE_TIME_LEFT):
-                confirmed, _ = flow.get(iid, (0.0, 0.0))
-                flow[iid] = (confirmed, float(units or 0))
+                confirmed, _, _ = flow.get(iid, (0.0, 0.0, 0.0))
+                flow[iid] = (confirmed, float(units or 0), 0.0)
+            # ...and of those, the ones a buyer can account for.
+            #
+            # A commodity ladder is consumed from the cheapest end. So take
+            # the cheapest posting that survived BOTH scans - proof that
+            # buying never reached that price - and count only the units that
+            # vanished from below it. Anything that went while a cheaper
+            # listing stood untouched was not bought; it was pulled.
+            #
+            # Survivors, not current listings: a posting created after the
+            # purchase would otherwise masquerade as the floor and hide a real
+            # sale. An item with no survivors at all is left out entirely -
+            # its whole ladder turned over, and nothing in the snapshot says
+            # whether that was one buyer or one seller having second thoughts.
+            for iid, units in db.execute(
+                    "WITH floor AS ("
+                    "  SELECT p.item_id AS item_id, MIN(p.price) AS lowest "
+                    "  FROM auction_prev p JOIN auc_now n ON n.id = p.id "
+                    "  WHERE p.price IS NOT NULL GROUP BY p.item_id) "
+                    "SELECT p.item_id, SUM(p.qty) FROM auction_prev p "
+                    "LEFT JOIN auc_now n ON n.id = p.id "
+                    "JOIN floor f ON f.item_id = p.item_id "
+                    f"WHERE n.id IS NULL AND p.time_left IN ({marks}) "
+                    "  AND p.price IS NOT NULL AND p.price < f.lowest "
+                    "GROUP BY p.item_id", self.SAFE_TIME_LEFT):
+                confirmed, likely, _ = flow.get(iid, (0.0, 0.0, 0.0))
+                flow[iid] = (confirmed, likely, float(units or 0))
 
         db.execute("DELETE FROM auction_prev")
         db.execute("INSERT INTO auction_prev SELECT * FROM auc_now")
@@ -952,7 +1066,7 @@ class Store:
     # about when we looked than about what sells.
     MIN_VELOCITY_HOURS = 6.0
 
-    def sale_velocity(self, days: int = 7) -> dict:
+    def sale_velocity(self, days: int = 7, basis: str = "likely") -> dict:
         """{item_id: units sold per day}, from watching individual auctions.
 
         A rate, divided by the market time actually observed rather than by
@@ -960,18 +1074,31 @@ class Store:
         machines reboot - so a day holding four hours of observation would
         otherwise read as a slow day rather than a short one.
 
-        Confirmed partial sales and vanished-with-hours-left are added
-        together. Each alone would be blind to half the market: partial sales
-        only happen to commodity stacks, and gear is single auctions that go
-        whole or not at all. Cancellations still count as sales in the second
-        term; nothing in the API separates them.
+        Confirmed partial sales are always counted: an auction that survived
+        with fewer units on it was bought from, and nothing else does that.
+        What is added to them depends on `basis`:
+
+          "likely" - every auction that vanished with hours still to run. It
+              cannot have expired, but it can have been cancelled, and on
+              thinly-listed items with big stacks that churn is most of it.
+          "swept"  - only those that vanished from BELOW the cheapest posting
+              that survived the interval, which a buyer working up the ladder
+              can actually account for. Strictly a subset of "likely".
+
+        "likely" remains the default until the two have been measured against
+        each other on live data - the whole point of storing both.
         """
         today = day_bucket(int(time.time()))
         cutoff = today - max(1, days) * 86400
+        column = "sold_swept" if basis == "swept" else "sold_likely"
+        if basis == "swept":
+            # Never read a day the ladder test did not run on: those zeros are
+            # an absence of measurement, not an absence of sales.
+            cutoff = max(cutoff, self.swept_from())
         sold: dict = {}
         covered: dict = {}
         for row in self.db.execute(
-                "SELECT item_id, sold_confirmed, sold_likely, seconds_covered "
+                f"SELECT item_id, sold_confirmed, {column}, seconds_covered "
                 "FROM price_snapshot WHERE taken_at >= ?", (cutoff,)):
             if not row[3]:
                 continue
@@ -981,6 +1108,44 @@ class Store:
         floor = self.MIN_VELOCITY_HOURS * 3600
         return {iid: sold[iid] / covered[iid] * 86400.0
                 for iid in sold if covered.get(iid, 0.0) >= floor}
+
+    def swept_from(self) -> int:
+        """First day the ladder test was actually running, or 0 for a
+        database that has never known anything else."""
+        try:
+            return int(self.get_meta("swept_from") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def sale_signal_summary(self, days: int = 7) -> dict:
+        """How much of the sale signal survives the ladder test.
+
+        The number this exists to produce is `churn`: the share of units that
+        vanished with hours left but had a cheaper listing standing untouched
+        beside them, which is a cancellation wearing a sale's clothes. It is
+        the measurement that decides whether `sale_basis` should switch, and
+        it is computed from stored columns so it can be asked of any database
+        at any time rather than only watched go past in a log.
+        """
+        today = day_bucket(int(time.time()))
+        cutoff = max(today - max(1, days) * 86400, self.swept_from())
+        row = self.db.execute(
+            "SELECT COALESCE(SUM(sold_confirmed),0), "
+            "       COALESCE(SUM(sold_likely),0), "
+            "       COALESCE(SUM(sold_swept),0), "
+            "       SUM(CASE WHEN sold_likely > 0 THEN 1 ELSE 0 END), "
+            "       SUM(CASE WHEN sold_swept > 0 THEN 1 ELSE 0 END) "
+            "FROM price_snapshot WHERE taken_at >= ?", (cutoff,)).fetchone()
+        confirmed, likely, swept = float(row[0]), float(row[1]), float(row[2])
+        return {
+            "confirmed": confirmed,
+            "likely": likely,
+            "swept": swept,
+            "churn": (1.0 - swept / likely) if likely > 0 else None,
+            "rows_likely": int(row[3] or 0),
+            "rows_swept": int(row[4] or 0),
+            "from": cutoff,
+        }
 
     def price_ranges(self, taken_at: int) -> dict:
         """{item_id: (buy_low, buy_high, sell_low, sell_high)} for one day."""
@@ -1220,6 +1385,28 @@ class MarginResult:
     # actually have the professions involved, so it is stated rather than
     # folded silently into the margin.
     crafted_savings: float = 0.0
+    # Units a day the whole market takes, after capping (see
+    # DEMAND_CAP_TURNOVER). None means not measured yet, which is not zero.
+    demand_per_day: Optional[float] = None
+    # True when the cap bit, i.e. the raw signal claimed more than a full
+    # turnover of standing supply per day. Almost always undercut churn.
+    demand_capped: bool = False
+    # The fraction of that market this assumes you take: one more seller among
+    # those already listed, so ten listings gives you a tenth. It is a model,
+    # not a measurement - one seller holding five postings reads as five
+    # competitors, and a market you undercut hard gives you more than this.
+    share: float = 0.0
+    # margin per unit x demand x share. The number the table ranks on.
+    gold_per_day: Optional[float] = None
+    # How many units to have on hand to cover COVER_DAYS of your share, less
+    # what you already hold. Zero on anything unprofitable or unmeasured.
+    restock_units: int = 0
+    # What crafting those units costs at today's reagent prices. Understated
+    # if it is much more than one batch, because you would eat further up the
+    # supply ladder buying them.
+    restock_cost: float = 0.0
+    # Units of the output already in your bags and banks, from the addon.
+    output_owned: int = 0
 
 
 def _col(row: Any, key: str, default: Any = None) -> Any:
@@ -1375,17 +1562,83 @@ class ReagentSourcer:
         return self._memo[key]
 
 
+def project_gold_per_day(r: "MarginResult", cover_days: float = COVER_DAYS,
+                         share: Optional[float] = None,
+                         cap_turnover: float = DEMAND_CAP_TURNOVER) -> None:
+    """Fill in demand, share, expected gold per day and a restock target.
+
+    Mutates `r`. Everything here is a projection rather than a measurement,
+    and it is built to fail towards "craft nothing" rather than towards a
+    number: an unmeasured item gets no forecast at all instead of a zero, and
+    a loss-making craft gets no restock target however fast it sells.
+    """
+    units = max(1, r.craftable_units)
+    # One more seller among those already listed. A market with ten listings
+    # gives you a tenth of it; a market with one gives you half. Crowded
+    # markets are punished automatically, which is the point - the alternative
+    # is a flat percentage that is generous on staples and stingy on niches at
+    # the same time.
+    r.share = (max(0.0, min(1.0, share)) if share is not None
+               else 1.0 / (max(0, r.output_listings) + 1))
+
+    if r.output_sold_per_day is None:
+        # Not measured yet. Distinct from measured-at-zero, and the ranking
+        # keeps it distinct: no forecast, sorted below everything that has one.
+        return
+
+    demand = max(0.0, r.output_sold_per_day)
+    cap = max(0.0, r.output_supply) * cap_turnover
+    if cap_turnover > 0 and demand > cap:
+        demand, r.demand_capped = cap, True
+    r.demand_per_day = demand
+
+    yours = demand * r.share
+    r.gold_per_day = (r.margin / units) * yours
+
+    # No restock target on a craft that loses money, however fast it moves,
+    # and none on one you cannot sell. Rounded rather than ceilinged: a craft
+    # you would shift once a fortnight should read as 0 to make now, not 1.
+    if r.margin <= 0 or yours <= 0:
+        return
+    target = yours * cover_days
+    r.restock_units = max(0, int(target - r.output_owned + 0.5))
+    r.restock_cost = r.restock_units * (r.cost / units)
+
+
+def _rank_key(r: "MarginResult") -> tuple:
+    """What the table ranks on, best first under reverse=True.
+
+    In order: crafts whose cost we actually know beat crafts whose cost is
+    only a floor (an understated cost always produces a flattering margin, so
+    sorting the two together would put every slotted recipe on top); then
+    crafts with a measured sale rate beat crafts without one; then expected
+    gold per day; then margin, which breaks ties and is the whole ordering for
+    the unmeasured rows.
+    """
+    return (r.cost_complete, r.gold_per_day is not None,
+            r.gold_per_day or 0.0, r.margin)
+
+
 def compute_margins(recipes: list, prices: dict, item_names: dict,
                     batch: int = 1, min_supply: int = 1,
                     min_listings: int = 1,
                     owned: Optional[dict] = None,
                     velocity: Optional[dict] = None,
-                    source_reagents: bool = True) -> tuple:
+                    source_reagents: bool = True,
+                    cover_days: float = COVER_DAYS,
+                    market_share: Optional[float] = None,
+                    cap_turnover: float = DEMAND_CAP_TURNOVER,
+                    rank: str = "gold-day") -> tuple:
     """Return (results, skipped) for every recipe we can fully price.
 
     `batch` = how many crafts you would do, which matters because buying 200
     units of a reagent costs more per unit than buying 1 (you eat further up
     the supply ladder). Costing a single craft understates real bulk cost.
+
+    `rank` is what the returned list is ordered by: "gold-day" (margin per
+    unit x what you could sell of it in a day) or "margin" for the old
+    ordering. The order matters beyond presentation - `--top` cuts the list
+    here, so it decides which crafts reach the page at all.
     """
     results: list = []
     skipped: dict = {"no_output_price": 0, "no_reagent_price": 0,
@@ -1552,12 +1805,18 @@ def compute_margins(recipes: list, prices: dict, item_names: dict,
     collapsed = len(results) - len(by_output)
     if collapsed:
         skipped["quality_variants_collapsed"] = collapsed
-    # Crafts whose cost we actually know rank above crafts whose cost is only a
-    # floor. Sorting the two together would put every slotted recipe on top -
-    # an understated cost always produces a flattering margin - and the biggest
-    # numbers on the page would be the least trustworthy ones.
-    results = sorted(by_output.values(),
-                     key=lambda x: (x.cost_complete, x.margin), reverse=True)
+    results = list(by_output.values())
+    for r in results:
+        r.output_owned = int((owned or {}).get(r.crafted_item_id, 0))
+        project_gold_per_day(r, cover_days=cover_days, share=market_share,
+                             cap_turnover=cap_turnover)
+    # A margin is what one craft pays if it sells; gold per day is what the
+    # craft is worth to you. Ranking on the first is what puts a five-figure
+    # margin on an item nobody has bought this week above a modest one that
+    # shifts all day. `--rank margin` restores the old ordering.
+    key = _rank_key if rank != "margin" else (
+        lambda x: (x.cost_complete, x.margin))
+    results.sort(key=key, reverse=True)
     return results, skipped
 
 
@@ -1838,7 +2097,7 @@ def resolve_connected_realm(client: BlizzardClient, store: Store,
 
 def cmd_scan(client: BlizzardClient, store: Store, cfg: dict, out_path: str,
              batch: int, top: int, min_listings: int = 1,
-             publish_dir: str = "") -> None:
+             publish_dir: str = "", rank: str = "gold-day") -> None:
     recipes = store.recipes(cfg.get("professions"), cfg.get("skill_tiers"))
     scope = " and ".join(
         filter(None, [", ".join(cfg.get("skill_tiers") or []),
@@ -1928,11 +2187,19 @@ def cmd_scan(client: BlizzardClient, store: Store, cfg: dict, out_path: str,
     if fresh_data:
         flow = store.record_auction_flow(commodity + realm)
         if flow:
-            confirmed = sum(c for c, _ in flow.values())
-            likely = sum(k for _, k in flow.values())
+            confirmed = sum(c for c, _, _ in flow.values())
+            likely = sum(k for _, k, _ in flow.values())
+            swept = sum(s for _, _, s in flow.values())
             log(f"sold since the last reading: {confirmed:,.0f} units bought "
                 f"off surviving listings, {likely:,.0f} more on auctions that "
                 f"went while they still had hours to run")
+            if likely > 0:
+                log(f"of those {likely:,.0f}, {swept:,.0f} "
+                    f"({swept / likely * 100:.0f}%) went from below the "
+                    f"cheapest listing that survived the hour, so a buyer "
+                    f"working up the ladder accounts for them; the other "
+                    f"{likely - swept:,.0f} left a cheaper listing standing "
+                    f"and were cancelled")
     store.save_prices(taken_at, prices, count_removals=fresh_data,
                       elapsed=elapsed, flow=flow)
     if fresh_data and elapsed:
@@ -1958,7 +2225,25 @@ def cmd_scan(client: BlizzardClient, store: Store, cfg: dict, out_path: str,
     else:
         log("sell prices are this scan's reading only (price_basis=current)")
 
-    velocity = store.sale_velocity(days=keep_days or 7)
+    basis = str(cfg.get("sale_basis", "likely")).lower()
+    velocity = store.sale_velocity(days=keep_days or 7, basis=basis)
+    if basis == "swept" and not velocity:
+        # Switching the basis on a database that has not yet collected a day
+        # of the ladder test would leave every craft unmeasured and quietly
+        # empty the ranking. Say so and use what there is.
+        log('sale_basis is "swept", but the ladder test has no whole day '
+            'behind it yet -- using "likely" for this scan')
+        basis = "likely"
+        velocity = store.sale_velocity(days=keep_days or 7, basis=basis)
+    signal = store.sale_signal_summary(days=keep_days or 7)
+    if signal["churn"] is not None:
+        log(f"across the stored window, {signal['churn'] * 100:.0f}% of the "
+            f"units that vanished with hours left had a cheaper listing "
+            f"standing beside them (cancellations, not sales)"
+            + (f" -- and sale_basis is \"likely\", so they are still counted; "
+               f"set it to \"swept\" to drop them"
+               if basis != "swept" else
+               f" -- sale_basis is \"swept\", so they are excluded"))
     if velocity:
         moving = sum(1 for v in velocity.values() if v > 0)
         log(f"market movement measured for {len(velocity):,} items; "
@@ -1967,9 +2252,28 @@ def cmd_scan(client: BlizzardClient, store: Store, cfg: dict, out_path: str,
     else:
         log("no movement data yet -- it needs several hours of scans behind it")
 
+    cover_days = float(cfg.get("cover_days", COVER_DAYS) or COVER_DAYS)
+    share_cfg = cfg.get("market_share")
+    market_share = float(share_cfg) if share_cfg not in (None, "", 0) else None
+    cap_turnover = float(cfg.get("demand_cap_turnover", DEMAND_CAP_TURNOVER))
     results, skipped = compute_margins(recipes, prices, names, batch=batch,
                                        min_listings=min_listings, owned=owned,
-                                       velocity=velocity)
+                                       velocity=velocity, cover_days=cover_days,
+                                       market_share=market_share,
+                                       cap_turnover=cap_turnover, rank=rank)
+    forecast = [r for r in results if r.gold_per_day is not None]
+    if forecast:
+        capped = sum(1 for r in forecast if r.demand_capped)
+        earners = sum(1 for r in forecast if (r.gold_per_day or 0) > 0)
+        log(f"{len(forecast):,} crafts have a sale rate behind them; "
+            f"{earners:,} project a positive gold/day at "
+            f"{cover_days:g} days of cover"
+            + (f" ({capped:,} had their sale rate capped at one turnover of "
+               "standing supply a day -- that is undercut churn, not demand)"
+               if capped else ""))
+    else:
+        log("no craft has a measured sale rate yet, so the table falls back "
+            "to ranking on margin -- that needs several hours of scans")
 
     store.save_margins(taken_at, results, considered=[r["id"] for r in recipes])
 
@@ -2048,9 +2352,26 @@ def cmd_scan(client: BlizzardClient, store: Store, cfg: dict, out_path: str,
 
 
 def velocity_str(per_day: Optional[float]) -> str:
+    """The measured sale rate, as a number again.
+
+    It went to a bare "moves"/"static" when the rate came from summing falls
+    in the aggregate listed quantity, which measured volatility rather than
+    trade - items came out "selling" a thousand times their own supply. That
+    method is gone: the rate now comes from individual auctions (a posting
+    that shrank was bought from; one that vanished with hours left cannot have
+    expired), which is a real per-day figure. It still counts cancellations as
+    sales, so it is capped before it gets here - see DEMAND_CAP_TURNOVER - and
+    the tooltip says what it can and cannot support.
+    """
     if per_day is None:
         return '<span class="meta">&ndash;</span>'
-    return "moves" if per_day > 0 else "static"
+    if per_day <= 0:
+        return "static"
+    if per_day >= 10:
+        return f"{per_day:,.0f}"
+    if per_day >= 1:
+        return f"{per_day:.1f}"
+    return f"{per_day:.2f}"
 
 
 def velocity_cls(per_day: Optional[float]) -> str:
@@ -2059,23 +2380,86 @@ def velocity_cls(per_day: Optional[float]) -> str:
     return "pos" if per_day > 0 else "neg"
 
 
-def velocity_tip(per_day: Optional[float]) -> str:
+def velocity_tip(per_day: Optional[float], capped: bool = False) -> str:
     if per_day is None:
-        return ("Not measured yet. This watches the listed quantity fall "
-                "between scans, so it needs several hours of scans behind it.")
+        return ("Not measured yet. This watches individual auctions between "
+                "scans, so it needs several hours of them behind it.")
     if per_day <= 0:
-        return ("The listed quantity never fell across the whole window, so "
-                "nothing left the market: no sales, and no cancellations "
-                "either. A margin you cannot realise is not a margin. The "
-                "blind spot: something restocked faster than it sells never "
-                "shows a fall, and lands here too.")
-    return ("The listed quantity fell at some point, so units did leave the "
-            "market. How MANY cannot be had from this API: cancellations look "
-            "identical to sales, and a seller posting more between two scans "
-            "hides whatever went in between. An earlier version of this "
-            "column printed a units-per-day figure and it was nonsense - "
-            "items 'sold' a thousand times their own supply - so it now says "
-            "only what it can support.")
+        return ("No auction of this item shrank or vanished early across the "
+                "whole window, so nothing left the market: no sales, and no "
+                "cancellations either. A margin you cannot realise is not a "
+                "margin. The blind spot: something restocked faster than it "
+                "sells never shows a fall, and lands here too.")
+    base = ("Units a day the whole market takes, from two signals: an auction "
+            "that survived with fewer units on it (a purchase, and nothing "
+            "else), and one that vanished while it still had hours to run (so "
+            "it cannot have expired). What neither can separate is a "
+            "cancellation, which looks exactly like a sale - measured against "
+            "live snapshots, reposts run about 5% of units, and far more than "
+            "that on thinly-listed items with big stacks. Read it as an upper "
+            "bound.")
+    if capped:
+        base += ("<br><br><strong>Capped.</strong> The raw signal claimed more "
+                 "than this item's entire standing supply changed hands every "
+                 "day, which is undercut churn rather than demand, so it is "
+                 "held at one full turnover a day.")
+    return base
+
+
+def gold_day_str(v: Optional[float]) -> str:
+    if v is None:
+        return '<span class="meta">&ndash;</span>'
+    return copper_to_gold_str(v)
+
+
+def gold_day_tip(r) -> str:
+    """Show the arithmetic, so the number can be argued with."""
+    if r.gold_per_day is None:
+        return ("No sale rate for this output yet, so there is nothing to "
+                "multiply the margin by. It is ranked below every craft that "
+                "has one rather than being guessed at.")
+    units = max(1, r.craftable_units)
+    yours = (r.demand_per_day or 0.0) * r.share
+    return (f"What this craft is worth to you per day, as opposed to per "
+            f"craft: {copper_to_gold_str(r.margin / units)} margin a unit "
+            f"&times; {velocity_str(r.demand_per_day)} units a day the market "
+            f"takes &times; your {r.share * 100:.0f}% of it = "
+            f"{copper_to_gold_str(r.gold_per_day)} a day, on {yours:.2f} units "
+            f"sold.<br><br>The share is a model, not a measurement: it treats "
+            f"you as one more seller among the {r.output_listings:,} already "
+            f"listed. One seller holding five postings reads as five "
+            f"competitors, and undercutting hard takes more than your share. "
+            f"The sale rate behind it counts cancellations as sales.")
+
+
+def restock_str(r) -> str:
+    if r.gold_per_day is None or r.restock_units <= 0:
+        return '<span class="meta">&ndash;</span>'
+    return f"{r.restock_units:,}"
+
+
+def restock_tip(r, cover_days: float) -> str:
+    if r.gold_per_day is None:
+        return ("Nothing to base a quantity on until this output has a "
+                "measured sale rate.")
+    if r.margin <= 0:
+        return ("This craft loses money at today's prices, so there is no "
+                "quantity of it worth making, however fast it sells.")
+    if r.restock_units <= 0:
+        return (f"Less than one unit would sell in {cover_days:g} days at your "
+                f"share of this market"
+                + (f", and you already hold {r.output_owned:,}."
+                   if r.output_owned else "."))
+    held = (f" You already hold {r.output_owned:,}, which is deducted."
+            if r.output_owned else "")
+    return (f"Units to have on hand to cover {cover_days:g} days of your share "
+            f"of this market.{held} Reagents for them cost about "
+            f"{copper_to_gold_str(r.restock_cost)} at today's prices - "
+            f"understated if that is much more than one batch, because buying "
+            f"in bulk eats further up the supply ladder.<br><br>It does not "
+            f"know what you already have posted at the auction house: nothing "
+            f"in the API or the addon reports your own listings yet, so a "
+            f"restock you have already made will be suggested twice.")
 
 
 def _variant_floor(r) -> Optional[float]:
@@ -2178,7 +2562,14 @@ tbody tr:hover { background: color-mix(in srgb, var(--accent) 8%, transparent); 
          border: 1px solid var(--axis); border-radius: 999px;
          font-size: 10.5px; color: var(--ink-2); vertical-align: 1px;
          cursor: help; font-weight: 500; }
-.badge.warn { border-color: var(--neg); color: var(--neg); }
+/* The .warn block below is the caveat box - 13px text and 12px padding -
+   and it is a single class selector like .badge, so being later in the sheet
+   it was winning both on every "badge warn". The result was a pill three
+   times the height of its neighbours, which read as a layout bug rather than
+   as a warning. Restated here where the two-class selector wins. */
+.badge.warn { border-color: var(--neg); color: var(--neg);
+              padding: 1px 6px; font-size: 10.5px; margin-bottom: 0;
+              background: none; border-left-width: 1px; }
 .badge.good { border-color: var(--pos); color: var(--pos); }
 .spark { display: block; }
 .reagents { font-size: 12.5px; color: var(--ink-2); padding: 4px 10px 14px 26px; }
@@ -2239,6 +2630,7 @@ const expSel = document.getElementById('exp');
 const onlyPos = document.getElementById('pos');
 const onlyFirm = document.getElementById('firm');
 const onlyMoves = document.getElementById('moves');
+const onlyLiquid = document.getElementById('liquid');
 
 function applyFilters() {
   const q = search.value.toLowerCase();
@@ -2260,13 +2652,17 @@ function applyFilters() {
       && (!onlyFirm.checked || tr.dataset.firm === '1')
       // -1 is "not measured yet", which is not the same as "does not sell" -
       // keep those, or a fresh database would show an empty table.
-      && (!onlyMoves.checked || parseFloat(tr.dataset.vel) !== 0);
+      && (!onlyMoves.checked || parseFloat(tr.dataset.vel) !== 0)
+      // One or two listings is one person's asking price. The ranking keeps
+      // those rows - thin is not wrong - but the forecast on them is fiction
+      // times a rate, so it must be one click to put them aside.
+      && (!onlyLiquid.checked || parseInt(tr.dataset.listings) >= 3);
     tr.hidden = !ok;
     if (detail && detail.classList.contains('detail')) detail.hidden = !ok;
   });
 }
 [search, profSel, expSel].forEach(el => el.addEventListener('input', applyFilters));
-[onlyPos, onlyFirm, onlyMoves].forEach(el => el.addEventListener('change', applyFilters));
+[onlyPos, onlyFirm, onlyMoves, onlyLiquid].forEach(el => el.addEventListener('change', applyFilters));
 applyFilters();   // honour the expansion the page opened on
 
 const rSearch = document.getElementById('rq');
@@ -2323,10 +2719,17 @@ def esc(s: Any) -> str:
             .replace(">", "&gt;").replace('"', "&quot;"))
 
 
-def render_bars(results: list, n: int = 15) -> str:
-    """Horizontal bar chart of margin per craft. One measure, so one hue;
+def render_bars(results: list, n: int = 15, value=None,
+                measure: str = "margin") -> str:
+    """Horizontal bar chart of one measure per craft. One measure, so one hue;
     sign is carried by the diverging pair AND by the signed label, never by
-    color alone."""
+    color alone.
+
+    `value` picks what the bar length means - margin for a single batch, or
+    expected gold a day. They rank crafts very differently and the caption
+    says which one is on screen.
+    """
+    value = value or (lambda r: r.margin)
     rows = results[:n]
     if not rows:
         return '<p class="cap">No priceable recipes.</p>'
@@ -2334,31 +2737,35 @@ def render_bars(results: list, n: int = 15) -> str:
     row_h, gap, label_w, val_w = 26, 6, 260, 78
     height = len(rows) * (row_h + gap)
     plot_w = 1000 - label_w - val_w
-    lo = min(0.0, min(r.margin for r in rows))
-    hi = max(0.0, max(r.margin for r in rows))
+    lo = min(0.0, min(value(r) for r in rows))
+    hi = max(0.0, max(value(r) for r in rows))
     span = (hi - lo) or 1.0
     zero_x = label_w + (0 - lo) / span * plot_w
 
     parts = [f'<svg class="bars" viewBox="0 0 1000 {height + 10}" '
-             f'role="img" aria-label="Top crafts by margin">']
+             f'role="img" aria-label="Top crafts by {esc(measure)}">']
     for i, r in enumerate(rows):
+        v = value(r)
         y = i * (row_h + gap)
-        x0 = label_w + (min(0, r.margin) - lo) / span * plot_w
-        w = abs(r.margin) / span * plot_w
-        color = "var(--neg)" if r.margin < 0 else "var(--pos)"
+        x0 = label_w + (min(0, v) - lo) / span * plot_w
+        w = abs(v) / span * plot_w
+        color = "var(--neg)" if v < 0 else "var(--pos)"
         name = r.crafted_item_name or r.recipe_name
         short = name if len(name) <= 34 else name[:32] + "…"
         tip = (f"<strong>{esc(name)}</strong><br>{esc(r.profession)}<br>"
                f"Cost {copper_to_gold_str(r.cost)} gold &middot; "
                f"Revenue {copper_to_gold_str(r.revenue)} gold<br>"
-               f"Margin {copper_to_gold_str(r.margin)} gold ({r.margin_pct:+.0f}%)")
+               f"Margin {copper_to_gold_str(r.margin)} gold ({r.margin_pct:+.0f}%)"
+               + (f"<br>Expected {copper_to_gold_str(r.gold_per_day)} gold a "
+                  f"day at your share of the market"
+                  if r.gold_per_day is not None else ""))
         parts.append(
             f'<text x="{label_w - 10}" y="{y + row_h * 0.7:.0f}" '
             f'text-anchor="end">{esc(short)}</text>'
             f'<rect class="mark" x="{x0:.1f}" y="{y}" width="{max(w, 2):.1f}" '
             f'height="{row_h}" fill="{color}" data-tip="{esc(tip)}"/>'
             f'<text class="val" x="{1000 - 8}" y="{y + row_h * 0.7:.0f}" '
-            f'text-anchor="end">{copper_to_gold_str(r.margin)}</text>')
+            f'text-anchor="end">{copper_to_gold_str(v)}</text>')
     parts.append(f'<line class="zero" x1="{zero_x:.1f}" y1="0" '
                  f'x2="{zero_x:.1f}" y2="{height}"/>')
     parts.append("</svg>")
@@ -2641,14 +3048,27 @@ def write_addon_prices(path: str, results: list, prices: dict, recipes: list,
     lines.append("range = {" + ",".join(swings) + "},")
 
     # Per single craft, so the number means something regardless of --batch.
+    #
+    # Gold/day and the restock quantity are the exception and are NOT divided:
+    # they are already whole-market-per-day figures, and dividing them by the
+    # batch size would produce a number that means nothing at all.
+    #
+    # They are preceded by a 0/1 flag rather than marked with a sentinel
+    # value, because every candidate sentinel is a number gold/day can
+    # honestly take: it is negative on a craft that loses money at a rate, and
+    # zero on one whose output nothing has been seen buying. Both are
+    # measurements, and neither may be shown as "unknown".
     margins = []
     for r in results:
         if not r.crafted_item_id or batch <= 0:
             continue
+        measured = r.gold_per_day is not None
         margins.append(
             f"[{r.crafted_item_id}]={{{int(r.cost / batch)},"
             f"{int(r.revenue / batch)},{r.margin_pct:.0f},"
-            f"{1 if r.cost_complete else 0},{r.optionals_filled}}}")
+            f"{1 if r.cost_complete else 0},{r.optionals_filled},"
+            f"{1 if measured else 0},"
+            f"{int(r.gold_per_day) if measured else 0},{r.restock_units}}}")
     lines.append("margin = {" + ",".join(margins) + "},")
     lines.append("}")
 
@@ -2667,8 +3087,8 @@ def render_dashboard(results: list, cfg: dict, taken_at: int, skipped: dict,
     # "best margin" would put a number on the page that nobody can achieve.
     firm = [r for r in results if r.cost_complete]
     floor_only = [r for r in results if not r.cost_complete]
+    cover_days = float(cfg.get("cover_days", COVER_DAYS) or COVER_DAYS)
     profitable = [r for r in firm if r.margin > 0]
-    best = firm[0] if firm else None
     when = time.strftime("%Y-%m-%d %H:%M", time.localtime(taken_at))
     # Built from the rows the table actually renders, not from every result.
     # Offering a filter that selects nothing because its crafts fell outside
@@ -2705,14 +3125,28 @@ def render_dashboard(results: list, cfg: dict, taken_at: int, skipped: dict,
             shown.append(r)
             seen.add(r.recipe_id)
 
-    shown.sort(key=lambda x: (x.cost_complete, x.margin), reverse=True)
+    # `results` arrives ranked (gold per day by default, margin under
+    # --rank margin). Re-sorting on a key of our own here would quietly
+    # disagree with the ranking that decided which rows got in, so the
+    # table simply keeps that order.
+    order = {r.recipe_id: i for i, r in enumerate(results)}
+    shown.sort(key=lambda x: order.get(x.recipe_id, len(order)))
     profs = sorted({r.profession for r in shown if r.profession})
 
+    # Ranked first, which under the default ranking means best gold per day.
+    earner = next((r for r in firm if r.gold_per_day is not None), None)
+    by_margin = max(firm, key=lambda r: r.margin) if firm else None
     tiles = [
         ("Profitable crafts", f"{len(profitable):,}",
          f"of {len(firm):,} fully costed"),
-        ("Best margin", copper_to_gold_str(best.margin) if best else "-",
-         f"gold &middot; {esc(best.crafted_item_name)}" if best else "gold"),
+        ("Best gold/day",
+         copper_to_gold_str(earner.gold_per_day) if earner else "-",
+         f"gold &middot; {esc(earner.crafted_item_name)}" if earner
+         else "needs a few hours of scans"),
+        ("Best margin",
+         copper_to_gold_str(by_margin.margin) if by_margin else "-",
+         f"gold &middot; {esc(by_margin.crafted_item_name)}" if by_margin
+         else "gold"),
         ("Median margin",
          f"{sorted(r.margin_pct for r in profitable)[len(profitable) // 2]:+.0f}%"
          if profitable else "-", "profitable crafts only"),
@@ -2767,6 +3201,23 @@ def render_dashboard(results: list, cfg: dict, taken_at: int, skipped: dict,
                 f'made these margins look impossible. Slot something dearer '
                 f'and the margin drops.">{r.optionals_filled} optional filled'
                 f'</span>')
+        # A forecast is only as good as the market under it. With one or two
+        # listings the sale price is one person's asking price, the share
+        # model hands you a third to a half of a market that barely exists,
+        # and a single auction vanishing across a week becomes a rate. The
+        # ranking does not hide these rows - thin is not the same as wrong,
+        # and transmog markets are genuinely thin - but it should not let them
+        # pass for measured either.
+        if r.output_listings < SHARE_THIN_LISTINGS:
+            rank_badge += (
+                f'<span class="badge warn" data-tip="This output has '
+                f'{r.output_listings} listing(s). That is not enough to be a '
+                f'market: the price comes from those listings alone, so the '
+                f'margin is mostly whatever they are asking, and any gold/day '
+                f'built on it inherits that. The share model also hands you '
+                f'{r.share * 100:.0f}% of it, which is arithmetic rather than '
+                f'a forecast. Check this one in game, or re-run with '
+                f'--min-listings 3.">thin market</span>')
         if not r.cost_complete:
             rank_badge += (
                 '<span class="badge warn" data-tip="This recipe has optional or '
@@ -2823,7 +3274,10 @@ def render_dashboard(results: list, cfg: dict, taken_at: int, skipped: dict,
             f'data-margin="{r.margin:.0f}" '
             f'data-pct="{r.margin_pct:.2f}" data-cost="{r.cost:.0f}" '
             f'data-rev="{r.revenue:.0f}" data-supply="{r.output_supply}" '
-            f'data-vel="{-1 if r.output_sold_per_day is None else r.output_sold_per_day:.4f}">'
+            f'data-vel="{-1 if r.demand_per_day is None else r.demand_per_day:.4f}" '
+            f'data-gpd="{r.gold_per_day if r.gold_per_day is not None else -1e18:.0f}" '
+            f'data-restock="{r.restock_units}" '
+            f'data-listings="{r.output_listings}">'
             f'<td class="num meta">{i}</td>'
             f'<td><div class="name">{esc(r.crafted_item_name)}{rank_badge}</div>'
             f'<div class="meta">{esc(r.profession)} &middot; {esc(r.skill_tier)}</div></td>'
@@ -2831,12 +3285,18 @@ def render_dashboard(results: list, cfg: dict, taken_at: int, skipped: dict,
             f'<td class="num">{copper_to_gold_str(r.revenue)}</td>'
             f'<td class="num {cls}">{copper_to_gold_str(r.margin)}</td>'
             f'<td class="num {cls}">{r.margin_pct:+.0f}%</td>'
-            f'<td class="num {velocity_cls(r.output_sold_per_day)}" '
-            f'data-tip="{esc(velocity_tip(r.output_sold_per_day))}">'
-            f'{velocity_str(r.output_sold_per_day)}</td>'
+            f'<td class="num {velocity_cls(r.demand_per_day)}" '
+            f'data-tip="{esc(velocity_tip(r.demand_per_day, r.demand_capped))}">'
+            f'{velocity_str(r.demand_per_day)}'
+            + ('<span class="meta"> capped</span>' if r.demand_capped else '')
+            + f'</td>'
+            f'<td class="num {"pos" if (r.gold_per_day or 0) > 0 else "neg" if r.gold_per_day is not None else "meta"}" '
+            f'data-tip="{esc(gold_day_tip(r))}">{gold_day_str(r.gold_per_day)}</td>'
+            f'<td class="num" data-tip="{esc(restock_tip(r, cover_days))}">'
+            f'{restock_str(r)}</td>'
             f'<td class="num meta">{r.output_supply:,}</td>'
             f'<td>{render_spark(history.get(r.recipe_id, []))}</td></tr>'
-            f'<tr class="detail"><td></td><td colspan="8"><details>'
+            f'<tr class="detail"><td></td><td colspan="10"><details>'
             f'<summary>reagent bill for {batch} crafts (gold)</summary>'
             f'<div class="reagents">{reagent_bill}</div></details></td></tr>')
 
@@ -2908,6 +3368,29 @@ def render_dashboard(results: list, cfg: dict, taken_at: int, skipped: dict,
             f"crafts, and kept out of every headline figure and the chart "
             f"above. On current content that is most of the list &mdash; which "
             f"is a statement about the API, not about the market.")
+    # The chart follows the ranking. On a fresh database nothing has a sale
+    # rate yet, so it falls back to margin rather than rendering an empty card.
+    chart_pool = [r for r in firm if r.gold_per_day is not None]
+    if chart_pool:
+        chart_pool.sort(key=lambda r: r.gold_per_day, reverse=True)
+        chart_heading = (f"Top {min(15, len(chart_pool))} fully costed crafts "
+                         f"by expected gold per day")
+        chart_caption = (
+            f"Gold a day after the auction house cut: margin per unit &times; "
+            f"the units a day the market takes &times; your modelled share of "
+            f"it. This is what the table ranks on, because a {batch}-craft "
+            f"batch of something nobody buys is not income.")
+        chart_html = render_bars(chart_pool, value=lambda r: r.gold_per_day,
+                                 measure="expected gold per day")
+    else:
+        chart_heading = f"Top {min(15, len(firm))} fully costed crafts by margin"
+        chart_caption = (
+            f"Profit in gold after the auction house cut, for one batch of "
+            f"{batch} crafts. No output has a measured sale rate yet, so this "
+            f"is still ranked on margin alone - run a few more scans and it "
+            f"switches to gold per day.")
+        chart_html = render_bars(firm)
+
     caveats = f"""
 <div class="warn">
 <strong>Read the numbers with these limits in mind.</strong>
@@ -2917,9 +3400,16 @@ single listing. But <strong>Blizzard's recipe endpoint does not expose crafting
 quality ranks</strong> &mdash; every rank of a craft reports the same output item &mdash;
 so a rank&nbsp;1 and a rank&nbsp;3 craft are indistinguishable here.{collapsed_txt}{named_txt}
 {floor_txt}
-The model also does not know about inspiration, resourcefulness, multicraft, personal
-or patron crafting orders, or whether a listed item actually sells. Treat high margins
-as leads to check in-game, not as gold in the bank. Skipped this run:
+The model also does not know about inspiration, resourcefulness, multicraft, or personal
+and patron crafting orders. Treat high margins as leads to check in-game, not as gold in
+the bank.
+<br><strong>Gold/day and Craft are projections, not measurements.</strong> Both rest on a
+sale rate that cannot tell a cancelled auction from a sold one (so it reads high, and is
+capped at one full turnover of standing supply a day), and on a share of the market
+modelled as one more seller among those already listed. Neither knows what you already
+have posted, whether you can hit the crafting quality that sets the price, or that a
+transmute-sourced reagent is limited to one a day. They are a better question than
+"which margin is biggest", not an answer. Skipped this run:
 {skipped.get('no_output_price', 0):,} with no output listed,
 {skipped.get('no_reagent_price', 0):,} with an unpriceable reagent{thin_txt}.
 {thin_note}
@@ -2938,12 +3428,11 @@ as leads to check in-game, not as gold in the bank. Skipped this run:
 <div class="tiles">{tile_html}</div>
 {caveats}
 <div class="card">
-<h2>Top {min(15, len(firm))} fully costed crafts by margin</h2>
-<p class="cap">Profit in gold after the auction house cut, for one batch of
-{batch} crafts. Blue is profit, red is loss; the signed value repeats it in text.
-<em>k</em> = thousand gold, <em>M</em> = million. Crafts with reagent slots are
-excluded here because their cost is only a floor{floor_chart_note}.</p>
-{render_bars(firm)}
+<h2>{chart_heading}</h2>
+<p class="cap">{chart_caption} Blue is profit, red is loss; the signed value
+repeats it in text. <em>k</em> = thousand gold, <em>M</em> = million.
+Crafts with reagent slots are excluded here because their cost is only a floor{floor_chart_note}.</p>
+{chart_html}
 </div>
 <div class="card">
 <h2>Reagents to buy</h2>
@@ -2958,11 +3447,16 @@ slots are a choice, not a shopping list. Click a column header to sort.</p>
 </div>
 <div class="card">
 <h2>All priced crafts</h2>
-<p class="cap">Showing the top {len(shown):,} of {len(results):,} priced crafts.
-Click a column header to sort. Expand a row for its reagent bill. The dropdowns
-only list what is on this page &mdash; to dig into an expansion whose crafts fall
-below the cut, scan it on its own with <code>--tier</code>, or raise
-<code>--top</code>.</p>
+<p class="cap">Showing the top {len(shown):,} of {len(results):,} priced crafts,
+ranked by <strong>Gold/day</strong> &mdash; margin per unit &times; the units a
+day that market takes &times; your share of it &mdash; with crafts that have no
+measured sale rate yet ranked below those that do, and floor-costed crafts below
+both.
+<strong>Craft</strong> is how many units to make now: {cover_days:g} days of cover at your share,
+less what you already hold. Hover either for the arithmetic. Click a column header to sort. Expand a row for its reagent bill.
+The dropdowns only list what is on this page &mdash; to dig into an expansion
+whose crafts fall below the cut, scan it on its own with <code>--tier</code>, or
+raise <code>--top</code>.</p>
 <div class="controls">
 <input id="q" type="search" placeholder="Filter by item name&hellip;" style="min-width:220px">
 <select id="prof"><option value="">All professions</option>{prof_opts}</select>
@@ -2970,6 +3464,7 @@ below the cut, scan it on its own with <code>--tier</code>, or raise
 <label><input id="pos" type="checkbox" checked> Profitable only</label>
 <label><input id="firm" type="checkbox"> Fully costed only</label>
 <label title="Hides crafts whose output has not shifted a single unit across the stored days. Rows with no measurement yet are kept."><input id="moves" type="checkbox"> Actually sells</label>
+<label title="Hides crafts whose output has fewer than three separate listings. One or two listings is one person's asking price, not a market - and both the margin and the gold/day built on it inherit that."><input id="liquid" type="checkbox"> Liquid markets only</label>
 </div>
 <table><thead><tr>
 <th class="num">#</th><th data-key="name">Item</th>
@@ -2977,7 +3472,9 @@ below the cut, scan it on its own with <code>--tier</code>, or raise
 <th class="num" data-key="rev">Revenue (g)</th>
 <th class="num" data-key="margin">Margin (g)</th>
 <th class="num" data-key="pct">Margin %</th>
-<th class="num" data-key="vel">Moves</th>
+<th class="num" data-key="vel">Sells/day</th>
+<th class="num" data-key="gpd">Gold/day</th>
+<th class="num" data-key="restock">Craft</th>
 <th class="num" data-key="supply">Supply</th>
 <th>History</th>
 </tr></thead><tbody id="rows">{''.join(rows_html)}</tbody></table>
@@ -3685,7 +4182,26 @@ def cmd_demo(out_path: str, batch: int, top: int) -> None:
                              "buyout": base * rng.uniform(0.9, 1.6)})
 
     prices = build_price_index(auctions, "commodity")
-    results, skipped = compute_margins(recipes, prices, item_names, batch=batch)
+    # Fabricated sale rates, so the demo shows the Gold/day and Craft columns
+    # doing their job rather than a page of dashes. A third of the outputs are
+    # given nothing at all, because "not measured yet" is a state the page has
+    # to show honestly and this is where you would see it.
+    velocity = {}
+    for i, r in enumerate(recipes):
+        out = r["crafted_item_id"]
+        listed = prices[out].total_quantity if out in prices else 0
+        roll = rng.random()
+        if roll < 0.3:
+            continue                      # not measured yet
+        if roll < 0.42:
+            velocity[out] = 0.0           # watched, and nothing moved
+            continue
+        # A believable fraction of standing supply per day - and one item
+        # deliberately over the cap, because "capped" is a state worth seeing.
+        turnover = 8.0 if i == 1 else rng.uniform(0.05, 0.6)
+        velocity[out] = round(max(0.2, listed * turnover), 2)
+    results, skipped = compute_margins(recipes, prices, item_names,
+                                       batch=batch, velocity=velocity)
 
     # Fabricate a little history so the sparklines have something to draw.
     now = int(time.time())
@@ -4374,6 +4890,25 @@ DEFAULT_CONFIG = {
     # 7 means a week of daily readings. 0 keeps everything, which grows the
     # database indefinitely.
     "history_days": 7,
+    # How many days of stock the restock target ("Craft") aims to cover, and
+    # what share of an item's daily volume you assume you take. Leave
+    # market_share at 0 and it is worked out per item as 1 / (listings + 1) -
+    # you as one more seller among those already posted, so a crowded market
+    # promises you less. demand_cap_turnover caps a measured sale rate at that
+    # many times the item's standing supply per day; the raw signal counts
+    # cancellations as sales, and on thin listings with big stacks that is
+    # most of it.
+    "cover_days": COVER_DAYS,
+    "market_share": 0,
+    "demand_cap_turnover": DEMAND_CAP_TURNOVER,
+    # Which sale signal the rate is built on. "likely" counts every auction
+    # that vanished with hours still to run, which cannot have expired but can
+    # have been cancelled. "swept" counts only the ones that went from below
+    # the cheapest listing that survived the interval - what a buyer eating up
+    # the ladder can actually account for - so undercut churn drops out. Both
+    # are stored on every scan either way; this only chooses which one the
+    # ranking reads. Watch the churn figure the scan prints before switching.
+    "sale_basis": "likely",
     # "market" smooths the sell price over the stored history, weighted
     # towards recent days, so one seller undercutting hard for an hour does
     # not become the price. "current" uses this scan's reading alone, which is
@@ -4472,6 +5007,23 @@ def main(argv: Optional[list] = None) -> int:
                          "mostly fiction: on a full scan, outputs with 1-2 "
                          "listings ran to a +3,623%% median margin against "
                          "+45%% at 10 or more. Try 3 to cut the worst of it.")
+    ap.add_argument("--rank", choices=["gold-day", "margin"], default="gold-day",
+                    help="what the table ranks on, which also decides which "
+                         "crafts survive --top. gold-day (default) is margin "
+                         "per unit times what you could sell of it in a day, "
+                         "so a modest margin that moves beats a huge one that "
+                         "does not. margin restores the old ordering.")
+    ap.add_argument("--cover-days", type=float, default=0.0, metavar="N",
+                    help=f"how many days of stock the Craft column aims to "
+                         f"cover (default {COVER_DAYS:g}, or cover_days in "
+                         f"config.json). Shorter is safer: an undercut war or "
+                         f"a patch should not catch you holding a month of "
+                         f"inventory.")
+    ap.add_argument("--market-share", type=float, default=0.0, metavar="F",
+                    help="assume you take this fraction of each item's daily "
+                         "volume (e.g. 0.25) instead of the default 1 in "
+                         "(listings + 1), which treats you as one more seller "
+                         "among those already posted.")
     # These narrow a single scan without touching config.json or the cache.
     # `init` caches everything once; these decide what you look at afterwards.
     ap.add_argument("-t", "--tier", action="append", metavar="NAME",
@@ -4568,8 +5120,12 @@ def main(argv: Optional[list] = None) -> int:
         elif args.command == "names":
             cmd_names(client, store, run_cfg)
         else:
+            if args.cover_days:
+                run_cfg["cover_days"] = args.cover_days
+            if args.market_share:
+                run_cfg["market_share"] = args.market_share
             cmd_scan(client, store, run_cfg, args.out, args.batch, args.top,
-                     args.min_listings, args.publish)
+                     args.min_listings, args.publish, rank=args.rank)
     except ApiError as exc:
         log(f"error: {exc}")
         return 2
