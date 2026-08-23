@@ -12,7 +12,7 @@ name: hourly scan
 # collect a publish that arrives up to forty minutes behind schedule.
 on:
   schedule:
-    - cron: "23 * * * *"
+    - cron: "20,50 * * * *"     # was "23 * * * *"
   # Patch day: tick `init` to re-cache recipe definitions before scanning.
   # Deliberately part of this workflow rather than one of its own, so the
   # `pages` concurrency group serialises it against the hourly cron - two jobs
