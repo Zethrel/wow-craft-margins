@@ -117,6 +117,14 @@ must("shows what the craft is worth per day",
 must("and how many to make now", any("Make now :: 6" in x for x in out))
 must("stamps the age", any("wowcraft - " in x for x in out))
 must("age is human readable", any(("m ago" in x or "h ago" in x or "just now" in x) for x in out))
+# And it is the age of the PRICES. The writer used to be handed the taken_at
+# day bucket, i.e. local midnight, so the tooltip reported the hours since
+# midnight instead - "4h ago" at four in the morning on data twenty minutes
+# old. The harness clock is exactly an hour past the stamp below.
+must("the file carries the timestamp it was given",
+     "updated = 1786738810," in open(REAL, encoding="utf-8").read())
+must("and the tooltip turns it into a real age",
+     any("wowcraft - 60m ago" in x for x in out))
 print("   sample:", [x for x in out][:4])
 
 # The three states of the forecast, which must not look alike on a tooltip:

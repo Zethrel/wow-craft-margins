@@ -1018,6 +1018,14 @@ fresh as your last `/reload`**. Every number is stamped with its age for that
 reason — "22m ago" rather than a bare figure pretending to be current.
 `/wcprices` reports what is loaded.
 
+That age is the age of the **prices**, taken from Blizzard's own
+`Last-Modified`. It used to be stamped with `taken_at`, the day bucket the
+rest of the pipeline keys history on — which is local midnight, so the tooltip
+was quietly reporting the hours since midnight instead: "4h ago" at four in
+the morning on data twenty minutes old, and "23h ago" late at night, on the
+same data. `pricecheck.py` reads `last_data_time` for exactly this reason and
+always has; the addon writer had never been given it.
+
 **It does not scan the auction house.** In-client scanning is throttled, needs
 you parked at an auctioneer, and only sees your realm. The API already gives
 region-wide prices hourly from a cron job, so prices stay where they are. The

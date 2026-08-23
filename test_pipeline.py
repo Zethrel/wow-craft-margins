@@ -700,6 +700,28 @@ store4.db.commit()
 must("an id only in an older snapshot is not counted",
      store4.unclassed_priced_items() == 1)
 
+# ---------------------------------------------------------------------------
+# The addon's age stamp is the DATA's timestamp, not the day bucket
+# ---------------------------------------------------------------------------
+# taken_at is local midnight, so stamping PriceData.lua with it made the
+# in-game tooltip report the hours since midnight rather than the age of the
+# prices: "4h ago" at four in the morning on data twenty minutes old, and
+# "23h ago" late at night. That is precisely the failure the stamp exists to
+# prevent - pricecheck.py reads last_data_time for the same reason, and the
+# addon writer had simply never been given it.
+addon_dir = tempfile.mkdtemp()
+stamp = 1_700_000_000 + 3 * 86400 + 11 * 3600      # mid-morning, not midnight
+assert stamp != W.day_bucket(stamp)                # or this proves nothing
+c_addon = FullClient(); c_addon.stamp = stamp
+with contextlib.redirect_stdout(buf):
+    W.cmd_scan(c_addon, store, dict(cfg, addon_path=addon_dir), out,
+               batch=5, top=50)
+written = open(os.path.join(addon_dir, "PriceData.lua"), encoding="utf-8").read()
+must("the addon file stamps the data's own time",
+     f"updated = {stamp}," in written)
+must("and never the day bucket, which is midnight",
+     f"updated = {W.day_bucket(stamp)}," not in written)
+
 print()
 print("ALL PASS" if not fails else f"{len(fails)} FAILURES: {fails}")
 sys.exit(1 if fails else 0)
