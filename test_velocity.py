@@ -203,7 +203,37 @@ report = sumry.sale_signal_summary(days=7)
 must("the summary totals what was stored",
      (report["likely"], report["swept"]) == (100.0, 40.0))
 must("and states the churn share", abs(report["churn"] - 0.6) < 1e-9)
+
+# The two sources are not measured with the same confidence and one number
+# hides it. Commodity buying goes through a cheapest-first purchase call, so
+# "gone from below a surviving cheaper listing" is literally what a buyer
+# does. On realm auctions the buyer picks a listing, and two postings of one
+# item id can be different bonus-list variants at honestly different prices -
+# so a buyer taking the dearer one is recorded here as a cancellation. That
+# has to be visible rather than averaged away.
+sumry.db.execute("INSERT INTO price_snapshot(taken_at,item_id,source,"
+                 "sell_unit_price,total_quantity,sold_likely,sold_swept,"
+                 "seconds_covered) VALUES(?,?,?,?,?,?,?,?)",
+                 (today, 2, "realm", 100, 10, 200.0, 20.0, 3600))
+sumry.db.commit()
+split = sumry.sale_signal_summary(days=7)
+must("the summary breaks the churn down by source",
+     set(split["by_source"]) == {"commodity", "realm"})
+must("the commodity figure is the commodity rows alone",
+     abs(split["by_source"]["commodity"]["churn"] - 0.6) < 1e-9)
+must("and the realm figure is its own",
+     abs(split["by_source"]["realm"]["churn"] - 0.9) < 1e-9)
+must("while the headline still covers both",
+     abs(split["churn"] - (1 - 60.0 / 300.0)) < 1e-9)
 sumry.close()
+
+# The default is a measurement, not a preference: on live data "likely" was
+# counting about 3.2x more than the ladder test could account for, and
+# gold/day multiplies by it. A future edit that quietly restores "likely"
+# would inflate every projection on the dashboard without changing a number
+# anyone would look at twice, so it is pinned here.
+must("the shipped default reads the ladder-tested signal",
+     W.DEFAULT_CONFIG["sale_basis"] == "swept")
 
 # ---- 2. velocity is units per unit of OBSERVED time ------------------
 s = W.Store(os.path.join(tmp, "rate.sqlite3"))
