@@ -117,19 +117,51 @@ def texts(lua):
     return [v for v in lua.eval("drawn").values()]
 
 
+def count(lua, name):
+    """How many entries the Lua table `name` holds.
+
+    len(list(...)) rather than len(...) straight off .values(): lupa used to
+    return a list there and now returns an iterator (lupa.luaXX._LuaIter),
+    which has no length. Wrapping in list() works under both, so this is not
+    a version check - it is just the spelling that does not care.
+
+    This is the whole reason two suites passed on the machine where they were
+    written and failed in CI: nothing about the addon differed, only the lupa
+    that happened to be installed.
+    """
+    return len(list(lua.eval(name).values()))
+
+
 # ---- 1. it opens, and it leads with what earns ---------------------------
 lua = fresh()
 lua.eval("SlashCmdList")["WCCRAFT"]("")
 out = texts(lua)
 rows = [t for t in out if not t.startswith("TIP:")]
 must("the list draws something", len(rows) > 0)
+
+
+def row_of(rows, name):
+    """Index of the row naming `name`, or None.
+
+    By content, never by position. The window draws a title first and a
+    footer last, and each craft takes two rows - so anything that counted
+    from zero would break the moment a line was added above it, which is
+    exactly what happened: these assertions were written against a window
+    with no title and started failing in CI the day one was added, while
+    still passing on the machine where the addon had been eyeballed.
+    """
+    return next((i for i, t in enumerate(rows) if name in t), None)
+
+
+lead = row_of(rows, "Bread and Butter")
+others = [row_of(rows, n) for n in ("Quiet Trinket", "Slotted Thing")]
 must("the earner leads, not the biggest margin",
-     "Bread and Butter" in rows[0])
+     lead is not None and all(o is None or lead < o for o in others))
 # The file says the market wants six. Two are in the bag and one is
 # listed, so three is what is left to make - subtracted here, from live
 # counts, because a PriceData.lua built in the cloud never saw either.
 must("and carries what it earns a day and how many to make",
-     "/day" in rows[1] and "x3" in rows[1])
+     lead is not None and "/day" in rows[lead + 1] and "x3" in rows[lead + 1])
 
 # A craft nothing has been seen buying all week is not what to make now,
 # whatever its margin - this one's is ninety times the leader's. Hidden by
@@ -160,8 +192,10 @@ must("the reachable rank is shown where the client knows it",
 
 # The header has to say how old the numbers are: a ranked list reads as an
 # instruction, and an instruction from four-hour-old prices is a bad one.
+# "60m ago", not the word "prices" - the footer had been reworded and this
+# was still matching against the old phrasing.
 must("the window states the age of the prices",
-     any("prices" in t and "ago" in t for t in out))
+     any("ago" in t for t in out))
 must("and how much of what you know was priced",
      any("of 6 priced" in t for t in out))
 
@@ -171,9 +205,9 @@ must("and how much of what you know was priced",
 first_row = next(f for f in lua.eval("frames").values()
                  if getattr(f, "entry", None) is not None)
 first_row.OnClick(first_row)
-must("clicking a row links the item", len(lua.eval("linked").values()) == 1)
-must("and sends nothing", len(lua.eval("sent").values()) == 0)
-must("and whispers nobody", len(lua.eval("tells").values()) == 0)
+must("clicking a row links the item", count(lua, "linked") == 1)
+must("and sends nothing", count(lua, "sent") == 0)
+must("and whispers nobody", count(lua, "tells") == 0)
 
 # ---- 3. `all` shows the ugly rows too -----------------------------------
 lua2 = fresh()

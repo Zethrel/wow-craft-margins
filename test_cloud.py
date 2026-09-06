@@ -908,11 +908,18 @@ def release_check(cfg_extra, tag, zip_status):
 
     W._latest_release_tag = lambda repo, timeout=20: tag
     urllib.request.urlopen = fake_open
+    # GITHUB_REPOSITORY is set on every Actions runner, and _site_urls falls
+    # back to it when the config names no repo. A test that did not control
+    # that passed here and failed in CI - which is exactly the sort of "works
+    # on my machine" this suite exists to catch, so it controls it.
+    had = os.environ.pop("GITHUB_REPOSITORY", None)
     out = []
     try:
         W._doctor_release(dict(local_cfg, **cfg_extra), out.append)
     finally:
         W._latest_release_tag, urllib.request.urlopen = real_tag, real_open
+        if had is not None:
+            os.environ["GITHUB_REPOSITORY"] = had
     return "\n".join(out)
 
 
@@ -949,6 +956,27 @@ must("no repo_url is not-configured rather than a failure",
      "not set" in absent and "FAIL" not in absent)
 must("the section is numbered so the report stays readable",
      "[C5]" in good)
+
+# Where the links come from, stated rather than assumed. This is what made
+# the check above environment-dependent, so it gets its own assertions.
+_had = os.environ.pop("GITHUB_REPOSITORY", None)
+try:
+    must("with nothing configured and no CI env, there are no links",
+         W._site_urls({}) == ("", ""))
+    os.environ["GITHUB_REPOSITORY"] = "Someone/Some-Repo"
+    site, repo = W._site_urls({})
+    must("a CI run derives the Pages URL from GITHUB_REPOSITORY",
+         site == "https://someone.github.io/Some-Repo/")
+    must("and the repository URL too",
+         repo == "https://github.com/Someone/Some-Repo")
+    cfg_site, cfg_repo = W._site_urls(
+        {"site_url": "https://example.invalid/x/", "repo_url": "https://h/r"})
+    must("but an explicit config wins over the environment",
+         cfg_site == "https://example.invalid/x/" and cfg_repo == "https://h/r")
+finally:
+    os.environ.pop("GITHUB_REPOSITORY", None)
+    if _had is not None:
+        os.environ["GITHUB_REPOSITORY"] = _had
 
 # No pull_url at all is a normal state, not an error.
 report = []

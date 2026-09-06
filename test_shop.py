@@ -137,6 +137,21 @@ def texts(lua):
     return [v for v in lua.eval("drawn").values() if not v.startswith("TIP:")]
 
 
+def count(lua, name):
+    """How many entries the Lua table `name` holds.
+
+    len(list(...)) rather than len(...) straight off .values(): lupa used to
+    return a list there and now returns an iterator (lupa.luaXX._LuaIter),
+    which has no length. Wrapping in list() works under both, so this is not
+    a version check - it is just the spelling that does not care.
+
+    This is the whole reason two suites passed on the machine where they were
+    written and failed in CI: nothing about the addon differed, only the lupa
+    that happened to be installed.
+    """
+    return len(list(lua.eval(name).values()))
+
+
 lua = fresh()
 lua.eval("SlashCmdList")["WCSHOP"]()
 rows = texts(lua)
@@ -224,9 +239,9 @@ must("and does not run the search", True)   # SendBrowseQuery would have errored
 lua.execute("AuctionHouseFrame.shown = false")
 first.OnClick(first)
 must("with the auction house closed it links the item instead",
-     len(lua.eval("linked").values()) == 1)
+     count(lua, "linked") == 1)
 must("and still searches nothing",
-     len(lua.eval("searched").values()) == 1)
+     count(lua, "searched") == 1)
 
 # ---- the empty states say which thing is missing ------------------------
 def reason(setup):
