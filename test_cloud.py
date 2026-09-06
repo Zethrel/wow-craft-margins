@@ -19,7 +19,9 @@ import http.server
 import io
 import json
 import os
+import shutil
 import sqlite3
+import struct
 import tempfile
 import threading
 import time
@@ -379,6 +381,151 @@ must("the columns it never had come through empty, not broken",
                  (today - 5 * DAY,)).fetchone()[0] is None)
 leg.close()
 
+# ---- 6b2. a damaged local database ----------------------------------
+# The real one. Two rows went missing from price_snapshot's primary-key index
+# on a machine that had been scanning for weeks. Nothing announced it: every
+# count and every scan still returned the right answer, because they read the
+# table. Only DISTINCT reads the index, and it handed back an empty blob that
+# had never been stored - which the history carry compared against an integer
+# and died on. `pull` then aborted before the swap, every hour, for six days,
+# while the dashboard it had already written kept updating and the tooltip in
+# game kept quoting week-old prices.
+#
+# Three things have to hold now: a damaged file is spotted, it does not stop
+# the pull, and there is a command that fixes it in place for the machine
+# that scans - where there is no fresh copy coming to replace it.
+
+
+def break_index(path, table):
+    """Empty out a table's primary-key index without touching its rows.
+
+    Byte surgery, because sqlite has no way to ask for a broken index - but
+    only over numbers read out of the file itself (the index's root page and
+    the page size), so it does not depend on a version or a build. The page
+    it writes is a structurally valid empty index leaf: sqlite reads it
+    happily and reports every row as missing, which is the fault that
+    actually happened rather than a shredded file.
+    """
+    db = sqlite3.connect(path)
+    root = db.execute("SELECT rootpage FROM sqlite_master WHERE type='index' "
+                      "AND tbl_name=? AND name LIKE 'sqlite_autoindex%'",
+                      (table,)).fetchone()[0]
+    size = db.execute("PRAGMA page_size").fetchone()[0]
+    db.close()
+    page = bytearray(size)
+    page[0] = 0x0A                                      # leaf index page
+    page[5:7] = struct.pack(">H", size % 65536)         # cell content start
+    data = bytearray(open(path, "rb").read())
+    data[(root - 1) * size:root * size] = page
+    with open(path, "wb") as fh:
+        fh.write(data)
+
+
+must("a healthy database reports no faults", W._integrity_faults(local_db) == [])
+
+broken = os.path.join(tmp, "broken.sqlite3")
+shutil.copyfile(local_db, broken)
+break_index(broken, "price_snapshot")
+faults = W._integrity_faults(broken)
+must("a damaged index is detected", len(faults) > 0)
+must("and named in terms of the table it belongs to",
+     any("price_snapshot" in f for f in faults))
+
+# What the rebuild is for: the rows are all still there, and reading them
+# through anything but the index proves it.
+rebuilt = os.path.join(tmp, "rebuilt.sqlite3")
+lost = W._rebuild_database(broken, rebuilt)
+must("the rebuild produces a healthy database",
+     W._integrity_faults(rebuilt) == [])
+must("and loses nothing", lost == {})
+_a = sqlite3.connect(rebuilt)
+must("with every row back",
+     _a.execute("SELECT COUNT(*) FROM price_snapshot").fetchone()[0] > 0)
+must("and the local-only table intact",
+     dict(_a.execute("SELECT item_id, quantity FROM inventory"))
+     == {2001: 42, 2002: 7})
+_a.close()
+os.remove(rebuilt)
+
+# A pull over the damaged file has to finish. This is the six days.
+dmg = os.path.join(tmp, "damaged")
+os.makedirs(dmg, exist_ok=True)
+dmg_db = os.path.join(dmg, "wowcraft.sqlite3")
+shutil.copyfile(local_db, dmg_db)
+break_index(dmg_db, "price_snapshot")
+with contextlib.redirect_stderr(dlog := io.StringIO()):
+    with contextlib.redirect_stdout(quiet):
+        rc = W.cmd_pull(url, dict(local_cfg, history_days=7), dmg_db,
+                        os.path.join(dmg, "dashboard.html"), force=True)
+must("a pull over a damaged database still succeeds", rc == 0)
+must("and says so rather than repairing it silently",
+     "damaged" in dlog.getvalue())
+_d = sqlite3.connect(dmg_db)
+must("the database it leaves behind is healthy",
+     W._integrity_faults(dmg_db) == [])
+must("and the local-only table came across anyway",
+     dict(_d.execute("SELECT item_id, quantity FROM inventory"))
+     == {2001: 42, 2002: 7})
+_d.close()
+
+# A taken_at that reads back as a blob is what the broken index produced, and
+# it must not be able to stop a pull whatever produced it.
+odd = os.path.join(tmp, "odd")
+os.makedirs(odd, exist_ok=True)
+odd_db = os.path.join(odd, "wowcraft.sqlite3")
+shutil.copyfile(local_db, odd_db)
+_o = sqlite3.connect(odd_db)
+_o.execute("INSERT OR REPLACE INTO price_snapshot(taken_at,item_id,source,"
+           "sell_unit_price,min_unit_price,total_quantity,listing_count) "
+           "VALUES (X'',?,?,?,?,?,?)", (2001, "commodity", 1.0, 1.0, 1, 1))
+_o.commit(); _o.close()
+with contextlib.redirect_stdout(quiet):
+    with contextlib.redirect_stderr(io.StringIO()):
+        rc = W.cmd_pull(url, dict(local_cfg, history_days=7), odd_db,
+                        os.path.join(odd, "dashboard.html"), force=True)
+must("a non-numeric taken_at cannot wedge the pull", rc == 0)
+_o = sqlite3.connect(odd_db)
+must("and is skipped rather than carried",
+     _o.execute("SELECT COUNT(*) FROM price_snapshot "
+                "WHERE typeof(taken_at) != 'integer'").fetchone()[0] == 0)
+_o.close()
+
+# ---- 6b3. the repair command ----------------------------------------
+with contextlib.redirect_stderr(rlog := io.StringIO()):
+    with contextlib.redirect_stdout(quiet):
+        rc = W.cmd_repair(local_db)
+must("repair on a healthy database changes nothing", rc == 0)
+must("and says why it did nothing", "no damage" in rlog.getvalue())
+
+fix = os.path.join(tmp, "fixme.sqlite3")
+shutil.copyfile(local_db, fix)
+break_index(fix, "price_snapshot")
+# Counted off the healthy original: on the damaged copy even COUNT(*) is
+# answered from the index, so it reports zero rows in a table that is full.
+_b = sqlite3.connect(local_db)
+rows_before = _b.execute("SELECT COUNT(*) FROM price_snapshot").fetchone()[0]
+_b.close()
+with contextlib.redirect_stderr(rlog := io.StringIO()):
+    with contextlib.redirect_stdout(quiet):
+        rc = W.cmd_repair(fix)
+must("repair fixes a damaged database", rc == 0)
+must("and leaves it healthy", W._integrity_faults(fix) == [])
+_b = sqlite3.connect(fix)
+must("with the rows still in it",
+     _b.execute("SELECT COUNT(*) FROM price_snapshot").fetchone()[0]
+     == rows_before)
+must("and the local-only table untouched",
+     dict(_b.execute("SELECT item_id, quantity FROM inventory"))
+     == {2001: 42, 2002: 7})
+_b.close()
+must("the damaged file is kept rather than deleted",
+     any(n.startswith("fixme.sqlite3.") and n.endswith(".bad")
+         for n in os.listdir(tmp)))
+must("and no half-finished rebuild is left lying about",
+     not os.path.exists(fix + ".rebuilt"))
+must("repair on a database that is not there says so",
+     W.cmd_repair(os.path.join(tmp, "nosuch.sqlite3")) == 1)
+
 # ---- 6c. something holding the database open -------------------------
 # pricecheck is meant to be left open on a second monitor, and on Windows an
 # open handle is enough to make os.replace fail. The pull must say so and
@@ -623,22 +770,59 @@ must("the probe ref is one nobody would create",
      "does-not-exist" in W.DOCTOR_PROBE_REF)
 
 # The whole report has to be safe to paste into an issue.
-report = []
-real_probe = W._probe_dispatch          # captured BEFORE stubbing
-W._probe_dispatch = lambda *a: ("OK", "actions:write granted")
-try:
-    W._doctor_cloud(
-        dict(local_cfg, pull_url=url, dispatch_when_stale_minutes=90,
-             github_token="tok_SECRET_VALUE",
-             dispatch_repo="zethrel/wow-craft-margins"),
-        local_db, report.append)
-finally:
-    W._probe_dispatch = real_probe
-text = "\n".join(report)
+#
+# The doctor prefers a token from the environment over the one in the config,
+# so the length it prints depends on what happens to be exported in the shell
+# running the tests. This used to assert "93 chars or 16 chars" - 93 being
+# whatever was in the author's environment at the time - which quietly turned
+# a property of the report into a property of the machine, and failed on any
+# box with a GITHUB_TOKEN of a different length. So the environment is
+# controlled here instead, and both paths are checked on purpose.
+@contextlib.contextmanager
+def token_env(**vars):
+    """Run with exactly these token variables set, and no others."""
+    names = ("WOWCRAFT_GITHUB_TOKEN", "GITHUB_TOKEN")
+    saved = {name: os.environ.pop(name, None) for name in names}
+    os.environ.update({k: v for k, v in vars.items() if v is not None})
+    try:
+        yield
+    finally:
+        for name in names:
+            os.environ.pop(name, None)
+        for name, value in saved.items():
+            if value is not None:
+                os.environ[name] = value
+
+
+def cloud_report(**env):
+    report = []
+    real = W._probe_dispatch            # captured BEFORE stubbing
+    W._probe_dispatch = lambda *a: ("OK", "actions:write granted")
+    try:
+        with token_env(**env):
+            W._doctor_cloud(
+                dict(local_cfg, pull_url=url, dispatch_when_stale_minutes=90,
+                     github_token="tok_SECRET_VALUE",
+                     dispatch_repo="zethrel/wow-craft-margins"),
+                local_db, report.append)
+    finally:
+        W._probe_dispatch = real
+    return "\n".join(report)
+
+
+text = cloud_report()
 must("the doctor report never contains the token",
      "tok_SECRET_VALUE" not in text)
-must("it reports the token's length instead", "93 chars" in text
-     or "%d chars" % len("tok_SECRET_VALUE") in text)
+must("it reports the token's length instead",
+     f"{len('tok_SECRET_VALUE')} chars" in text)
+must("and where the token came from", "from config.json" in text)
+
+# The environment wins over the config, and neither value is ever printed.
+from_env = cloud_report(GITHUB_TOKEN="ghp_" + "x" * 36)
+must("a token in the environment is preferred", "from GITHUB_TOKEN" in from_env)
+must("its length is reported, not its value",
+     f"{len('ghp_' + 'x' * 36)} chars" in from_env
+     and "x" * 36 not in from_env)
 must("it covers the published site", "[C1]" in text)
 must("it covers time zones", "[C2]" in text)
 must("it covers local state", "[C3]" in text)

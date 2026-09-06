@@ -151,6 +151,23 @@ GOLD = 10000  # copper per gold
 # Small utilities
 # --------------------------------------------------------------------------
 
+def age_str(stamp: Optional[int]) -> str:
+    """"3h ago" for a timestamp. Anything read from the client rather than
+    from this scan carries one of these: a photograph has to say when it was
+    taken or it gets read as a live feed."""
+    if not stamp:
+        return "never"
+    mins = max(0, int((time.time() - stamp) / 60))
+    if mins < 1:
+        return "just now"
+    if mins < 90:
+        return f"{mins}m ago"
+    hours = mins // 60
+    if hours < 48:
+        return f"{hours}h ago"
+    return f"{hours // 24}d ago"
+
+
 def copper_to_gold_str(copper: float) -> str:
     """Format a copper amount the way the game does, abbreviated for tables."""
     if copper is None:
@@ -480,6 +497,34 @@ CREATE TABLE IF NOT EXISTS inventory (
     item_id   INTEGER NOT NULL,
     quantity  INTEGER NOT NULL,
     PRIMARY KEY (character, item_id)
+);
+
+-- What you already have listed at the auction house, from the addon. Kept
+-- apart from `inventory` on purpose: these two answer different questions and
+-- must not be pooled. Stock in a bag can be crafted with, so it reduces what
+-- a reagent bill costs to finish; stock on the auction house cannot, but it
+-- IS already on the market, so it reduces how many more of an output there is
+-- any point making.
+--
+-- seen_at is when the client last read it, and it matters more here than
+-- anywhere else in the database: owned auctions are only readable with the
+-- auction house open, so this is a photograph rather than a feed.
+CREATE TABLE IF NOT EXISTS posted_auction (
+    character TEXT NOT NULL,
+    item_id   INTEGER NOT NULL,
+    quantity  INTEGER NOT NULL,
+    seen_at   INTEGER NOT NULL,
+    PRIMARY KEY (character, item_id)
+);
+
+-- When each character's auctions were last read, INCLUDING a read that found
+-- nothing. Without this, "the auction house was checked twenty minutes ago
+-- and you have nothing listed" and "your listings have never been read" are
+-- the same empty table - and they are not the same thing at all, in exactly
+-- the way a measured zero and an unmeasured item are not.
+CREATE TABLE IF NOT EXISTS posted_read (
+    character TEXT PRIMARY KEY,
+    seen_at   INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS price_snapshot (
@@ -920,6 +965,68 @@ class Store:
         return {r["item_id"]: r["n"] for r in self.db.execute(
             "SELECT item_id, SUM(quantity) AS n FROM inventory GROUP BY item_id")}
 
+    # A listing lasts at most 48 hours. Past that, whatever the addon last saw
+    # has either sold or expired back into a bag, and deducting it from a
+    # restock target would suppress crafting you actually need to do. An old
+    # snapshot is therefore ignored rather than trusted, which fails towards
+    # "make some" rather than towards "make none".
+    POSTED_MAX_AGE_HOURS = 48
+
+    def posted(self, max_age_hours: Optional[float] = None) -> dict:
+        """{item_id: quantity} you currently have listed, per the last read.
+
+        Pooled across characters like `owned`, and filtered by age: see
+        POSTED_MAX_AGE_HOURS.
+        """
+        limit = (self.POSTED_MAX_AGE_HOURS if max_age_hours is None
+                 else max_age_hours)
+        cutoff = int(time.time()) - int(limit * 3600) if limit else 0
+        return {r["item_id"]: r["n"] for r in self.db.execute(
+            "SELECT item_id, SUM(quantity) AS n FROM posted_auction "
+            "WHERE seen_at >= ? GROUP BY item_id", (cutoff,))}
+
+    def posted_seen_at(self) -> Optional[int]:
+        """When the auction house was last read, or None if it never was.
+
+        From `posted_read`, so a read that found nothing listed still counts
+        as a read - it is the difference between "checked, you have nothing
+        listed" and "never checked".
+        """
+        row = self.db.execute(
+            "SELECT MAX(seen_at) AS t FROM posted_read").fetchone()
+        if row and row["t"]:
+            return int(row["t"])
+        # Databases written before posted_read existed keep their answer.
+        row = self.db.execute(
+            "SELECT MAX(seen_at) AS t FROM posted_auction").fetchone()
+        return int(row["t"]) if row and row["t"] else None
+
+    def save_posted(self, listed: dict) -> int:
+        """Replace what each listed character has on the auction house.
+
+        Replaces rather than merges, and an empty map for a character is
+        meaningful: it means that character has nothing listed, which is a
+        fact worth storing rather than an absence of news. Characters absent
+        from `listed` are left alone.
+        """
+        total = 0
+        for character, data in listed.items():
+            counts = data.get("items") or {}
+            seen_at = int(data.get("seen_at") or time.time())
+            self.db.execute("DELETE FROM posted_auction WHERE character=?",
+                            (character,))
+            self.db.executemany(
+                "INSERT OR REPLACE INTO posted_auction"
+                "(character,item_id,quantity,seen_at) VALUES(?,?,?,?)",
+                [(character, int(i), int(q), seen_at)
+                 for i, q in counts.items() if q > 0])
+            self.db.execute(
+                "INSERT OR REPLACE INTO posted_read(character,seen_at) "
+                "VALUES(?,?)", (character, seen_at))
+            total += len(counts)
+        self.db.commit()
+        return total
+
     # An auction that vanished having had at least this long left cannot have
     # expired, so it sold or was cancelled. Blizzard's buckets are SHORT
     # (under 30m), MEDIUM (30m-2h), LONG (2-12h) and VERY_LONG (over 12h);
@@ -1085,8 +1192,17 @@ class Store:
               that survived the interval, which a buyer working up the ladder
               can actually account for. Strictly a subset of "likely".
 
-        "likely" remains the default until the two have been measured against
-        each other on live data - the whole point of storing both.
+        "swept" is the default. That is a measurement, not a preference: over
+        a week of Argent Dawn EU, 68% of the units counted by "likely" had a
+        cheaper listing standing untouched beside them, so "likely" was
+        overstating demand by about 3.2x - and gold/day is demand times
+        margin times share, so the whole ranking was inflated by roughly the
+        same factor. Per item the correction varies from 0.06x to 1.0x
+        (median 0.34x), which is why a flat haircut on "likely" was rejected
+        in favour of reading the per-item measurement.
+
+        Both columns are recorded on every scan regardless. This only picks
+        which one the ranking reads, so switching back costs nothing.
         """
         today = day_bucket(int(time.time()))
         cutoff = today - max(1, days) * 86400
@@ -1129,23 +1245,42 @@ class Store:
         """
         today = day_bucket(int(time.time()))
         cutoff = max(today - max(1, days) * 86400, self.swept_from())
-        row = self.db.execute(
-            "SELECT COALESCE(SUM(sold_confirmed),0), "
-            "       COALESCE(SUM(sold_likely),0), "
-            "       COALESCE(SUM(sold_swept),0), "
-            "       SUM(CASE WHEN sold_likely > 0 THEN 1 ELSE 0 END), "
-            "       SUM(CASE WHEN sold_swept > 0 THEN 1 ELSE 0 END) "
-            "FROM price_snapshot WHERE taken_at >= ?", (cutoff,)).fetchone()
-        confirmed, likely, swept = float(row[0]), float(row[1]), float(row[2])
-        return {
-            "confirmed": confirmed,
-            "likely": likely,
-            "swept": swept,
-            "churn": (1.0 - swept / likely) if likely > 0 else None,
-            "rows_likely": int(row[3] or 0),
-            "rows_swept": int(row[4] or 0),
-            "from": cutoff,
-        }
+        cols = ("COALESCE(SUM(sold_confirmed),0), "
+                "COALESCE(SUM(sold_likely),0), "
+                "COALESCE(SUM(sold_swept),0), "
+                "SUM(CASE WHEN sold_likely > 0 THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN sold_swept > 0 THEN 1 ELSE 0 END)")
+
+        def shape(row) -> dict:
+            confirmed, likely, swept = (float(row[0]), float(row[1]),
+                                        float(row[2]))
+            return {
+                "confirmed": confirmed,
+                "likely": likely,
+                "swept": swept,
+                "churn": (1.0 - swept / likely) if likely > 0 else None,
+                "rows_likely": int(row[3] or 0),
+                "rows_swept": int(row[4] or 0),
+            }
+
+        out = shape(self.db.execute(
+            f"SELECT {cols} FROM price_snapshot WHERE taken_at >= ?",
+            (cutoff,)).fetchone())
+        # Split by source, because the two are not equally trustworthy and one
+        # number hides that. Commodity buying goes through the client's own
+        # cheapest-first purchase call, so "vanished from below a surviving
+        # cheaper listing" is exactly what a buyer does. Realm auctions are
+        # picked one at a time and two listings of one item id can be
+        # different bonus-list variants at honestly different prices, so a
+        # buyer taking the dearer one reads here as a cancellation. Realm
+        # volume is a rounding error beside commodity volume, which is the
+        # only reason that weakness is tolerable rather than disqualifying.
+        out["by_source"] = {
+            row[0]: shape(row[1:]) for row in self.db.execute(
+                f"SELECT source, {cols} FROM price_snapshot "
+                "WHERE taken_at >= ? GROUP BY source", (cutoff,))}
+        out["from"] = cutoff
+        return out
 
     def price_ranges(self, taken_at: int) -> dict:
         """{item_id: (buy_low, buy_high, sell_low, sell_high)} for one day."""
@@ -1401,12 +1536,25 @@ class MarginResult:
     # How many units to have on hand to cover COVER_DAYS of your share, less
     # what you already hold. Zero on anything unprofitable or unmeasured.
     restock_units: int = 0
+    # The same figure BEFORE anything is deducted - what the market wants,
+    # rather than what you personally still need to make. The addon is given
+    # this one and does its own subtraction, because the client knows your
+    # bags, bank and reagent bank live and to the second, while the database
+    # knows only what was last exported. It also keeps the deduction in one
+    # place: a file that arrived already deducted, deducted again on display,
+    # would subtract your stock twice.
+    restock_target: int = 0
     # What crafting those units costs at today's reagent prices. Understated
     # if it is much more than one batch, because you would eat further up the
     # supply ladder buying them.
     restock_cost: float = 0.0
     # Units of the output already in your bags and banks, from the addon.
     output_owned: int = 0
+    # ...and units of it you already have listed at the auction house. Kept
+    # separate from output_owned because they are not interchangeable: stock
+    # in a bag can still be crafted with, stock on the auction house is
+    # already competing with what you were about to make.
+    output_posted: int = 0
 
 
 def _col(row: Any, key: str, default: Any = None) -> Any:
@@ -1601,7 +1749,12 @@ def project_gold_per_day(r: "MarginResult", cover_days: float = COVER_DAYS,
     if r.margin <= 0 or yours <= 0:
         return
     target = yours * cover_days
-    r.restock_units = max(0, int(target - r.output_owned + 0.5))
+    r.restock_target = max(0, int(target + 0.5))
+    # Both are deducted: what is in the bag has been made, and what is on the
+    # auction house has been made AND listed. Suggesting either again is the
+    # same mistake twice over.
+    r.restock_units = max(
+        0, int(target - r.output_owned - r.output_posted + 0.5))
     r.restock_cost = r.restock_units * (r.cost / units)
 
 
@@ -1623,6 +1776,7 @@ def compute_margins(recipes: list, prices: dict, item_names: dict,
                     batch: int = 1, min_supply: int = 1,
                     min_listings: int = 1,
                     owned: Optional[dict] = None,
+                    posted: Optional[dict] = None,
                     velocity: Optional[dict] = None,
                     source_reagents: bool = True,
                     cover_days: float = COVER_DAYS,
@@ -1808,6 +1962,7 @@ def compute_margins(recipes: list, prices: dict, item_names: dict,
     results = list(by_output.values())
     for r in results:
         r.output_owned = int((owned or {}).get(r.crafted_item_id, 0))
+        r.output_posted = int((posted or {}).get(r.crafted_item_id, 0))
         project_gold_per_day(r, cover_days=cover_days, share=market_share,
                              cap_turnover=cap_turnover)
     # A margin is what one craft pays if it sells; gold per day is what the
@@ -2168,6 +2323,17 @@ def cmd_scan(client: BlizzardClient, store: Store, cfg: dict, out_path: str,
     if owned:
         log(f"{len(owned):,} distinct items in your bags and banks -- margins "
             "also show what is left to buy")
+    # Deducted from restock targets only, never from reagent costs: an item
+    # sitting on the auction house cannot be crafted with.
+    posted = store.posted()
+    seen_at = store.posted_seen_at()
+    if posted:
+        log(f"{len(posted):,} distinct items already listed at the auction "
+            f"house as of {time.strftime('%H:%M', time.localtime(seen_at))} "
+            f"({age_str(seen_at)}) -- restock targets deduct them")
+    elif seen_at:
+        log(f"nothing listed at the auction house as of "
+            f"{age_str(seen_at)}, or the reading is too old to use")
 
     collapsed = store.collapse_to_days()
     if collapsed:
@@ -2225,7 +2391,7 @@ def cmd_scan(client: BlizzardClient, store: Store, cfg: dict, out_path: str,
     else:
         log("sell prices are this scan's reading only (price_basis=current)")
 
-    basis = str(cfg.get("sale_basis", "likely")).lower()
+    basis = str(cfg.get("sale_basis", "swept")).lower()
     velocity = store.sale_velocity(days=keep_days or 7, basis=basis)
     if basis == "swept" and not velocity:
         # Switching the basis on a database that has not yet collected a day
@@ -2240,10 +2406,20 @@ def cmd_scan(client: BlizzardClient, store: Store, cfg: dict, out_path: str,
         log(f"across the stored window, {signal['churn'] * 100:.0f}% of the "
             f"units that vanished with hours left had a cheaper listing "
             f"standing beside them (cancellations, not sales)"
-            + (f" -- and sale_basis is \"likely\", so they are still counted; "
-               f"set it to \"swept\" to drop them"
-               if basis != "swept" else
-               f" -- sale_basis is \"swept\", so they are excluded"))
+            + (" -- sale_basis is \"swept\", so they are excluded"
+               if basis == "swept" else
+               " -- and sale_basis is \"likely\", so they are still counted; "
+               "set it to \"swept\" to drop them"))
+        # One number for both sources would hide that they are measured with
+        # very different confidence. Printed rather than acted on: the split
+        # is a caveat to read, not a second knob to turn.
+        for src in sorted(signal.get("by_source") or {}):
+            part = signal["by_source"][src]
+            if part["churn"] is None:
+                continue
+            log(f"    {src:<10} churn {part['churn'] * 100:>5.1f}%  "
+                f"({part['swept']:,.0f} swept of {part['likely']:,.0f} "
+                f"vanished, {part['confirmed']:,.0f} confirmed partial)")
     if velocity:
         moving = sum(1 for v in velocity.values() if v > 0)
         log(f"market movement measured for {len(velocity):,} items; "
@@ -2258,6 +2434,7 @@ def cmd_scan(client: BlizzardClient, store: Store, cfg: dict, out_path: str,
     cap_turnover = float(cfg.get("demand_cap_turnover", DEMAND_CAP_TURNOVER))
     results, skipped = compute_margins(recipes, prices, names, batch=batch,
                                        min_listings=min_listings, owned=owned,
+                                       posted=posted,
                                        velocity=velocity, cover_days=cover_days,
                                        market_share=market_share,
                                        cap_turnover=cap_turnover, rank=rank)
@@ -2450,16 +2627,21 @@ def restock_tip(r, cover_days: float) -> str:
                 f"share of this market"
                 + (f", and you already hold {r.output_owned:,}."
                    if r.output_owned else "."))
-    held = (f" You already hold {r.output_owned:,}, which is deducted."
-            if r.output_owned else "")
+    have = []
+    if r.output_owned:
+        have.append(f"{r.output_owned:,} in your bags or bank")
+    if r.output_posted:
+        have.append(f"{r.output_posted:,} already listed at the auction house")
+    held = (" You have " + " and ".join(have) + ", both deducted."
+            if have else "")
     return (f"Units to have on hand to cover {cover_days:g} days of your share "
             f"of this market.{held} Reagents for them cost about "
             f"{copper_to_gold_str(r.restock_cost)} at today's prices - "
             f"understated if that is much more than one batch, because buying "
-            f"in bulk eats further up the supply ladder.<br><br>It does not "
-            f"know what you already have posted at the auction house: nothing "
-            f"in the API or the addon reports your own listings yet, so a "
-            f"restock you have already made will be suggested twice.")
+            f"in bulk eats further up the supply ladder.<br><br>Your own "
+            f"listings are only readable while the auction house is open, so "
+            f"that half is as fresh as your last visit; a reading older than "
+            f"the longest auction duration is ignored rather than trusted.")
 
 
 def _variant_floor(r) -> Optional[float]:
@@ -3071,12 +3253,23 @@ def write_addon_prices(path: str, results: list, prices: dict, recipes: list,
         if not r.crafted_item_id or batch <= 0:
             continue
         measured = r.gold_per_day is not None
+        # The UNDEDUCTED target, not restock_units. The client subtracts what
+        # you hold and what you have listed itself, from live counts - which
+        # is both fresher than anything the database has and the only version
+        # that works when this file was built somewhere else. The published
+        # file is built in the cloud, where your bags do not exist; a deducted
+        # number there would mean "deducted by nobody".
+        # The ninth field is how many the craft yields, which the client
+        # cannot work out from anything else it has: a shopping list needs to
+        # turn "make 6 units" into "so, two crafts" before it can multiply a
+        # reagent quantity by anything.
         margins.append(
             f"[{r.crafted_item_id}]={{{int(r.cost / batch)},"
             f"{int(r.revenue / batch)},{r.margin_pct:.0f},"
             f"{1 if r.cost_complete else 0},{r.optionals_filled},"
             f"{1 if measured else 0},"
-            f"{int(r.gold_per_day) if measured else 0},{r.restock_units}}}")
+            f"{int(r.gold_per_day) if measured else 0},{r.restock_target},"
+            f"{max(1.0, r.crafted_qty):.2f}}}")
     lines.append("margin = {" + ",".join(margins) + "},")
     lines.append("}")
 
@@ -3414,10 +3607,12 @@ the bank.
 <br><strong>Gold/day and Craft are projections, not measurements.</strong> Both rest on a
 sale rate that cannot tell a cancelled auction from a sold one (so it reads high, and is
 capped at one full turnover of standing supply a day), and on a share of the market
-modelled as one more seller among those already listed. Neither knows what you already
-have posted, whether you can hit the crafting quality that sets the price, or that a
-transmute-sourced reagent is limited to one a day. They are a better question than
-"which margin is biggest", not an answer. Skipped this run:
+modelled as one more seller among those already listed. Craft deducts what you hold and
+what you already have listed, but your own listings are only readable while the auction
+house is open, so that half is as fresh as your last visit. Neither knows whether you can
+hit the crafting quality that sets the price, or that a transmute-sourced reagent is
+limited to one a day. They are a better question than "which margin is biggest", not an
+answer. Skipped this run:
 {skipped.get('no_output_price', 0):,} with no output listed,
 {skipped.get('no_reagent_price', 0):,} with an unpriceable reagent{thin_txt}.
 {thin_note}
@@ -3865,6 +4060,16 @@ def cmd_doctor(client: BlizzardClient, store: Store, cfg: dict,
     w("[7] QUALITY-TIER PROBE  (the known modelling gap)")
     w("    How many distinct bonus-list variants exist per item id, and how far")
     w("    apart do they price? This is what decides how to model quality.")
+    # Item level was the obvious candidate and it was tested, on 5,593 items
+    # whose variants priced more than 10% apart: it accounted for 19% of them.
+    # Grouping the variants by item level moved the median spread from 6.83x
+    # to 3.91x, and on every one of the worst cases it changed nothing at all.
+    # So the axis is not item level, and the tool that computed it (TSM's
+    # BonusIdTool, MIT) was removed again rather than left in place looking
+    # useful. See "The quality-tier experiment" in the README before spending
+    # another afternoon on the same idea.
+    w("    (item level was tested as the cause and explains 19% of it - see")
+    w("     the README. The axis is something else.)")
     variants: dict = {}
     for a in list(commodity) + list(realm):
         item = a.get("item") or {}
@@ -3880,8 +4085,8 @@ def cmd_doctor(client: BlizzardClient, store: Store, cfg: dict,
     multi = {i: v for i, v in variants.items() if len(v) > 1}
     w(f"    items with >1 bonus-list variant: {len(multi):,} "
       f"of {len(variants):,} priced items")
-    for iid, v in sorted(multi.items(),
-                         key=lambda kv: -len(kv[1]))[:8]:
+
+    for iid, v in sorted(multi.items(), key=lambda kv: -len(kv[1]))[:8]:
         w(f"      item {iid}: {len(v)} variants")
         for key, prices in sorted(v.items(), key=lambda kv: min(kv[1]))[:5]:
             label = ",".join(map(str, key)) or "(none)"
@@ -4050,6 +4255,19 @@ def _doctor_cloud(cfg: dict, db_path: str, w) -> None:
     w("[C3] LOCAL STATE")
     w(f"    database : {db_path}")
     if os.path.exists(db_path):
+        # Before anything is read out of it. Damage here does not announce
+        # itself - counts and scans keep returning right answers while an
+        # index quietly hands back a value that was never stored - so the
+        # only way anyone finds out is by being told.
+        faults = _integrity_faults(db_path)
+        if faults:
+            w(f"    FAIL - sqlite reports {len(faults)} problem(s):")
+            for fault in faults[:5]:
+                w(f"           {fault}")
+            if len(faults) > 5:
+                w(f"           ... and {len(faults) - 5} more")
+            w("           Run `python wowcraft.py repair` to rebuild it. A")
+            w("           pull would work around it, a scan would not.")
         try:
             db = sqlite3.connect(db_path)
             days = [r[0] for r in db.execute(
@@ -4259,7 +4477,22 @@ SEED_PATH = os.path.join("seed", "recipes.sqlite3.gz")
 # kept only so the next scan has something to diff against. Publishing it would
 # roughly triple the download to say nothing the sale figures do not already
 # carry.
-UNPUBLISHED_TABLES = ("inventory", "margin_snapshot", "auction_prev")
+# Never leaves this machine. `inventory` and `posted_auction` are a list of
+# what you own and what you have on the auction house, which is nobody's
+# business but yours - and `posted_read` says when you were last at an auction
+# house, which is not much better. The published database is a public file on
+# a public site; anything personal has to be dropped from it here, not trusted
+# to nobody looking.
+UNPUBLISHED_TABLES = ("inventory", "posted_auction", "posted_read",
+                      "margin_snapshot", "auction_prev")
+
+# ...and the same three the other way round: they came off your own
+# SavedVariables and exist nowhere else, so a pull that swaps the database
+# wholesale has to carry them across or it deletes them. Named once, as a
+# list, because the version of this that named `inventory` by hand was one
+# table out of date within a day of a new one being added - the same way
+# sync-addon.cmd's hand-written file list was.
+LOCAL_ONLY_TABLES = ("inventory", "posted_auction", "posted_read")
 
 # The seed drops prices too, leaving only what `init` spent fifteen minutes
 # building. Recipes change on patch day and not otherwise, so this compresses
@@ -4416,6 +4649,105 @@ def _columns(db: sqlite3.Connection, table: str, schema: str = "main") -> list:
     return [r[1] for r in db.execute(f"PRAGMA {schema}.table_info({table})")]
 
 
+def _integrity_faults(path: str) -> list:
+    """What sqlite thinks is wrong with a database file, if anything.
+
+    Empty means healthy. Cheap enough to run before every pull: an integrity
+    check reads the file it is about to replace, which is already being copied.
+    """
+    try:
+        db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        return [str(exc)]
+    try:
+        # One row can carry a hundred newline-separated complaints, and a
+        # caller that prints "the first fault" should get one line, not a
+        # page of them.
+        faults = []
+        for (row,) in db.execute("PRAGMA integrity_check"):
+            faults += [line.strip() for line in str(row).splitlines()
+                       if line.strip() and line.strip() != "ok"]
+        return faults
+    except sqlite3.DatabaseError as exc:
+        return [str(exc)]
+    finally:
+        db.close()
+
+
+def _rebuild_database(src: str, dst: str) -> dict:
+    """Rewrite a database row by row, so its indexes are built from scratch.
+
+    Not VACUUM: a vacuum of a file whose index disagrees with its table copies
+    the disagreement across, which is exactly what happened here. Reading every
+    row with a plain table scan and inserting it into an empty schema is the
+    one operation that cannot inherit a bad index, because it never reads one.
+
+    Rows that will not go in are dropped and counted rather than aborting the
+    rebuild: a database with two unreadable rows in a quarter of a million is
+    worth having back, and the count is reported rather than swallowed.
+
+    Returns {table: (scanned, inserted)} for every table that lost rows.
+    """
+    if os.path.exists(dst):
+        os.remove(dst)
+    src_db = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
+    dst_db = sqlite3.connect(dst)
+    lost = {}
+    try:
+        schema = src_db.execute(
+            "SELECT type, name, sql FROM sqlite_master "
+            "WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'").fetchall()
+        for kind, _name, sql in schema:
+            if kind == "table":
+                dst_db.execute(sql)
+        for kind, name, _sql in schema:
+            if kind != "table":
+                continue
+            cols = [r[1] for r in src_db.execute(
+                f'PRAGMA table_info("{name}")')]
+            if not cols:
+                continue
+            quoted = ", ".join(f'"{c}"' for c in cols)
+            marks = ", ".join("?" * len(cols))
+            insert = (f'INSERT OR IGNORE INTO "{name}" ({quoted}) '
+                      f"VALUES ({marks})")
+            scanned = kept = 0
+            cur = src_db.execute(f'SELECT {quoted} FROM "{name}"')
+            while True:
+                try:
+                    batch = cur.fetchmany(2000)
+                except sqlite3.DatabaseError:
+                    break       # the scan itself hit the damage; keep what we
+                if not batch:   # already have rather than losing the table
+                    break
+                scanned += len(batch)
+                try:
+                    dst_db.executemany(insert, batch)
+                    kept += len(batch)
+                except sqlite3.Error:
+                    # One bad row must not cost the other 1,999.
+                    for row in batch:
+                        try:
+                            dst_db.execute(insert, row)
+                            kept += 1
+                        except sqlite3.Error:
+                            pass
+            if kept < scanned:
+                lost[name] = (scanned, kept)
+        # Indexes, views and triggers last, over rows that are already in.
+        for kind, name, sql in schema:
+            if kind != "table":
+                try:
+                    dst_db.execute(sql)
+                except sqlite3.Error:
+                    pass
+        dst_db.commit()
+    finally:
+        src_db.close()
+        dst_db.close()
+    return lost
+
+
 def _carry_item_classes(db: sqlite3.Connection) -> int:
     """Keep item classes the published database has not learned yet.
 
@@ -4488,7 +4820,14 @@ def _carry_history(db: sqlite3.Connection, keep_days: int) -> dict:
             f"SELECT DISTINCT taken_at FROM {table}")}
         mine = {r[0] for r in db.execute(
             f"SELECT DISTINCT taken_at FROM old.{table}")}
-        missing = sorted(d for d in mine - theirs if d >= cutoff)
+        # isinstance, not trust. A damaged index hands DISTINCT a value that
+        # was never in the table - the fault that wedged this pull for six
+        # days was an empty blob arriving here and failing the comparison
+        # below. _install_prices_db repairs that before we get here; this is
+        # the second lock, because a crash in the middle of a pull is a much
+        # worse failure than one skipped day of history.
+        missing = sorted(d for d in mine - theirs
+                         if isinstance(d, int) and d >= cutoff)
         if not missing:
             continue
         # Intersect the column lists rather than trusting SELECT *: a database
@@ -4537,6 +4876,68 @@ def _replace_with_retry(src: str, dst: str, attempts: int = 6,
         f"database browser, then pull again. ({last})")
 
 
+def cmd_repair(db_path: str) -> int:
+    """Check the local database, and rebuild it if sqlite says it is damaged.
+
+    `pull` heals itself - it replaces the whole file - so this is for the
+    machine that scans, where the same file is written to for months and a
+    bad index has nothing to replace it. The damage that prompted this was
+    two rows missing from a primary-key index: every count and every scan
+    still returned the right answer, and only DISTINCT, which reads the index
+    instead of the table, handed back a value that was never stored.
+
+    The original is kept beside the repaired one rather than deleted. A
+    rebuild that drops rows should be reversible by someone who disagrees
+    with it.
+    """
+    import shutil
+
+    if not os.path.exists(db_path):
+        log(f"{db_path} does not exist yet - nothing to repair.")
+        return 1
+    faults = _integrity_faults(db_path)
+    if not faults:
+        log(f"{db_path}: sqlite reports no damage. Nothing to do.")
+        return 0
+    log(f"{db_path} is damaged:")
+    for fault in faults[:10]:
+        log(f"  {fault}")
+    if len(faults) > 10:
+        log(f"  ... and {len(faults) - 10} more")
+
+    folder = os.path.dirname(os.path.abspath(db_path)) or "."
+    stamp = time.strftime("%Y-%m-%d")
+    backup = os.path.join(folder, f"{os.path.basename(db_path)}.{stamp}.bad")
+    fixed = db_path + ".rebuilt"
+    log("rebuilding...")
+    try:
+        lost = _rebuild_database(db_path, fixed)
+    except (sqlite3.Error, OSError) as exc:
+        log(f"could not rebuild it: {exc}")
+        if os.path.exists(fixed):
+            os.remove(fixed)
+        return 2
+
+    still = _integrity_faults(fixed)
+    if still:
+        log("the rebuilt copy is still damaged, so nothing has been changed:")
+        for fault in still[:5]:
+            log(f"  {fault}")
+        log(f"the attempt is at {fixed} if it is worth looking at.")
+        return 2
+
+    for table, (scanned, kept) in sorted(lost.items()):
+        log(f"  warn: {scanned - kept} unreadable {table} row(s) dropped "
+            f"(of {scanned:,})")
+    if not lost:
+        log("  every row came across")
+    shutil.copyfile(db_path, backup)
+    _replace_with_retry(fixed, db_path)
+    log(f"repaired. The damaged file is kept as {backup} - delete it once "
+        f"the next scan or pull looks right.")
+    return 0
+
+
 def _install_prices_db(blob: bytes, db_path: str, keep_days: int = 0) -> None:
     """Swap a downloaded price database in, keeping what only this PC knows.
 
@@ -4563,9 +4964,10 @@ def _install_prices_db(blob: bytes, db_path: str, keep_days: int = 0) -> None:
         with open(tmp, "wb") as fh:
             fh.write(gzip.decompress(blob))
 
-        inventory = 0
+        carried_local = {}
         classes = 0
         history = {}
+        repaired = None
         if os.path.exists(db_path):
             # Read the old database through a copy rather than attaching the
             # destination directly. Attaching leaves a handle on it, and on
@@ -4576,17 +4978,56 @@ def _install_prices_db(blob: bytes, db_path: str, keep_days: int = 0) -> None:
             os.close(fd2)
             try:
                 shutil.copyfile(db_path, old_copy)
+                # Check the file we are about to read BEFORE reading it. A
+                # corrupt local database used to abort the pull outright, and
+                # because pull is what refreshes prices, that meant six days
+                # of silently stale numbers behind a tooltip that still said
+                # it was working. The published database is complete on its
+                # own; the local one is only here for what it alone knows, so
+                # damage in it must cost at most that, never the whole pull.
+                faults = _integrity_faults(old_copy)
+                if faults:
+                    log(f"  warn: {db_path} is damaged "
+                        f"({faults[0]}" + (" and %d more)" % (len(faults) - 1)
+                                           if len(faults) > 1 else ")"))
+                    fd3, fixed = tempfile.mkstemp(suffix=".sqlite3",
+                                                  dir=folder)
+                    os.close(fd3)
+                    try:
+                        lost = _rebuild_database(old_copy, fixed)
+                        os.remove(old_copy)
+                        old_copy, repaired = fixed, lost
+                        log("  rebuilt a clean copy to read it through; this "
+                            "pull replaces the damaged file anyway")
+                    except (sqlite3.Error, OSError) as exc:
+                        log(f"  warn: could not rebuild it ({exc}); carrying "
+                            "nothing local across this time")
+                        if os.path.exists(fixed):
+                            os.remove(fixed)
                 db = sqlite3.connect(tmp)
                 try:
                     db.execute("ATTACH DATABASE ? AS old", (old_copy,))
-                    have = db.execute(
-                        "SELECT name FROM old.sqlite_master WHERE type='table'"
-                        " AND name='inventory'").fetchone()
-                    if have:
-                        db.execute("INSERT OR REPLACE INTO inventory "
-                                   "SELECT * FROM old.inventory")
-                        inventory = db.execute(
-                            "SELECT COUNT(*) FROM inventory").fetchone()[0]
+                    present = {r[0] for r in db.execute(
+                        "SELECT name FROM old.sqlite_master "
+                        "WHERE type='table'")}
+                    for table in LOCAL_ONLY_TABLES:
+                        if table not in present:
+                            continue
+                        # Column lists rather than SELECT *: a database
+                        # written by an older version is missing columns this
+                        # one added, and the two sides have to line up.
+                        shared = [c for c in _columns(db, table)
+                                  if c in set(_columns(db, table, "old"))]
+                        if not shared:
+                            continue
+                        cols = ", ".join(f'"{c}"' for c in shared)
+                        db.execute(
+                            f"INSERT OR REPLACE INTO {table} ({cols}) "
+                            f"SELECT {cols} FROM old.{table}")
+                        rows = db.execute(
+                            f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                        if rows:
+                            carried_local[table] = rows
                     classes = _carry_item_classes(db)
                     history = _carry_history(db, keep_days)
                     db.commit()
@@ -4597,14 +5038,17 @@ def _install_prices_db(blob: bytes, db_path: str, keep_days: int = 0) -> None:
                 if os.path.exists(old_copy):
                     os.remove(old_copy)
         _replace_with_retry(tmp, db_path)
-        if inventory:
-            log(f"  kept {inventory} inventory rows from the local database")
+        for table, rows in sorted(carried_local.items()):
+            log(f"  kept {rows} {table} row(s) from the local database")
         if classes:
             log(f"  kept {classes:,} item classes the published data has not "
                 "looked up yet")
         for table, (days, rows) in sorted(history.items()):
             log(f"  kept {days} day(s) of local {table} ({rows:,} rows) "
                 "that the published data does not cover")
+        for table, (scanned, kept) in sorted((repaired or {}).items()):
+            log(f"  warn: {scanned - kept} unreadable {table} row(s) were "
+                "dropped by the rebuild")
     except BaseException:
         if os.path.exists(tmp):
             os.remove(tmp)
@@ -4922,7 +5366,7 @@ DEFAULT_CONFIG = {
     # the ladder can actually account for - so undercut churn drops out. Both
     # are stored on every scan either way; this only chooses which one the
     # ranking reads. Watch the churn figure the scan prints before switching.
-    "sale_basis": "likely",
+    "sale_basis": "swept",
     # "market" smooths the sell price over the stored history, weighted
     # towards recent days, so one seller undercutting hard for an hour does
     # not become the price. "current" uses this scan's reading alone, which is
@@ -4991,7 +5435,7 @@ def main(argv: Optional[list] = None) -> int:
         description="Crafting margin scanner using Blizzard's official API.")
     ap.add_argument("command",
                     choices=["init", "scan", "pull", "seed", "demo", "config",
-                             "doctor", "names"],
+                             "doctor", "repair", "names"],
                     help="init: cache recipes (run once per patch). "
                          "scan: fetch auctions and build the dashboard. "
                          "pull: download a published scan instead of running "
@@ -5002,6 +5446,8 @@ def main(argv: Optional[list] = None) -> int:
                          "config: write a starter config.json. "
                          "doctor: probe every endpoint and write a shareable "
                          "diagnostic report. "
+                         "repair: check the local database and rebuild it if "
+                         "sqlite reports damage. "
                          "names: look up names for every priced item that has "
                          "none (one-off, ~10 min).")
     ap.add_argument("-c", "--config", default="config.json")
@@ -5087,6 +5533,12 @@ def main(argv: Optional[list] = None) -> int:
     # Reads the local database and writes a file. No credentials involved.
     if args.command == "seed":
         return cmd_seed(args.db, args.publish or SEED_PATH)
+
+    # Also credential-free, and deliberately reachable on a machine whose
+    # config has never been filled in: a database can be damaged before the
+    # credentials are.
+    if args.command == "repair":
+        return cmd_repair(args.db)
 
     cfg = load_config(args.config)
 
