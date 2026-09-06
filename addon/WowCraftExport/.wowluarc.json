@@ -1,0 +1,7 @@
+{
+  "flavors": ["retail"],
+  "globals": {
+    "read": ["WowCraftPrices"],
+    "write": ["WowCraftExport_Stock"]
+  }
+}

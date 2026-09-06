@@ -97,6 +97,64 @@ local function craftableSet()
     return mine
 end
 
+-- itemID -> what one craft of it consumes, as a compact string:
+--
+--     "2:210796,210797,210798|1:210800"
+--
+-- One slot per bar, its required quantity before the colon, and the items
+-- that legally fill it after - which on modern recipes is the same reagent at
+-- three qualities. A string rather than nested tables because this is written
+-- for every learned recipe on every profession open: five thousand recipes of
+-- three slots each is a megabyte of Lua for the client to serialise at every
+-- logout, and it is only ever read back whole.
+--
+-- Basic slots only. Optional and finishing reagents are a choice you make at
+-- the crafting table, and a shopping list that told you to buy them would be
+-- inventing a decision on your behalf.
+local function requirements()
+    WowCraftExportDB = WowCraftExportDB or { format = 2, exports = {} }
+    local all = WowCraftExportDB.needs
+    if type(all) ~= "table" then all = {} end
+    local mine = all[me()]
+    if type(mine) ~= "table" then mine = {} end
+    all[me()] = mine
+    WowCraftExportDB.needs = all
+    return mine
+end
+
+local function requirementString(schematic)
+    local list = schematic.reagentSlotSchematics
+    if type(list) ~= "table" then return nil end
+    local slots = {}
+    for i = 1, #list do
+        local slot = list[i]
+        -- 1 = basic per Enum.CraftingReagentType. A build that does not say
+        -- is treated as basic, matching how every other field here is read:
+        -- take what is there, do not invent what is not.
+        local kind = slot and slot.reagentType
+        if type(slot) == "table" and (kind == nil or issecretvalue(kind)
+                                      or kind == 1) then
+            local qty = slot.quantityRequired
+            local ids = {}
+            if type(slot.reagents) == "table" then
+                for j = 1, #slot.reagents do
+                    local entry = slot.reagents[j]
+                    local id = type(entry) == "table" and entry.itemID or entry
+                    if type(id) == "number" and not issecretvalue(id) then
+                        ids[#ids + 1] = tostring(id)
+                    end
+                end
+            end
+            if type(qty) == "number" and not issecretvalue(qty) and qty > 0
+                    and #ids > 0 then
+                slots[#slots + 1] = tostring(qty) .. ":" .. table.concat(ids, ",")
+            end
+        end
+    end
+    if #slots == 0 then return nil end
+    return table.concat(slots, "|")
+end
+
 -- itemID -> the best rank this character can currently produce.
 local function reachableSet()
     WowCraftExportDB = WowCraftExportDB or { format = 2, exports = {} }
@@ -140,15 +198,51 @@ end
 -- Refreshed whenever a profession window is open, which is also when you would
 -- run /wcexport, so there is no extra chore. Only learned recipes count: being
 -- able to see a recipe is not being able to make it.
-local function learnFromOpenProfession()
+--
+-- Done a slice at a time, and not more than once every LEARN_EVERY seconds.
+-- This used to run in full on every TRADE_SKILL_LIST_UPDATE, and that event
+-- fires on every keystroke in the profession search box - so typing a recipe
+-- name walked several thousand recipes per letter, each walk asking
+-- GetRecipeInfo, GetRecipeSchematic and GetCraftingOperationInfo twice. The
+-- result was a visible stutter on every key pressed, in a window whose entire
+-- purpose is typing into it.
+--
+-- Throttling alone would not be enough: one walk still stalls a frame long
+-- enough to feel. So the work is spread across frames as well, SLICE recipes
+-- at a time, and nothing here is urgent - what you know does not change while
+-- you type.
+local SLICE = 40            -- recipes per frame
+local LEARN_EVERY = 10      -- seconds between walks
+
+local walk = { ids = nil, index = 1, added = 0, announce = false }
+local lastLearn = 0
+
+local function now()
+    return (GetTime and GetTime()) or (time and time()) or 0
+end
+
+local function beginWalk(announce)
+    if walk.ids then return true end        -- one already in progress
     if type(C_TradeSkillUI) ~= "table"
             or type(C_TradeSkillUI.GetAllRecipeIDs) ~= "function" then
-        return 0
+        return false
     end
     local ok, ids = pcall(C_TradeSkillUI.GetAllRecipeIDs)
-    if not ok or type(ids) ~= "table" then return 0 end
-    local mine, reach, added = craftableSet(), reachableSet(), 0
-    for _, recipeID in ipairs(ids) do
+    if not ok or type(ids) ~= "table" then return false end
+    walk.ids, walk.index, walk.added = ids, 1, 0
+    walk.announce = announce and true or false
+    lastLearn = now()
+    return true
+end
+
+local function stepWalk()
+    local ids = walk.ids
+    if not ids then return end
+    local mine, reach = craftableSet(), reachableSet()
+    local wants = requirements()
+    local last = math.min(walk.index + SLICE - 1, #ids)
+    for i = walk.index, last do
+        local recipeID = ids[i]
         local known = true
         local ok2, info = pcall(C_TradeSkillUI.GetRecipeInfo, recipeID)
         if ok2 and type(info) == "table" and info.learned ~= nil then
@@ -162,18 +256,28 @@ local function learnFromOpenProfession()
                 if type(itemID) == "number" and not issecretvalue(itemID) then
                     if not mine[itemID] then
                         mine[itemID] = true
-                        added = added + 1
+                        walk.added = walk.added + 1
                     end
                     -- Refreshed every time, not only for new recipes: skill
                     -- goes up, and a rank you could not reach last week is
                     -- exactly the thing you want the addon to notice.
                     local q = reachableQuality(recipeID)
                     if q then reach[itemID] = q end
+                    local needs = requirementString(schematic)
+                    if needs then wants[itemID] = needs end
                 end
             end
         end
     end
-    return added
+    walk.index = last + 1
+    if walk.index > #ids then
+        walk.ids = nil
+        if walk.announce then
+            print(string.format("|cff44ff44WowCraft|r: learned %d more "
+                                .. "craftable item(s) on this character.",
+                                walk.added))
+        end
+    end
 end
 
 -- -- watching the channel ---------------------------------------------------
@@ -274,9 +378,17 @@ end
 
 local function redraw()
     build()
-    local now, shown = time(), 0
+    -- Deliberately NOT called `now`: there is a now() above returning
+    -- GetTime(), a monotonic clock with an arbitrary origin, and this is
+    -- time(), a wall clock in epoch seconds. Naming the local `now` shadowed
+    -- that function inside this scope, so anything added here that reached for
+    -- the throttle clock would have called a number. The two clocks are not
+    -- interchangeable and no longer share a name.
+    local wallNow, shown = time(), 0
     for i = #matches, 1, -1 do
-        if now - matches[i].at > KEEP_SECONDS then table.remove(matches, i) end
+        if wallNow - matches[i].at > KEEP_SECONDS then
+            table.remove(matches, i)
+        end
     end
     for i = 1, MAX_ROWS do
         local m, row = matches[i], rows[i]
@@ -300,13 +412,21 @@ f:RegisterEvent("PLAYER_LOGIN")
 f:RegisterEvent("CHAT_MSG_CHANNEL")
 f:RegisterEvent("TRADE_SKILL_LIST_UPDATE")
 f:RegisterEvent("TRADE_SKILL_SHOW")
+f:SetScript("OnUpdate", function()
+    if walk.ids then stepWalk() end
+end)
 f:SetScript("OnEvent", function(_, event, ...)
     if event == "PLAYER_LOGIN" then
         build()
         return
     end
     if event ~= "CHAT_MSG_CHANNEL" then
-        learnFromOpenProfession()
+        -- Opening the window is worth a walk immediately; the list updating
+        -- again half a second later, because a letter was typed into the
+        -- search box, is not.
+        if event == "TRADE_SKILL_SHOW" or (now() - lastLearn) > LEARN_EVERY then
+            beginWalk(false)
+        end
         return
     end
 
@@ -358,9 +478,15 @@ SLASH_WCTRADE1 = "/wctrade"
 SlashCmdList["WCTRADE"] = function(arg)
     arg = (arg or ""):lower():match("^%s*(.-)%s*$")
     if arg == "learn" then
-        local added = learnFromOpenProfession()
-        print(string.format("|cff44ff44WowCraft|r: learned %d more craftable "
-                            .. "item(s) for %s.", added, me()))
+        -- The walk runs across frames now, so the count is not known yet.
+        -- It announces itself when it finishes rather than reporting a
+        -- number it has not counted.
+        if beginWalk(true) then
+            print("|cff44ff44WowCraft|r: reading this profession's recipes for "
+                  .. me() .. " - it reports back in a moment.")
+        else
+            print("|cff44ff44WowCraft|r: open a profession window first.")
+        end
         return
     end
     if arg == "clear" then

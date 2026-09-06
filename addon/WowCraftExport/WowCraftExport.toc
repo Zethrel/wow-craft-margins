@@ -2,7 +2,7 @@
 ## Title: WowCraft Export
 ## Notes: Exports the open profession's recipe schematics to SavedVariables, for the wowcraft margin scanner. Collection only - reads C_TradeSkillUI, touches nothing protected.
 ## Author: Zethrel - Argent Dawn EU
-## Version: 0.10
+## Version: 0.11
 ## SavedVariables: WowCraftExportDB
 ## IconTexture: Interface\Icons\Trade_BlackSmithing
 
@@ -11,6 +11,12 @@
 PriceData.lua
 main.lua
 inventory.lua
+auctions.lua
 trade.lua
 undercut.lua
 prices.lua
+# Reads the two tables the others leave behind - what you can make, and what
+# each craft earns - so it has to load after both.
+craft.lua
+# And this one reads what craft.lua's list would cost to actually make.
+shop.lua

@@ -13,7 +13,6 @@
 -- you know in that profession, not just the expansion tab you happen to have
 -- open, so there is no need to click through the tiers.
 
-local ADDON = ...
 
 -- 12.0 secret values: clients before that don't have issecretvalue.
 local issecretvalue = issecretvalue or function() return false end
