@@ -38,6 +38,14 @@ REM registry points at the Store's real executable, which exists and then
 REM refuses to launch, so an existence check picks the one path guaranteed to
 REM fail and never reaches the alias that works.
 
+REM How long the log is BEFORE this run, so an interactive run can print back
+REM exactly its own lines at the end. The output still streams straight into
+REM scan.log as it happens: capturing it to a temp file and echoing that
+REM afterwards would be simpler, but it would also mean a fifteen minute
+REM `scan` shows nothing anywhere until it finishes.
+set "WCSKIP=0"
+for /f %%N in ('type scan.log 2^>nul ^| find /c /v ""') do set "WCSKIP=%%N"
+
 echo.>> scan.log
 echo ==== %DATE% %TIME% (%WCCMD%) ==== >> scan.log
 
@@ -72,6 +80,23 @@ echo ---- python: %PY% >> scan.log
 "%PY%" wowcraft.py %WCCMD% >> scan.log 2>&1
 set RC=%ERRORLEVEL%
 if not "%RC%"=="0" echo ---- exited with code %RC% >> scan.log
+
+REM -- say something, when there is somebody to say it to --------------------
+REM Everything above goes to the log and nothing to the console, which is
+REM right for Task Scheduler and useless when you have just typed the command
+REM and are watching a prompt do nothing. So when this is a real session,
+REM print back the lines this run added.
+REM
+REM SESSIONNAME is "Console" or "RDP-Tcp#nn" for a logged-on session and
+REM "Services" (or unset) for a task running in session 0. Not a perfect test
+REM - a task set to "run only when the user is logged on" looks interactive -
+REM but the cost of being wrong is writing to a console nobody is looking at,
+REM which is one PowerShell launch and nothing else.
+REM
+REM Before the trim below, never after: trimming renumbers the lines.
+REM One line and no parenthesised block on purpose: the command below contains
+REM brackets, and cmd's block parser has enough opinions about those already.
+if defined SESSIONNAME if /i not "%SESSIONNAME%"=="Services" powershell -NoProfile -Command "Get-Content scan.log | Select-Object -Skip ([int]$env:WCSKIP)"
 
 REM Keep the log from growing without bound: past ~2 MB, keep the tail.
 for %%F in (scan.log) do if %%~zF GTR 2000000 (
