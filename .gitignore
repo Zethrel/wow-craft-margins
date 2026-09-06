@@ -40,3 +40,19 @@ site/
 
 __pycache__/
 *.pyc
+
+# Other people's data. The TSM SavedVariables a supporter shared is one
+# person's actual account: 23 character names, a gold log, and three and a
+# half years of transactions. It is here to read for ideas, not to publish -
+# and this repo is public.
+TSM information and inspiration/
+
+# What `repair` and a hand-made rescue leave beside the live database. Same
+# 28 MB as the real one, and the whole point of keeping them is that they are
+# local safety copies.
+*.bad
+wowcraft.corrupt-*.sqlite3
+wowcraft.sqlite3.rebuilt
+
+# Where files go when device tooling cannot delete them.
+_to_delete/

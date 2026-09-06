@@ -110,6 +110,16 @@ that quoting entirely, which is also why the wrapper exists at all.
 The wrapper appends to `scan.log` with a timestamp per run, records a non-zero
 exit code, and trims the log to its last 400 lines once it passes 2 MB.
 
+Run it **by hand** and it also prints that run's log lines back to the console
+when it finishes — a scheduled run stays silent, since there is nobody to print
+to. It decides by `SESSIONNAME`, which is `Console` or `RDP-Tcp#nn` for a
+logged-on session and `Services` or unset in session 0. Output still streams
+into `scan.log` while the command runs, so a long `scan` can still be watched
+with `Get-Content scan.log -Wait -Tail 20` from another window.
+
+Note that from PowerShell it is `.\run-scan.cmd pull`, and that it takes the
+subcommand as its first argument — no argument means `scan`.
+
 To run **whether or not you are logged on**, use S4U — it needs no stored
 password, and outbound HTTPS works fine under it (only network *shares* do
 not). From an elevated PowerShell:
@@ -300,8 +310,9 @@ CI, and exactly when you want a diagnostic. It reports:
   staleness threshold, every published file and its size
 - **[C2]** timezones: publisher versus this machine, since a mismatch stores
   every calendar day twice and nothing else complains
-- **[C3]** local state: database size, recipe count, days of history, whether
-  any date is stored twice, and when `PriceData.lua` was last written
+- **[C3]** local state: whether sqlite reports the database as damaged,
+  database size, recipe count, days of history, whether any date is stored
+  twice, and when `PriceData.lua` was last written
 - **[C4]** self-dispatch: the token's source and length, the target repo and
   workflow, and whether the token can actually dispatch
 
@@ -314,6 +325,43 @@ branch was bogus. A `403` also prints the two settings that cause it — the
 
 The report contains no credentials and no token — only lengths and sources —
 so it stays safe to paste anywhere.
+
+### When the database itself is damaged
+
+```bash
+python3 wowcraft.py repair
+```
+
+Checks `PRAGMA integrity_check` and, if sqlite reports damage, rebuilds the
+file by reading every row with a plain table scan into a fresh, empty schema.
+It keeps the damaged original beside the repaired one as
+`wowcraft.sqlite3.YYYY-MM-DD.bad`, and says how many rows (if any) it could not
+carry across. On a healthy database it does nothing and says so.
+
+This is not hypothetical, and it is worth knowing what it looked like. Two rows
+went missing from `price_snapshot`'s primary-key index on a machine that had
+been running for weeks. **Nothing announced it.** Every count and every scan
+kept returning the right answer, because they read the table. `SELECT DISTINCT`
+reads the *index* — so it returned an empty blob that had never been stored,
+the history carry compared that against an integer, and `pull` died on the
+`TypeError` before the swap. Every hour. For six days. The dashboard kept
+updating (it is written before the database is installed) and the tooltip in
+game kept quoting week-old prices under a timestamp that looked fine at a
+glance.
+
+Three things changed as a result:
+
+- `pull` checks the file before reading it, rebuilds a clean copy to read
+  through if it is damaged, and completes — it replaces the whole database
+  anyway, so damage in the old one now costs at most the local-only tables,
+  never the pull.
+- `doctor`'s **[C3]** reports integrity, so the state is visible without
+  waiting for something to break.
+- `repair` exists for the machine that *scans*, where nothing is coming to
+  replace the file and a bad index would otherwise sit there indefinitely.
+
+`pull` heals itself; a scanning machine needs `repair`. A rebuild is cheap —
+about a second on a 28 MB database — so running it on suspicion costs nothing.
 
 ### The database, and why there is a seed
 
@@ -387,8 +435,10 @@ untouched and exiting non-zero rather than reporting success over stale prices.
 Keep running `addon_import.py` locally for the inventory side; it is unaffected.
 
 `test_cloud.py` covers the whole round trip — publish, serve, pull — against a
-fake API and a local HTTP server, including the inventory hand-off and a
-corrupt download.
+fake API and a local HTTP server, including the inventory hand-off, a corrupt
+download, and a *damaged local database*: it empties a primary-key index by
+hand (valid page, no rows) and asserts the pull spots it, rebuilds a clean copy
+to read through, and still completes.
 
 ---
 
@@ -495,6 +545,11 @@ zero — nothing left the market at all across the whole week.
 
 `demand_cap_turnover` in `config.json` changes the multiple; 0 turns it off.
 
+*Every figure in this section was measured under `sale_basis: "likely"`, which
+is no longer the default — see the next section for what the ladder test did to
+them.* They are left here because the cap was designed against them, and because
+the size of the correction is the point.
+
 **The cap is a bound, not a fix — so the real one is being measured.** A
 commodity ladder is consumed from the cheapest end, which gives a test the
 snapshot can actually answer: take the cheapest posting that survived *both*
@@ -509,23 +564,71 @@ number being undercut churn counted as trade. The same comparison over the
 whole stored window is one line further down, and `Store.sale_signal_summary`
 answers it from the columns for any database at any time.
 
-**No figure is quoted here yet, because none has been collected yet.** The
-column starts at zero on every existing row — it has to, nothing measured them
-— so the scan counts from the first whole day after the upgrade rather than
-reporting a week of history it never saw as 100% cancellation.
+**The figure came in, and it is large.** A week on Argent Dawn EU, 30,166 items:
 
-Nothing is ranked on it yet. `sale_basis` in `config.json` is `"likely"` — the
-old measure — until there are enough days behind the new one to say what
-changing it does, because swapping a number on an argument rather than on a
-measurement is how the discredited aggregate version got shipped in the first
-place. Set it to `"swept"` to switch; a scan that finds no whole day of the new
-signal falls back and says so rather than emptying the table.
+| | units | share |
+|---|---:|---:|
+| confirmed partial sales | 24,554,586 | — |
+| vanished with hours left (`sold_likely`) | 447,687,569 | 100% |
+| of those, swept from below a survivor (`sold_swept`) | 141,634,769 | 31.6% |
 
-Two known limits. The test is honest on commodities and weaker on realm gear,
-where an auction is a single item and variants are not interchangeable. And an
-item whose *entire* ladder turned over inside one hour is left out rather than
-counted: one buyer clearing the lot and one seller pulling everything leave the
-same trace.
+**68.4% of what was being counted as sales was not a sale.** `sold_likely` was
+overstating demand by about 3.2×, and gold/day is `margin × demand × share`, so
+every projection on the dashboard was inflated by roughly the same factor.
+
+`sale_basis` therefore now ships as `"swept"`. A scan that finds no whole day of
+the ladder test behind it falls back to `"likely"` and says so rather than
+emptying the table.
+
+**Why the per-item measurement and not a flat 0.32 haircut on `likely`.** The
+correction is not a constant. Across the 11,543 items where both signals are
+positive, `swept ÷ likely` runs p10 **0.06**, median **0.34**, p90 **1.00** —
+some markets are almost pure undercut churn and others are almost pure trade.
+One average applied to both would be wrong in opposite directions at once. The
+per-item figure is already measured, so there is no reason to use the average.
+
+**What changes on screen.** The same 30,166 items keep a measured rate — the
+switch costs no coverage. Of the 18,912 that read as moving under `likely`,
+11,543 still do; **7,369 drop to exactly zero**. That is not a gap in the data,
+it is the answer: units left those markets, and none of it looked like anyone
+buying. Those are the crafts to stop making, and `/wccraft` hides them by
+default while still separating them from *never measured*.
+
+**The cap is now a guard rather than a crutch.** `demand_cap_turnover` at 1.0
+clamped 12.3% of moving items under `likely`; under `swept` it clamps 4.2%.
+Demand-to-supply falls from a median of 0.11 to 0.06, p99 from 6.67 to 2.41. It
+is left at 1.0 — it still catches the outliers a one-off bulk buy produces —
+but it is no longer quietly doing the work the signal should have been doing.
+
+**Three known limits, and the scan prints the first one every run.**
+
+The test is honest on commodities and weak on realm gear, so the churn figure
+is reported **split by source**:
+
+```
+commodity  churn  68.4%  (141,615,317 swept of 447,451,594 vanished, 24,554,586 confirmed partial)
+realm      churn  91.8%  (     19,452 swept of     235,975 vanished,          0 confirmed partial)
+```
+
+Commodity buying goes through the client's own cheapest-first purchase call, so
+"gone from below a surviving cheaper listing" is *literally* what a buyer does.
+Realm auctions are picked one at a time, and two postings of one item id can be
+different bonus-list variants at honestly different prices — a buyer taking the
+dearer one is recorded here as a cancellation. Realm volume is 0.05% of
+commodity volume, which is the only reason that weakness is tolerable rather
+than disqualifying; treat a gear rate as the weakest number on the page. (The
+zero confirmed partials are not a bug: a realm auction is one item, so there is
+no such thing as a partial sale of it.)
+
+Second: an item whose *entire* ladder turned over inside one hour is left out
+rather than counted — one buyer clearing the lot and one seller pulling
+everything leave the same trace.
+
+Third, and it follows from the design: `sold_swept` is a **lower bound**. It can
+only see a sale that left a cheaper listing standing. The truth is somewhere
+between it and `sold_likely`, nearer the swept end on deep ladders. Both columns
+are recorded on every scan regardless of the setting, so switching back costs
+nothing and loses no history.
 
 **The restock target fails towards crafting nothing.** No sale rate means no
 target rather than a target of zero — the two are not the same and the ranking
@@ -537,11 +640,40 @@ one. What you already hold, from the addon's inventory export, is deducted.
 `--cover-days N` sets the window (default 3). Short is deliberate: an undercut
 war or a patch should not catch you holding a month of inventory.
 
-**What it still cannot see.** Your own auctions, above all — nothing in the API
-or the addon reports what you already have posted, so a restock you have
-already made and listed will be suggested a second time. Nor whether you can
-hit the crafting quality that sets the price, nor that a transmute-sourced
-reagent is limited to one a day. And the forecast inherits every flaw in the
+**Why the deduction happens in the client rather than in the scanner.** Both
+halves of it — what you hold and what you have listed — are things the game
+knows and the database only remembers. `GetItemCount` covers bags, bank and
+reagent bank as they are right now; the exported inventory is as fresh as your
+last `/reload`. And `pull` downloads a `PriceData.lua` built in the cloud,
+where none of your stock exists, so a file that arrived already deducted would
+mean "deducted by nobody". Doing it on display fixes both, and keeps the
+subtraction in one place so it cannot be applied twice.
+
+The dashboard still deducts on its own, from the exported inventory and
+listings, because it is a page and has no client to ask.
+
+**Your own listings are deducted too, when the addon has read them.** Stock
+you have already crafted and listed is in neither your bags nor your bank, so
+until recently a craft posted in the morning was suggested again in the
+afternoon. `auctions.lua` reads `C_AuctionHouse.QueryOwnedAuctions` whenever
+you open the auction house and `addon_import.py --apply` stores it; restock
+then subtracts what you hold *and* what you have listed.
+
+Two limits, both stamped rather than papered over. Owned auctions are only
+readable with the auction house open, so that half is as fresh as your last
+visit — and a reading older than 48 hours, the longest an auction can live, is
+**ignored** rather than trusted, because deducting listings that have since
+sold or expired would suppress crafting you actually need to do. A sold but
+uncollected auction is not counted either: it is off the market and not in
+your bags, so treating it as stock would suppress a restock twice over.
+
+A read that finds nothing listed is still recorded as a read. "Checked twenty
+minutes ago, you have nothing listed" and "your listings have never been read"
+are different facts, in the same way a measured zero and an unmeasured item
+are.
+
+**What it still cannot see.** Whether you can hit the crafting quality that
+sets the price, and that a transmute-sourced reagent is limited to one a day. And the forecast inherits every flaw in the
 price under it: on an output with one or two listings the margin is mostly
 somebody's asking price, and multiplying a fiction by a sale rate produces a
 larger fiction. Those rows are badged **thin market** and there is a *Liquid
@@ -774,6 +906,99 @@ These are real gaps, not hedging:
 Treat a high margin as a lead to verify in-game, not as gold in the bank. If a
 number looks too good, it usually means the item is thinly listed or quality-tiered.
 
+## The quality-tier experiment (settled: it was not item level)
+
+`doctor` section [7] can see that **7,748 of 29,610 priced items** carry more
+than one bonus-list variant, and that variants of one item price wildly apart.
+It could never say *why*, and the two candidate causes wanted opposite
+responses: if the spread is **item level**, price each level as its own market
+and the gap closes; if it is something else, modelling item level achieves
+nothing.
+
+So it was measured rather than argued about. TradeSkillMaster's
+[BonusIdTool][bit] (MIT) computes item level from bonus IDs offline in Python,
+which is exactly the shape the auction API hands us. It was vendored, verified
+against upstream across 3,005 cases with zero mismatches, wired into [7] behind
+a pre-registered verdict — *if item level explains most of the spread, keep it;
+if not, delete it* — and run against a live Argent Dawn scan.
+
+[bit]: https://github.com/TradeSkillMaster/BonusIdTool
+
+```
+      5,593 item(s) price their variants over 10% apart
+        item level accounts for it : 1,071 (19%)
+        it does not               : 4,522 (81%)
+      median spread across variants      : 6.83x
+      median spread within one item level: 3.91x
+```
+
+**Item level explains 19% of it.** Grouping variants by item level moved the
+median spread from 6.83x only to 3.91x — it removes 43% of the spread and
+leaves the rest. On every one of the worst cases it removed *nothing*:
+
+```
+item 170112: 100,000.0x across 1 level(s), 100,000.0x within one of them
+item 224599:  31,713.8x across 2 level(s),  31,713.8x within one of them
+```
+
+A hundred-thousand-fold range inside a single item level is not a valuation
+difference at all — it is one seller's asking price against another's, on
+variants that mostly have a single listing each. Which sharpens the conclusion
+rather than weakening it: **the variant spread is largely listing noise, not a
+signal about what the item is worth**, and no bonus-ID modelling would have
+touched it.
+
+So `bonusid.py` and its 264 KB data file **were deleted**, exactly as the
+verdict said. The cost was an afternoon; the return is that nobody has to
+wonder again. If you find yourself reaching for item-level modelling, this is
+the result to read first.
+
+What *is* still unmodelled: variants whose price differs by secondary stats, and
+the fact that a variant with one listing has no market price at all — only an
+asking price. `VARIANT_MIN_LISTINGS` already refuses to price those; the numbers
+above are a reminder of why.
+
+---
+
+## Linting the addon
+
+The addon's Lua is checked by [wowlua-ls][wls], a language server built for WoW
+Lua rather than a general one with stubs bolted on. It is **not vendored** — it
+is GPL-3.0 and this project is not, so it is used as a tool and nothing more,
+which carries no obligation.
+
+[wls]: https://github.com/TradeSkillMaster/wowlua-ls
+
+```bash
+wowlua_ls check addon/WowCraftExport --severity hint
+```
+
+Binaries are on its releases page; on Windows take
+`wowlua_ls-x86_64-pc-windows-msvc.exe`.
+
+`.wowluarc.json` in the addon folder declares the two globals it cannot
+otherwise see — `WowCraftPrices`, which the generated `PriceData.lua` defines
+and which is therefore never in the repo, and `WowCraftExport_Stock`, which
+`auctions.lua` deliberately exports for `prices.lua` and `craft.lua` — and sets
+`flavors: ["retail"]`, which is what turns on the `wrong-flavor-api` check.
+
+The first run over 3,218 lines found no false positives and two real things:
+
+- `trade.lua` had a `now()` function returning `GetTime()` (monotonic) and, in
+  `redraw()`, a `local now = time()` (wall clock) shadowing it. Nothing called
+  it in that scope yet, so nothing was broken — but anything later reaching for
+  the throttle clock inside `redraw` would have called a number. The local is
+  now `wallNow`.
+- `main.lua` captured the addon vararg into an unused `ADDON` local.
+
+**It is not in CI, on purpose.** The tool is beta by its own README, and a false
+positive failing a build on correct code is worse than no linter. Run it by
+hand; wire it in once it has been quiet for a while, and pin the version when
+you do — a beta that gains diagnostics between runs will fail builds that
+changed nothing.
+
+---
+
 ## Verified against the live API
 
 The tool was originally built in a sandbox with `battle.net` blocked, so nothing
@@ -817,6 +1042,7 @@ Run `doctor` first.
 | `seed` | Export the recipe cache for the CI workflow to cold-start from |
 | `demo` | Run the whole pipeline on synthetic data, no credentials |
 | `doctor` | Probe every endpoint *and* the pull side, write a shareable report |
+| `repair` | Check the local database and rebuild it if sqlite reports damage |
 | `names` | Look up names for every priced item that has none (one-off, ~6 min) |
 
 Blizzard allows 36,000 requests an hour. A full `init` plus a full `names` is
@@ -953,6 +1179,13 @@ python3 test_inventory.py   # the inventory collector, addon Lua through to owne
 python3 test_trade.py       # the trade-channel watcher, including that it never sends
 python3 test_undercut.py    # the undercut helper, including that it never posts
 python3 test_pricecheck.py  # the lookup window, including picking up a scan while open
+python3 test_restock.py     # gold/day and the restock quantity
+python3 test_velocity.py    # the sale-rate signals, including the ladder sweep
+python3 test_sourcing.py    # buy-or-craft for reagents
+python3 test_craft.py       # /wccraft, against a stubbed client
+python3 test_shop.py        # /wcshop, including that it buys nothing
+python3 test_auctions.py    # reading your own listings, including that it posts nothing
+python3 test_cloud.py       # publish/pull round trip, and database repair
 ```
 
 `test_addon.py` needs `lupa` (`pip install lupa`) to run the addon's Lua for
@@ -990,7 +1223,11 @@ set in `config.json`. The addon loads it and adds, for any item it knows:
 - **what the craft is worth a day, and how many to make** — the same two
   numbers the dashboard ranks on, on the tooltip and on the crafting window,
   because standing at the crafting table is where "how many" actually gets
-  decided
+  decided. `PriceData.lua` carries what the *market* wants and the addon
+  subtracts your own stock from it live, so "make 3 (of 12, you have 9)"
+  counts bags, bank and reagent bank to the second — and works whether the
+  file was built by your own `scan` or downloaded by `pull` from a cloud that
+  has never seen your bags
 - a line on the crafting window showing cost, sale price and margin for the
   recipe you have open
 
@@ -1070,6 +1307,97 @@ returns distinct per-quality items for gear (53 Blacksmithing and 28
 Leatherworking recipes) but the same id for every quality on consumables, so
 Alchemy and Cooking show none. Not yet modelled either way.
 
+### What to make (`/wccraft`)
+
+The dashboard ranks every craft the scanner can price — around six thousand
+rows — and you can make perhaps two hundred of them. `/wccraft` is the
+intersection: the crafts **this character has learned**, ranked by gold a day,
+with the quantity to make.
+
+```
+/wccraft           the list
+/wccraft all       include losses, and outputs nothing has been seen buying
+```
+
+It reads two tables that are already in the client — the margins from
+`PriceData.lua` and the learned-recipe set `trade.lua` keeps up to date
+whenever a profession window is open — so it fetches nothing, scans nothing,
+and calls nothing protected. Clicking a row links the item in chat. As
+everywhere else in this addon, it never posts and never whispers.
+
+The ordering is the dashboard's, for the same reasons: fully costed crafts
+above floor-costed ones, measured sale rates above unmeasured ones, then gold
+a day, then margin. Each row says which of those it is — a figure with a
+quantity, *no sales seen*, *no rate*, or the `floor` badge — because a ranked
+list in the middle of the screen reads as an instruction, and these numbers
+are a projection.
+
+**Two things are hidden by default and the header says so**: crafts that lose
+money, and crafts whose output has not shifted a single unit all week. A
+fantasy margin on something nobody buys is exactly what the gold/day ranking
+exists to demote, and demoting it to the bottom of a twenty-row window is the
+same as showing it. The count of what was hidden, and the command to see it,
+are in the header — a filter nobody knows about is indistinguishable from
+missing data.
+
+An empty list always says which of three different things is wrong: no price
+data at all, no professions exported yet, or nothing you can make being worth
+making at today's prices.
+
+### What to buy (`/wcshop`)
+
+`/wccraft` says what to make. `/wcshop` says what that takes: every reagent the
+worth-making crafts consume, summed, netted against what you already hold, and
+priced.
+
+```
+/wcshop            the list
+```
+
+It asks the auction house for nothing — no scan, no search, no purchase.
+Clicking a row types the reagent's name into the search box and stops there,
+the same way the undercut panel writes a price and leaves *Create Auction* to
+you. Away from the auction house it links the item in chat instead.
+
+Four things go into it and all four are already on the client: what to make
+and how many (`PriceData.lua`, less your own stock), what one craft consumes
+(recorded by `trade.lua` whenever a profession window is open), what you hold
+(live), and the cheapest price from the last scan.
+
+Details that are easy to get wrong and are therefore tested:
+
+- **Yield.** A recipe that makes two a craft needs half as many runs, so
+  `PriceData.lua` carries the crafted quantity and the list divides by it
+  before multiplying anything.
+- **Shared stock is netted once**, against the whole list rather than per
+  craft. Two recipes wanting the same herb share the stack in your bag;
+  subtracting it from both would send you shopping for twice what you are
+  short of.
+- **Basic reagents only.** Optional and finishing reagents are a choice made
+  at the crafting table, and a shopping list that told you to buy them would
+  be inventing a decision on your behalf.
+- **The cheapest legal quality** is the one costed, which is the same
+  assumption the scanner makes when it prices a slot — and carries the same
+  caveat, since a better reagent costs more and crafts better.
+
+The header says **runs, not crafts** — "108 runs of Elixir of Minor
+Fortitude", because "108 crafts" reads as a hundred and eight different things
+to make. One recipe is named outright; more than one would not fit, so the
+count stands in and **hovering the summary** lists every recipe with its run
+count. Hovering a reagent names the crafts that want it: a hundred of
+something is worth knowing the name of before spending two hundred gold on
+herbs for it.
+
+Crafts whose reagents have never been recorded are **named**, not merely
+counted — "Mystery Brew has no reagents recorded". A count on its own cannot
+be acted on, and the usual cause is obvious once it has a name: a second
+profession whose window has not been opened on that character this session.
+
+The total is an estimate and says so. Every quantity descends from the restock
+projection, so a shopping list multiplies that projection's error by a reagent
+count. Crafts whose reagents this character has never recorded are counted in
+the header rather than quietly left out.
+
 ### Undercutting at the auction house
 
 Open something to sell and a small panel appears beside the auction house
@@ -1117,7 +1445,18 @@ addon pulls the itemID out of the link and checks it against what **this
 character has learned**. Nothing fires unless you can actually make the thing.
 
 Open a profession window once per character and run `/wctrade learn` (or just
-open it — a profession window refreshes the set on its own). After that, a
+open it — a profession window refreshes the set on its own).
+
+That refresh is **throttled and spread across frames**, because it is not
+cheap: it asks `GetRecipeInfo`, `GetRecipeSchematic` and
+`GetCraftingOperationInfo` (twice, for the concentration case) for every
+recipe the character knows. It used to run in full on every
+`TRADE_SKILL_LIST_UPDATE` — an event the client fires on **every keystroke in
+the profession search box** — so typing a recipe name walked several thousand
+recipes per letter and stuttered the game in the one window whose whole
+purpose is typing into it. It now walks at most once every ten seconds, forty
+recipes per frame. Nothing is lost by the delay: what you know does not change
+while you type. After that, a
 linked request in trade prints a line with the buyer's name, the item, and what
 the mats cost you, and lists it in a small movable window. Click a row to open
 a whisper box addressed to them.
@@ -1126,6 +1465,26 @@ a whisper box addressed to them.
 cursor to you. Automated whispering is a spam-policy problem and would buy
 nothing — the value is in noticing the request, not in saving a keystroke.
 `/wctrade` shows what is being watched, `/wctrade clear` empties the list.
+
+**It never asks the auction house for anything on its own**, and that is the
+design rather than an omission. The first version queried owned auctions on
+`AUCTION_HOUSE_SHOW` — the same moment Blizzard's own UI issues the browse
+query that restores your last search — and the auction house runs one
+throttled query at a time. The two raced, the browse reply never arrived, and
+the window sat on *Searching…* until it was closed and reopened. An addon that
+collects data has no business breaking the window it collects from.
+
+So it listens instead. `OWNED_AUCTIONS_UPDATED` fires whenever the client
+refreshes your listings, which it does by itself when you open your **Auctions
+tab** to look at them, and whatever was in that refresh is what gets recorded.
+The cost is that the reading is as fresh as the last time you looked at your
+own auctions rather than the last time you walked past an auctioneer.
+
+`/wcauctions` reports what was last read and when, and will force a refresh —
+but only with the frame open and only when nothing else is in flight, and it
+says which of those stopped it rather than failing quietly. Like everything
+else here it only ever reads: nothing posts, cancels or bids, and the test
+suite fails if a posting function is ever called.
 
 Usage: open a profession window, `/wcexport`, then `/reload` to flush the file.
 Repeat once per profession, on whichever character has it — each export is
