@@ -340,7 +340,7 @@ switch it off entirely.
 python3 wowcraft.py doctor
 ```
 
-`doctor` now covers the pull side as well as the API, and **runs without
+`doctor` covers the pull side as well as the API, and **runs without
 Battle.net credentials** — which is the normal state once scanning moved to
 CI, and exactly when you want a diagnostic. It reports:
 
@@ -362,6 +362,13 @@ the permission is missing, `422` means the permission is fine and only the
 branch was bogus. A `403` also prints the two settings that cause it — the
 *Public repositories* access mode is read-only and can never grant
 `actions=write`, which GitHub's own error never mentions.
+
+`doctor-cloud` runs **[C1]–[C5] only**. `doctor` falls back to those when it
+finds no credentials, but on the machine that *has* them there was otherwise no
+way to ask — and the pull side is the half that goes wrong: a stale published
+site, a timezone drift, a download button still pointing at last month's
+release. Seconds and no API budget, against minutes and a chunk of the hourly
+allowance for the full sweep.
 
 The report contains no credentials and no token — only lengths and sources —
 so it stays safe to paste anywhere.
@@ -1082,6 +1089,7 @@ Run `doctor` first.
 | `seed` | Export the recipe cache for the CI workflow to cold-start from |
 | `demo` | Run the whole pipeline on synthetic data, no credentials |
 | `doctor` | Probe every endpoint *and* the pull side, write a shareable report |
+| `doctor-cloud` | The pull side alone — no credentials, no API calls, a few seconds |
 | `repair` | Check the local database and rebuild it if sqlite reports damage |
 | `names` | Look up names for every priced item that has none (one-off, ~6 min) |
 

@@ -5734,7 +5734,7 @@ def main(argv: Optional[list] = None) -> int:
         description="Crafting margin scanner using Blizzard's official API.")
     ap.add_argument("command",
                     choices=["init", "scan", "pull", "seed", "demo", "config",
-                             "doctor", "repair", "names"],
+                             "doctor", "doctor-cloud", "repair", "names"],
                     help="init: cache recipes (run once per patch). "
                          "scan: fetch auctions and build the dashboard. "
                          "pull: download a published scan instead of running "
@@ -5745,6 +5745,10 @@ def main(argv: Optional[list] = None) -> int:
                          "config: write a starter config.json. "
                          "doctor: probe every endpoint and write a shareable "
                          "diagnostic report. "
+                         "doctor-cloud: the pull side alone - published "
+                         "site, timezones, local state, self-dispatch and the "
+                         "release the download button hands out. No "
+                         "credentials, no API calls, a few seconds. "
                          "repair: check the local database and rebuild it if "
                          "sqlite reports damage. "
                          "names: look up names for every priced item that has "
@@ -5840,6 +5844,15 @@ def main(argv: Optional[list] = None) -> int:
         return cmd_repair(args.db)
 
     cfg = load_config(args.config)
+
+    # `doctor` already falls back to the pull side when there are no
+    # credentials, but that left no way to ask for it on a machine that HAS
+    # them - and the pull side is the half that breaks: a stale published
+    # site, a timezone drift, a download button pointing at last month's
+    # release. Asking for it directly costs seconds and no API budget, where
+    # the full sweep costs minutes and a chunk of the hourly allowance.
+    if args.command == "doctor-cloud":
+        return cmd_doctor_cloud(cfg, args.db)
 
     # Before the credential gate on purpose: the whole point of `pull` is that
     # the machine running it has no Blizzard credentials and needs none.

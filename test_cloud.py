@@ -884,6 +884,37 @@ must("it covers time zones", "[C2]" in text)
 must("it covers local state", "[C3]" in text)
 must("it covers self-dispatch", "[C4]" in text)
 
+# ---- 6f1. asking for the pull side on a machine that has credentials --
+# `doctor` falls back to this when credentials are missing, which left no way
+# to ask for it when they are present - and the pull side is the half that
+# breaks. It was also referenced in instructions before it existed, which is
+# its own kind of bug.
+_cwd, _had_repo = os.getcwd(), os.environ.pop("GITHUB_REPOSITORY", None)
+_dc = os.path.join(tmp, "doctorcloud")
+os.makedirs(_dc, exist_ok=True)
+try:
+    os.chdir(_dc)
+    _cfg_path = os.path.join(_dc, "c.json")
+    # Credentials PRESENT: the point is that it does not go near the API.
+    with open(_cfg_path, "w", encoding="utf-8") as fh:
+        json.dump({"pull_url": "", "repo_url": "",
+                   "client_id": "id", "client_secret": "secret"}, fh)
+    with contextlib.redirect_stderr(io.StringIO()):
+        with contextlib.redirect_stdout(quiet):
+            _rc = W.main(["doctor-cloud", "-c", _cfg_path,
+                          "-d", os.path.join(_dc, "none.sqlite3")])
+    must("doctor-cloud runs even with credentials in the config", _rc == 0)
+    _report = os.path.join(_dc, "doctor-report.txt")
+    must("and writes its report", os.path.exists(_report))
+    _text = open(_report, encoding="utf-8").read()
+    must("covering the pull side", "[C1]" in _text and "[C5]" in _text)
+    must("and no Blizzard endpoint at all", "AUTHENTICATION" not in _text)
+    must("the secret never reaches the report", "secret" not in _text)
+finally:
+    os.chdir(_cwd)
+    if _had_repo is not None:
+        os.environ["GITHUB_REPOSITORY"] = _had_repo
+
 # ---- 6f2. the download the landing page hands out --------------------
 # This shipped broken and nothing noticed. /releases/latest is NOT "the
 # newest tag" - it is a separate pointer GitHub only moves when a release is
