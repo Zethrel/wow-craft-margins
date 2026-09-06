@@ -18,6 +18,7 @@ import os
 import re
 import sqlite3
 import sys
+import time
 
 DEFAULT_WOW = r"D:\Games\World of Warcraft\_retail_"
 # The client names the file after the ADDON, not after the saved variable, so
@@ -151,7 +152,6 @@ def load_inventory(paths: list) -> dict:
         for match in token.finditer(text, start):
             if match.group("who"):
                 who = match.group("who")
-                out.setdefault(who, {})
                 continue
             if not who:
                 continue
@@ -162,8 +162,72 @@ def load_inventory(paths: list) -> dict:
                 held = json.loads(raw)
             except json.JSONDecodeError:
                 continue
-            counts = out[who]
+            # Created here, on a group blob, and NOT when the character key
+            # was seen: the walk runs to the end of the file, so a name that
+            # appears in a later table - auctions, say - would otherwise
+            # arrive as a character holding nothing, and save_inventory
+            # deletes before it inserts.
+            counts = out.setdefault(who, {})
             for item_id, count in held.items():
+                try:
+                    counts[int(item_id)] = counts.get(int(item_id), 0) + int(count)
+                except (TypeError, ValueError):
+                    continue
+    return out
+
+
+def load_posted(paths: list) -> dict:
+    """{character: {"items": {item_id: count}, "seen_at": epoch}}.
+
+    What each character had listed at the auction house the last time the
+    client could read it. Kept out of `load_inventory` deliberately: a stack
+    in a bag and a stack on the auction house are not the same thing, and
+    pooling them would let stock you cannot craft with reduce a reagent bill.
+
+    `seen_at` travels with the counts because owned auctions are only
+    readable with the auction house open, so this is a photograph. Without the
+    timestamp there is no way to tell yesterday's listings from this
+    minute's, and the scanner refuses to use an old one.
+    """
+    out: dict = {}
+    token = re.compile(
+        r'\["(?P<who>[^"\\]+-[^"\\]+)"\]\s*=\s*\{'
+        r'|\["posted"\]\s*=\s*"(?P<blob>(?:[^"\\]|\\.)*)"'
+        r'|\["posted_at"\]\s*=\s*(?P<at>\d+)')
+    for path in paths:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        start = text.find('["auctions"]')
+        if start < 0:
+            continue
+        who = None
+        for match in token.finditer(text, start):
+            if match.group("who"):
+                who = match.group("who")
+                continue
+            if not who:
+                continue
+            # Entries are created by the auction fields, never by the name
+            # alone: this walk also runs to the end of the file, and a
+            # character that only appears in ["inventory"] must not arrive
+            # here as one with nothing listed - save_posted deletes before it
+            # inserts, so that would throw away a real reading.
+            #
+            # An empty "{}" blob IS a fact and does create one: it means that
+            # character has nothing listed.
+            if match.group("at"):
+                out.setdefault(who, {"items": {}, "seen_at": 0})
+                out[who]["seen_at"] = int(match.group("at"))
+                continue
+            raw = re.sub(r"\\(.)",
+                         lambda m: LUA_UNESCAPE.get(m.group(1), m.group(1)),
+                         match.group("blob"))
+            try:
+                listed = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            counts = out.setdefault(who, {"items": {}, "seen_at": 0})["items"]
+            for item_id, count in listed.items():
                 try:
                     counts[int(item_id)] = counts.get(int(item_id), 0) + int(count)
                 except (TypeError, ValueError):
@@ -674,16 +738,35 @@ def main(argv=None) -> int:
             print(f"  {who:28s} {len(held[who]):5d} distinct items, "
                   f"{sum(held[who].values()):,} total")
 
+    listed = load_posted(paths)
+    if listed:
+        print()
+        print("what you have on the auction house:")
+        for who in sorted(listed):
+            items = listed[who]["items"]
+            seen = listed[who]["seen_at"]
+            when = (time.strftime("%d %b %H:%M", time.localtime(seen))
+                    if seen else "unknown when")
+            print(f"  {who:28s} {len(items):5d} distinct items, "
+                  f"{sum(items.values()):,} units, read {when}")
+        print("  restock targets deduct these, so a craft you have already "
+              "made and listed is not suggested again.")
+
     if args.apply:
         print()
         print("applying to the cache:")
         apply_to_cache(exports, args.db)
-        if held:
+        if held or listed:
             import wowcraft as W
             store = W.Store(args.db)
-            rows = store.save_inventory(held)
-            print(f"  stored {rows} inventory rows across {len(held)} "
-                  "character(s)")
+            if held:
+                rows = store.save_inventory(held)
+                print(f"  stored {rows} inventory rows across {len(held)} "
+                      "character(s)")
+            if listed:
+                rows = store.save_posted(listed)
+                print(f"  stored {rows} auction listing rows across "
+                      f"{len(listed)} character(s)")
             store.close()
 
     if args.names and not args.apply:

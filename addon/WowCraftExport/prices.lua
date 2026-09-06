@@ -96,7 +96,17 @@ local function addItemLines(tooltip, itemID)
                                                         margin[3], margin[4],
                                                         margin[5]
         local haveRate = margin[6] == 1
-        local perDay, restock = margin[7] or 0, margin[8] or 0
+        local perDay, target = margin[7] or 0, margin[8] or 0
+        -- The file says what the market wants; what YOU still need to make is
+        -- that less what you are holding and what you already have listed.
+        -- Subtracted here rather than in the file because the client counts
+        -- your bags live, and because a file built in the cloud never saw
+        -- them at all.
+        local held, posted = 0, 0
+        if type(WowCraftExport_Stock) == "function" then
+            held, posted = WowCraftExport_Stock(itemID)
+        end
+        local restock = math.max(0, target - held - posted)
         local r, g, b = 0.4, 0.9, 0.4
         if (pct or 0) < 0 then r, g, b = 0.95, 0.4, 0.4 end
         tooltip:AddDoubleLine("Craft cost", money(cost), 0.6, 0.8, 1, 1, 1, 1)
@@ -118,8 +128,17 @@ local function addItemLines(tooltip, itemID)
             tooltip:AddDoubleLine("Expected per day", shown,
                                   0.6, 0.8, 1, sr, sg, sb)
             if restock > 0 then
-                tooltip:AddDoubleLine("Make now", string.format("%d", restock),
+                local note = ""
+                if held + posted > 0 then
+                    note = string.format(" (of %d, you have %d)", target,
+                                         held + posted)
+                end
+                tooltip:AddDoubleLine("Make now",
+                                      string.format("%d%s", restock, note),
                                       0.6, 0.8, 1, 1, 1, 1)
+            elseif target > 0 then
+                tooltip:AddDoubleLine("Make now", "none - you have enough",
+                                      0.6, 0.8, 1, 0.7, 0.7, 0.7)
             end
         end
         if complete == 0 then
@@ -266,7 +285,12 @@ local function refresh()
     local cost, revenue, pct, complete, optionals =
         margin[1], margin[2], margin[3], margin[4], margin[5]
     local haveRate = margin[6] == 1
-    local perDay, restock = margin[7] or 0, margin[8] or 0
+    local perDay, target = margin[7] or 0, margin[8] or 0
+    local held, posted = 0, 0
+    if type(WowCraftExport_Stock) == "function" then
+        held, posted = WowCraftExport_Stock(itemID)
+    end
+    local restock = math.max(0, target - held - posted)
     local profit = (revenue or 0) - (cost or 0)
     local colour = profit >= 0 and "|cff66dd66" or "|cffee6666"
     local text = string.format(
@@ -275,7 +299,9 @@ local function refresh()
     -- Standing at the crafting table is where "how many" actually gets
     -- decided, so the quantity belongs here and not only on the dashboard.
     if haveRate and perDay > 0 then
-        text = text .. string.format("  |cffffd100%s/day|r", money(perDay))
+        -- money() carries its own colour for the gold glyph, so wrapping it
+        -- in another one closes that colour early and leaves "/day" grey.
+        text = text .. "  " .. money(perDay) .. "|cffffd100/day|r"
         if restock > 0 then
             text = text .. string.format("  |cffffd100make %d|r", restock)
         end
@@ -300,6 +326,11 @@ local function refresh()
         expected = expected .. (restock > 0
             and string.format("\nmake %d to cover the next few days", restock)
             or "\nnothing to make now - what you hold covers it")
+        if held + posted > 0 then
+            expected = expected .. string.format(
+                "\nthe market wants %d; you hold %d and have %d listed",
+                target, held, posted)
+        end
     elseif haveRate and perDay == 0 then
         expected = "nothing has left the market for this output all week"
     elseif haveRate then

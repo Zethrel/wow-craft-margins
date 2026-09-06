@@ -14,6 +14,7 @@ loss gets no restock target however fast it moves, and the numbers on the page
 are the ones the stated arithmetic produces.
 """
 import json
+import os
 import time
 
 import wowcraft as W
@@ -123,7 +124,28 @@ r = result(margin=1000.0, craftable_units=10, output_listings=9,
            output_supply=10000, output_sold_per_day=40.0, output_owned=5)
 W.project_gold_per_day(r, cover_days=3.0)
 must("stock on hand is deducted", r.restock_units == 7)
-must("and the tooltip says it was", "already hold" in W.restock_tip(r, 3.0))
+must("and the tooltip says it was",
+     "in your bags or bank" in W.restock_tip(r, 3.0))
+
+# What you have already crafted AND listed is the other half of the same
+# mistake, and it is the one that shipped: a craft posted this morning was
+# suggested again this afternoon because an auction is in neither your bags
+# nor your bank.
+r = result(margin=1000.0, craftable_units=10, output_listings=9,
+           output_supply=10000, output_sold_per_day=40.0, output_posted=4)
+W.project_gold_per_day(r, cover_days=3.0)
+must("stock already on the auction house is deducted too",
+     r.restock_units == 8)
+must("and the tooltip says which is which",
+     "already listed at the auction house" in W.restock_tip(r, 3.0))
+
+r = result(margin=1000.0, craftable_units=10, output_listings=9,
+           output_supply=10000, output_sold_per_day=40.0,
+           output_owned=3, output_posted=4)
+W.project_gold_per_day(r, cover_days=3.0)
+must("both are deducted together", r.restock_units == 5)
+must("and both are named", "bags or bank" in W.restock_tip(r, 3.0)
+     and "auction house" in W.restock_tip(r, 3.0))
 
 r = result(margin=1000.0, craftable_units=10, output_listings=9,
            output_supply=10000, output_sold_per_day=40.0, output_owned=99)
@@ -143,6 +165,38 @@ r = result(margin=1000.0, craftable_units=10, output_listings=9,
            output_supply=100, output_sold_per_day=0.5)
 W.project_gold_per_day(r, cover_days=3.0)
 must("a trickle rounds to nothing to craft now", r.restock_units == 0)
+
+# ---- 5b. reading your listings back ------------------------------------
+# A listing lasts at most 48 hours, and the addon can only read them with the
+# auction house open. An old reading is therefore ignored rather than trusted:
+# deducting listings that have since sold or expired would suppress crafting
+# you actually need to do, so this fails towards "make some".
+import tempfile
+import time as _time
+
+st = W.Store(os.path.join(tempfile.mkdtemp(), "posted.sqlite3"))
+now = int(_time.time())
+st.save_posted({"Zethrel-ArgentDawn": {"items": {9: 4, 8: 1}, "seen_at": now}})
+must("a fresh reading is used", st.posted() == {9: 4, 8: 1})
+must("and its age is available to say so", st.posted_seen_at() == now)
+
+st.save_posted({"Zethrel-ArgentDawn":
+                {"items": {9: 4}, "seen_at": now - 50 * 3600}})
+must("a reading older than an auction can live is ignored", st.posted() == {})
+must("but the timestamp survives, so the page can say why",
+     st.posted_seen_at() == now - 50 * 3600)
+
+# An empty read is a fact - "I have nothing listed" - not an absence of news,
+# so it must clear what was there rather than leaving stale rows behind.
+st.save_posted({"Zethrel-ArgentDawn": {"items": {9: 4}, "seen_at": now}})
+st.save_posted({"Zethrel-ArgentDawn": {"items": {}, "seen_at": now}})
+must("an empty reading clears the previous one", st.posted() == {})
+
+# One alt's trip to the auction house must not wipe another's listings.
+st.save_posted({"Zethrel-ArgentDawn": {"items": {9: 2}, "seen_at": now}})
+st.save_posted({"Alt-ArgentDawn": {"items": {9: 3}, "seen_at": now}})
+must("characters are pooled, not overwritten", st.posted() == {9: 5})
+st.close()
 
 # ---- 6. the ranking ---------------------------------------------------
 # The whole point: a modest margin that moves beats a huge one that does not.
@@ -203,8 +257,8 @@ must("rows carry their listing count for that filter", 'data-listings="' in html
 
 must("the caveat calls them projections",
      "projections, not measurements" in html)
-must("and admits it cannot see your own listings",
-     "have posted" in html or "own listings" in html)
+must("and dates the half that comes from the client",
+     "as fresh as your last visit" in html)
 
 # With nothing measured at all the page must still render, and must not
 # pretend the chart is a forecast.
