@@ -4100,6 +4100,7 @@ def cmd_doctor(client: BlizzardClient, store: Store, cfg: dict,
     w("CLOUD / PULL SIDE")
     w("=" * 68)
     _doctor_cloud(cfg, db_path, w)
+    _doctor_release(cfg, w)
 
     w("")
     w("=" * 68)
@@ -4132,6 +4133,7 @@ def cmd_doctor_cloud(cfg: dict, db_path: str,
     w("=" * 68)
 
     _doctor_cloud(cfg, db_path, w)
+    _doctor_release(cfg, w)
 
     w("")
     w("=" * 68)
@@ -4190,6 +4192,110 @@ def _probe_dispatch(repo: str, workflow: str, token: str) -> tuple:
         return "FAIL", f"HTTP {exc.code}"
     except (urllib.error.URLError, OSError) as exc:
         return "WARN", f"could not reach GitHub: {exc}"
+
+
+TOC_PATH = os.path.join("addon", "WowCraftExport", "WowCraftExport.toc")
+
+
+def _toc_version(root: str = "") -> str:
+    """The version the addon reports in game, read from the .toc."""
+    path = os.path.join(root or os.path.dirname(os.path.abspath(__file__)),
+                        TOC_PATH)
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            for line in fh:
+                if line.lower().startswith("## version:"):
+                    return line.split(":", 1)[1].strip()
+    except OSError:
+        return ""
+    return ""
+
+
+def _latest_release_tag(repo_url: str, timeout: int = 20) -> str:
+    """The tag GitHub currently serves as /releases/latest.
+
+    By redirect rather than by API: /releases/latest is a 302 to
+    /releases/tag/<tag>, so the answer is in the final URL. No token, no rate
+    limit worth worrying about, and nothing to install - which matters because
+    this runs on a machine whose only job is to pull.
+    """
+    url = repo_url.rstrip("/") + "/releases/latest"
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        final = resp.geturl()
+    tag = final.rstrip("/").rsplit("/", 1)[-1]
+    # A repo with no releases at all does not redirect anywhere.
+    return "" if tag in ("latest", "releases") else tag
+
+
+def _doctor_release(cfg: dict, w) -> None:
+    """Check the download the landing page actually hands people.
+
+    This exists because it already went wrong. The site's front page has a
+    Download button pointing at /releases/latest, and /releases/latest is not
+    "the newest tag" - it is a separate, mutable pointer that GitHub only
+    moves when a release is published and marked latest. A tag that was
+    pushed but whose release step did not finish leaves the button silently
+    serving the previous version: a current-looking page handing out a
+    fortnight-old addon, which is worse than handing out nothing.
+
+    Two questions, both answerable without a token: does the button resolve to
+    the version this working tree builds, and is there actually a zip on it.
+    """
+    _, repo = _site_urls(cfg)
+    w("")
+    w("[C5] THE DOWNLOAD PEOPLE GET")
+    if not repo:
+        w("    repo_url is not set and this is not a CI run, so there is no")
+        w("    release to check. Set repo_url in the config if you publish a")
+        w("    landing page.")
+        return
+
+    want = _toc_version()
+    w(f"    addon here : {want or 'unknown (no .toc beside this script)'}")
+    try:
+        tag = _latest_release_tag(repo)
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        w(f"    FAIL - could not read {repo}/releases/latest: {exc}")
+        return
+    if not tag:
+        w("    FAIL - the repository has no published release at all, so the")
+        w("           Download button on the landing page goes nowhere.")
+        return
+
+    w(f"    button gives: {tag}")
+    got = tag[1:] if tag.startswith("v") else tag
+    if not want:
+        w("    cannot compare - run this from a checkout to check the version")
+    elif got == want:
+        w("    OK - the button hands out the version this tree builds")
+    else:
+        w(f"    FAIL - the button hands out {tag}, but the addon in this tree")
+        w(f"           is {want}. A tag alone does not move /releases/latest;")
+        w("           a release has to be published and marked latest. Check")
+        w("           the 'release addon' run for the tag, then either re-push")
+        w("           the tag or mark the release latest by hand.")
+
+    # A release with no zip on it is the same failure wearing a better hat:
+    # the button resolves, the page loads, and there is nothing to download.
+    asset = f"{repo.rstrip('/')}/releases/download/{tag}/WowCraftExport-{got}.zip"
+    try:
+        req = urllib.request.Request(asset, method="HEAD",
+                                     headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            size = int(resp.headers.get("Content-Length") or 0)
+        w(f"    OK - WowCraftExport-{got}.zip is attached "
+          f"({size // 1024} KB)" if size else
+          f"    OK - WowCraftExport-{got}.zip is attached")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            w(f"    FAIL - {tag} has no WowCraftExport-{got}.zip on it. The")
+            w("           release exists but the addon was never attached, so")
+            w("           the button leads to a page with nothing to take.")
+        else:
+            w(f"    could not check the zip: HTTP {exc.code}")
+    except (urllib.error.URLError, OSError) as exc:
+        w(f"    could not check the zip: {exc}")
 
 
 def _doctor_cloud(cfg: dict, db_path: str, w) -> None:

@@ -217,6 +217,16 @@ runs are free.
 
 ### Sharing it with other people
 
+**Check the Download button before you send anyone the link.** The landing
+page points at `/releases/latest`, and that is *not* "the newest tag" — it is a
+separate pointer GitHub only moves when a release is **published**. Push a tag
+whose release workflow does not finish and the button keeps serving the previous
+version: a current-looking page handing out a fortnight-old addon, which is
+worse than handing out nothing because it looks right. That happened on v0.11 —
+the tag existed, the release did not. `doctor` section **[C5]** now checks both
+halves (does the button resolve to this version, and is there a zip on it), so
+it is one command rather than something you have to remember.
+
 **Send them the site URL.** `index.html` is a landing page, not the dashboard:
 what this is, the addon download, the four steps to get prices in game, the
 realms being published, and the caveat about other realms and other regions. It
@@ -343,6 +353,8 @@ CI, and exactly when you want a diagnostic. It reports:
   twice, and when `PriceData.lua` was last written
 - **[C4]** self-dispatch: the token's source and length, the target repo and
   workflow, and whether the token can actually dispatch
+- **[C5]** the download people get: whether `/releases/latest` resolves to the
+  version this tree builds, and whether a zip is actually attached to it
 
 That last check **starts no workflow**. It dispatches a ref that cannot exist,
 because GitHub validates the permission before it resolves the ref: `403` means

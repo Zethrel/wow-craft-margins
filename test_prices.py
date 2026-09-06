@@ -20,18 +20,26 @@ class _P:
 class _R:
     crafted_item_id = 8191; cost = 3474020.0; revenue = 9305060.0
     margin_pct = 168.0; cost_complete = True; optionals_filled = 1
-    gold_per_day = 1250000.0; restock_units = 6
+    gold_per_day = 1250000.0
+    # restock_TARGET is what the file carries and what the addon reads: the
+    # whole number the market wants. restock_units is the same figure with
+    # this machine's stock already taken off, which is the dashboard's job -
+    # the client subtracts its own, live, because a file built in the cloud
+    # never saw anyone's bags. Both exist on MarginResult and it is easy to
+    # reach for the wrong one; the writer wants the target.
+    restock_target = 6; restock_units = 6
+    crafted_qty = 1.0
 
 
 class _RNone(_R):
     """No sale rate for this output - the state that must not print a zero."""
-    gold_per_day = None; restock_units = 0
+    gold_per_day = None; restock_target = 0; restock_units = 0
 
 
 class _RLoss(_R):
     """It sells, and at a loss. Both halves have to survive the trip."""
     revenue = 1000000.0; margin_pct = -71.0
-    gold_per_day = -430000.0; restock_units = 0
+    gold_per_day = -430000.0; restock_target = 0; restock_units = 0
 _rows = [{"crafted_item_id": 8191, "reagents_json": '[{"id": 2589, "quantity": 4}]',
           "slots_json": None}]
 REAL = os.path.join(tempfile.mkdtemp(), "PriceData.lua")
@@ -115,6 +123,8 @@ must("shows margin after cut", any("Margin after AH cut" in x for x in out))
 must("shows what the craft is worth per day",
      any("Expected per day" in x for x in out))
 must("and how many to make now", any("Make now :: 6" in x for x in out))
+must("with no stock of your own, the target is what to make",
+     not any("you have" in x for x in out))
 must("stamps the age", any("wowcraft - " in x for x in out))
 must("age is human readable", any(("m ago" in x or "h ago" in x or "just now" in x) for x in out))
 # And it is the age of the PRICES. The writer used to be handed the taken_at

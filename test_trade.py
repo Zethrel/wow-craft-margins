@@ -58,6 +58,18 @@ function F:CreateFontString() return {SetPoint=function() end,SetText=function(s
   SetJustifyH=function() end} end
 function CreateFrame(_,_,_,_) local f=setmetatable({},F); frames[#frames+1]=f; return f end
 function FireEvent(e,...) for _,f in ipairs(frames) do if f.OnEvent then f.OnEvent(f,e,...) end end end
+-- The learn walk runs a slice per frame now, so the harness has to let
+-- frames happen. clock advances with them, because the walk is throttled on
+-- GetTime as well as spread across frames.
+clock = 0
+function GetTime() return clock end
+function Tick(n)
+  for _ = 1, (n or 1) do
+    clock = clock + 0.016
+    for _, f in ipairs(frames) do if f.OnUpdate then f.OnUpdate(f, 0.016) end end
+  end
+end
+schematicCalls = 0
 -- This character knows one recipe, making item 244591. Skill is far below the
 -- recipe's difficulty, so it comes out at rank 2 - rank 3 if concentration is
 -- spent. Modelled on a real case: skill 105 against difficulty 400, where the
@@ -65,7 +77,10 @@ function FireEvent(e,...) for _,f in ipairs(frames) do if f.OnEvent then f.OnEve
 C_TradeSkillUI={
   GetAllRecipeIDs=function() return {101, 102} end,
   GetRecipeInfo=function(id) return {recipeID=id, learned=(id==101)} end,
-  GetRecipeSchematic=function(id) return {outputItemID=(id==101) and 244591 or 999999} end,
+  GetRecipeSchematic=function(id)
+    schematicCalls = schematicCalls + 1
+    return {outputItemID=(id==101) and 244591 or 999999}
+  end,
   GetCraftingOperationInfo=function(id, _reagents, _guid, concentrating)
     if id ~= 101 then return nil end
     return {craftingQuality=(concentrating and 3 or 2), baseDifficulty=400,
@@ -80,11 +95,38 @@ lua.execute(PRELUDE)
 lua.eval("function(s) return assert(load(s,'trade.lua')) end")(
     open(ADDON, encoding="utf-8").read())()
 lua.eval("FireEvent")("PLAYER_LOGIN")
-lua.eval("FireEvent")("TRADE_SKILL_LIST_UPDATE")
+lua.eval("FireEvent")("TRADE_SKILL_SHOW")
 
+# The walk is spread across frames, so opening the window costs nothing in
+# the frame that opened it. It used to run in full on every
+# TRADE_SKILL_LIST_UPDATE - an event that fires on every keystroke in the
+# profession search box - and each walk asked GetRecipeInfo,
+# GetRecipeSchematic and GetCraftingOperationInfo (twice) for every recipe
+# the character knows. Typing a recipe name stuttered the game, in the one
+# window whose entire purpose is typing into it.
+must("opening a profession window does no work in that frame",
+     lua.eval("schematicCalls") == 0)
+
+lua.eval("Tick")(5)
 known = dict(lua.eval("WowCraftExportDB.craftable")["Zethrel-ArgentDawn"])
 must("learned recipes recorded", 244591 in known)
 must("unlearned recipes ignored", 999999 not in known)
+
+# Typing. Every keystroke fires the list update, and none of them may start
+# another walk: what you know does not change while you type.
+before = lua.eval("schematicCalls")
+for _ in range(40):
+    lua.eval("FireEvent")("TRADE_SKILL_LIST_UPDATE")
+lua.eval("Tick")(5)
+must("forty keystrokes do not walk the recipe list again",
+     lua.eval("schematicCalls") == before)
+
+# Ten seconds later it is willing again, because skill and recipes do change.
+lua.execute("clock = clock + 11")
+lua.eval("FireEvent")("TRADE_SKILL_LIST_UPDATE")
+lua.eval("Tick")(5)
+must("but it does refresh once the throttle has passed",
+     lua.eval("schematicCalls") > before)
 
 LINK = "|cffa335ee|Hitem:244591::::::::80:::::|h[Smuggler's Reinforced Hood]|h|r"
 lua.eval("FireEvent")("CHAT_MSG_CHANNEL",

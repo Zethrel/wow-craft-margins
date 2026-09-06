@@ -884,6 +884,72 @@ must("it covers time zones", "[C2]" in text)
 must("it covers local state", "[C3]" in text)
 must("it covers self-dispatch", "[C4]" in text)
 
+# ---- 6f2. the download the landing page hands out --------------------
+# This shipped broken and nothing noticed. /releases/latest is NOT "the
+# newest tag" - it is a separate pointer GitHub only moves when a release is
+# published. A tag whose release step did not finish leaves the button
+# serving the previous version, so a current-looking front page hands out a
+# fortnight-old addon. Worse than handing out nothing, because it looks fine.
+def release_check(cfg_extra, tag, zip_status):
+    """Run [C5] with the two network calls answered from here."""
+    import urllib.error
+    import urllib.request
+    real_tag, real_open = W._latest_release_tag, urllib.request.urlopen
+
+    def fake_open(req, *a, **k):
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        if zip_status == 200:
+            class R:
+                headers = {"Content-Length": "26000"}
+                def __enter__(self): return self
+                def __exit__(self, *e): return False
+            return R()
+        raise urllib.error.HTTPError(url, zip_status, "nope", None, None)
+
+    W._latest_release_tag = lambda repo, timeout=20: tag
+    urllib.request.urlopen = fake_open
+    out = []
+    try:
+        W._doctor_release(dict(local_cfg, **cfg_extra), out.append)
+    finally:
+        W._latest_release_tag, urllib.request.urlopen = real_tag, real_open
+    return "\n".join(out)
+
+
+REPO = {"repo_url": "https://github.com/example/wcm"}
+here = W._toc_version()
+must("the check knows what version this tree builds", bool(here))
+
+# The failure that actually happened.
+stale = release_check(REPO, "v0.1-old", 200)
+must("a button serving an older version than this tree is a FAIL",
+     "FAIL" in stale and "v0.1-old" in stale)
+must("and it says a tag alone does not move /releases/latest",
+     "does not move" in stale)
+
+# The other half of the same failure: right tag, nothing on it.
+empty = release_check(REPO, "v" + here, 404)
+must("the right tag with no zip attached is also a FAIL",
+     "no WowCraftExport" in empty and "FAIL" in empty)
+must("and says the page has nothing to take", "nothing to take" in empty)
+
+good = release_check(REPO, "v" + here, 200)
+must("a matching tag with a zip on it passes",
+     "OK - the button hands out" in good and "is attached" in good)
+must("and FAIL appears nowhere in a healthy check", "FAIL" not in good)
+
+none = release_check(REPO, "", 404)
+must("a repo with no releases at all is called out",
+     "no published release" in none)
+
+# A pull-only machine has no repo and no checkout, and must not be told it
+# has failed at something it is not doing.
+absent = release_check({"repo_url": ""}, "v1", 200)
+must("no repo_url is not-configured rather than a failure",
+     "not set" in absent and "FAIL" not in absent)
+must("the section is numbered so the report stays readable",
+     "[C5]" in good)
+
 # No pull_url at all is a normal state, not an error.
 report = []
 W._doctor_cloud(dict(local_cfg, pull_url=""), local_db, report.append)
