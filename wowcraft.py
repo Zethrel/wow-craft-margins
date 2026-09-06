@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import html
 import json
 import os
 import re
@@ -4553,6 +4554,194 @@ def export_prices_db(src: str, dest: str,
     return os.path.getsize(dest)
 
 
+def _site_urls(cfg: dict) -> tuple:
+    """(site base, repo base) for links, from config or the Actions env.
+
+    Absolute rather than relative on purpose. The same page is written into
+    every realm's folder AND copied to the site root, so a relative link would
+    have to be right at two different depths at once. `site_url` in the config
+    settles it; without one, fall back to what GitHub tells a workflow about
+    itself, and finally to relative links that are at least right at the root.
+    """
+    site = str(cfg.get("site_url") or "").rstrip("/")
+    repo = str(cfg.get("repo_url") or "").rstrip("/")
+    slug = os.environ.get("GITHUB_REPOSITORY", "")
+    if slug and "/" in slug:
+        owner, name = slug.split("/", 1)
+        site = site or f"https://{owner.lower()}.github.io/{name}"
+        repo = repo or f"https://github.com/{slug}"
+    return (site + "/" if site else ""), repo
+
+
+def write_landing_page(path: str, cfg: dict, data_time: int) -> None:
+    """The page somebody lands on when you send them the link.
+
+    Until this existed the site root was a byte copy of the dashboard, so
+    anyone handed the URL arrived at a two-megabyte table of margins with no
+    indication of what it was, that an addon existed, or that the numbers are
+    only right on one realm in one region. The dashboard is the thing you read
+    once you already know all that.
+
+    Deliberately plain: no build step, no framework, no external requests. It
+    is written by the same scan that writes everything else, so the realm list
+    and the timestamp cannot drift from what was actually published.
+    """
+    site, repo = _site_urls(cfg)
+    realms = [r for r in (cfg.get("realms") or []) if r]
+    if not realms and cfg.get("realm_slug"):
+        realms = [cfg["realm_slug"]]
+    region = str(cfg.get("region") or "").upper()
+
+    def realm_name(slug: str) -> str:
+        return " ".join(w.capitalize() for w in slug.split("-"))
+
+    rows = "\n".join(
+        f'<tr><td>{html.escape(realm_name(r))}</td>'
+        f'<td class="dim">{html.escape(r)}</td>'
+        f'<td><a href="{site}{r}/dashboard.html">dashboard</a></td>'
+        f'<td><a href="{site}{r}/PriceData.lua">PriceData.lua</a></td></tr>'
+        for r in realms)
+
+    stamp = (time.strftime("%d %b %Y, %H:%M", time.localtime(data_time))
+             if data_time else "unknown")
+    releases = f"{repo}/releases/latest" if repo else "#"
+    readme = f"{repo}#readme" if repo else "#"
+
+    doc = f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WowCraft \u2014 free crafting prices for {html.escape(region)} auction houses</title>
+<style>
+:root {{ color-scheme: light dark;
+  --plane:#faf9f0; --surface:#ffffff; --ink:#0e0e0c; --ink-2:#4f4d43;
+  --muted:#736f5a; --line:#e7e3cf; --accent:#f5e400; --accent-ink:#0e0e0c;
+  --accent-text:#7d6f00; --warn:#c2491f; }}
+@media (prefers-color-scheme: dark) {{ :root:not([data-theme="light"]) {{
+  --plane:#0e0e0c; --surface:#181713; --ink:#f2f0e6; --ink-2:#b8b5a5;
+  --muted:#8d8a7c; --line:#2a2a22; --accent:#f5e400; --accent-ink:#0e0e0c;
+  --accent-text:#f5e400; --warn:#e0784f; }} }}
+:root[data-theme="dark"] {{
+  --plane:#0e0e0c; --surface:#181713; --ink:#f2f0e6; --ink-2:#b8b5a5;
+  --muted:#8d8a7c; --line:#2a2a22; --accent:#f5e400; --accent-ink:#0e0e0c;
+  --accent-text:#f5e400; --warn:#e0784f; }}
+* {{ box-sizing: border-box; }}
+body {{ margin:0; padding:40px 24px 72px; background:var(--plane); color:var(--ink);
+  font:16px/1.6 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }}
+.wrap {{ max-width:760px; margin:0 auto; }}
+h1 {{ font-size:30px; line-height:1.2; margin:0 0 8px; letter-spacing:-0.02em; }}
+h2 {{ font-size:19px; margin:40px 0 10px; letter-spacing:-0.01em; }}
+p, li {{ color:var(--ink-2); }}
+.lede {{ font-size:17px; color:var(--ink); margin:0 0 4px; }}
+.stamp {{ font-size:13px; color:var(--muted); margin:0 0 28px; }}
+.card {{ background:var(--surface); border:1px solid var(--line); border-radius:10px;
+  padding:20px 22px; margin:16px 0; }}
+.card h2 {{ margin-top:0; }}
+ol, ul {{ padding-left:22px; margin:10px 0; }}
+li {{ margin:6px 0; }}
+code {{ font:13px/1.4 ui-monospace, "Cascadia Mono", Consolas, monospace;
+  background:var(--plane); border:1px solid var(--line); border-radius:4px;
+  padding:1px 5px; color:var(--ink); }}
+a {{ color:var(--accent-text); }}
+.btn {{ display:inline-block; background:var(--accent); color:var(--accent-ink);
+  font-weight:600; text-decoration:none; padding:9px 18px; border-radius:7px;
+  margin:8px 0; }}
+table {{ border-collapse:collapse; width:100%; margin:12px 0; font-size:15px; }}
+th, td {{ text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); }}
+th {{ font-size:12px; text-transform:uppercase; letter-spacing:.05em;
+  color:var(--muted); }}
+td.dim {{ color:var(--muted); font-family:ui-monospace,Consolas,monospace;
+  font-size:13px; }}
+.warn {{ border-left:3px solid var(--warn); padding-left:14px; margin:16px 0; }}
+.warn strong {{ color:var(--ink); }}
+footer {{ margin-top:48px; padding-top:18px; border-top:1px solid var(--line);
+  font-size:13px; color:var(--muted); }}
+@media (max-width:560px) {{ body {{ padding:28px 16px 56px; }} h1 {{ font-size:25px; }} }}
+</style></head><body><div class="wrap">
+
+<h1>Crafting prices, in your game, for free</h1>
+<p class="lede">An addon that puts what a craft costs, what it sells for and how
+many to make onto the tooltip. The prices are scanned from the official
+Blizzard auction-house API and republished here every hour.</p>
+<p class="stamp">Prices last refreshed <strong>{html.escape(stamp)}</strong>
+&middot; {html.escape(region)} region &middot; free, no account, no tracking</p>
+
+<div class="card">
+<h2>1. Get it in the game</h2>
+<p>This is what most people want. Nothing to install beyond the addon itself.</p>
+<a class="btn" href="{releases}">Download the addon</a>
+<ol>
+<li>Unzip into <code>World of Warcraft\\_retail_\\Interface\\AddOns</code> so you
+    have an <code>AddOns\\WowCraftExport</code> folder.</li>
+<li>Open <code>sync.cmd</code> in that folder and set <code>REALM</code> to your
+    realm slug &mdash; lower case with hyphens, as in the table below.</li>
+<li>Double-click <code>sync.cmd</code> once to fetch prices, then
+    <code>sync-hourly.cmd</code> to keep them fresh. No admin rights needed.</li>
+<li>In game, <code>/reload</code>. Prices appear on tooltips; <code>/wccraft</code>
+    ranks what you can make, <code>/wcshop</code> lists what to buy for it.</li>
+</ol>
+<p><strong>Why a batch file?</strong> WoW's Lua sandbox has no network access at
+all, by design, so no addon can fetch anything &mdash; the price file has to be
+on disk before the game loads it. This is the same reason TradeSkillMaster ships
+a desktop application.</p>
+</div>
+
+<div class="card">
+<h2>2. Or just look at the numbers</h2>
+<p>Every craft this scan can price, ranked by what it should earn per day rather
+than by margin. Nothing to install.</p>
+<table><thead><tr><th>Realm</th><th>Slug</th><th>Browse</th>
+<th>Price file</th></tr></thead><tbody>
+{rows}
+</tbody></table>
+</div>
+
+<div class="warn">
+<p><strong>Only these realms, and only {html.escape(region)}.</strong>
+Reagent prices come from the commodity auction house, which is shared across the
+whole region &mdash; those are right for any {html.escape(region)} realm. Crafted
+gear is sold on your own realm's auction house, and those prices are not. On a
+realm that is not listed you would get correct reagent costs and wrong sale
+prices, which produces margins that look authoritative and are not. In another
+region, everything is wrong. Ask and the realm can be added; it costs one extra
+API call per scan.</p>
+</div>
+
+<div class="card">
+<h2>3. The desktop lookup (optional)</h2>
+<p>A small window for "what is this going for" when you are nowhere near an
+auctioneer, plus the full price history as a database. Needs Python and a
+one-line config. See the <a href="{readme}">README</a>.</p>
+<p>Please ask before pointing this at the site on a schedule &mdash; it pulls
+about 8&nbsp;MB an hour where the addon pulls 0.7&nbsp;MB, and the hosting is a
+free tier with a bandwidth budget.</p>
+</div>
+
+<h2>Before you trust a number</h2>
+<ul>
+<li>A margin is what the market looked like at the last scan, not a promise. It
+    does not know about undercutting after you post.</li>
+<li>Sale rates are inferred from auctions disappearing between scans. Roughly
+    two thirds of disappearances turn out to be cancellations rather than sales,
+    which is corrected for &mdash; but it is still an estimate.</li>
+<li>Crafted gear is priced far less reliably than reagents. Two listings of the
+    same item can be different quality tiers at honestly different prices.</li>
+<li>The <a href="{readme}">README</a> has a section called <em>What this tool
+    does not know</em>. It is worth the five minutes.</li>
+</ul>
+
+<footer>
+<p>Free and open source. Not affiliated with, endorsed by or sponsored by
+Blizzard Entertainment.</p>
+<p>World of Warcraft data &copy; Blizzard Entertainment, retrieved via the
+public Battle.net Game Data API.</p>
+<p><a href="{repo or '#'}">Source code</a></p>
+</footer>
+</div></body></html>
+"""
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(doc)
+
+
 def publish(out_dir: str, store: Store, cfg: dict, dashboard_path: str,
             results: list, prices: dict, recipes: list, taken_at: int,
             batch: int, data_time: Optional[int] = None) -> dict:
@@ -4578,8 +4767,12 @@ def publish(out_dir: str, store: Store, cfg: dict, dashboard_path: str,
 
     if dashboard_path and os.path.exists(dashboard_path):
         shutil.copyfile(dashboard_path, os.path.join(out_dir, "dashboard.html"))
-        # A bare Pages URL should land on the dashboard rather than a 404.
-        shutil.copyfile(dashboard_path, os.path.join(out_dir, "index.html"))
+    # index.html used to be a byte copy of the dashboard, which meant anyone
+    # sent the bare URL arrived at two megabytes of margin table with nothing
+    # to say what it was, that there is an addon, or that the numbers are only
+    # right on one realm in one region. `pull` fetches dashboard.html by name
+    # and never reads this, so the two can differ safely.
+    write_landing_page(os.path.join(out_dir, "index.html"), cfg, data_time)
 
     export_prices_db(store.path, os.path.join(out_dir, PRICES_NAME))
 

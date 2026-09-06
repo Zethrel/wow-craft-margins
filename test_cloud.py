@@ -106,7 +106,12 @@ tmp = tempfile.mkdtemp()
 site = os.path.join(tmp, "site")
 cfg = {"region": "eu", "realm_slug": "argent-dawn", "locale": "en_GB",
        "professions": [], "skill_tiers": [], "history_days": 0,
-       "addon_path": ""}
+       "addon_path": "",
+       # The landing page links out to these; without them it falls back to
+       # relative links, which is a different code path and a different test.
+       "realms": ["argent-dawn"],
+       "site_url": "https://example.invalid/wcm/",
+       "repo_url": "https://github.com/example/wcm"}
 
 # ---- 1. publish ------------------------------------------------------
 server_db = os.path.join(tmp, "server.sqlite3")
@@ -152,6 +157,57 @@ must("manifest covers every published file",
 must("manifest hashes match the bytes on disk",
      all(entry["sha256"] == W._sha256(os.path.join(site, name))
          for name, entry in manifest["files"].items()))
+
+# ---- 1b. the front door ----------------------------------------------
+# index.html was a byte copy of the dashboard, so anyone handed the bare URL
+# arrived at two megabytes of margin table with nothing to say what it was,
+# that an addon exists, or that the numbers are only right on one realm in one
+# region. The things asserted here are the ones somebody would actually be
+# harmed by their absence: the realm caveat, the attribution, and the fact
+# that `pull` still finds the dashboard under its own name.
+landing = open(os.path.join(site, "index.html"), encoding="utf-8").read()
+dash_html = open(os.path.join(site, "dashboard.html"), encoding="utf-8").read()
+# Prose assertions run against whitespace-collapsed text: the source is
+# hard-wrapped, so "in another region" is split across a newline in the file
+# and reflowing a paragraph should not fail a test about what it says.
+prose = " ".join(landing.split())
+must("the landing page is not just the dashboard again",
+     landing != dash_html)
+must("and is small enough to be a landing page", len(landing) < 60_000)
+must("the dashboard is still published under its own name, which is what "
+     "pull fetches", "dashboard.html" in published)
+
+must("it says what the thing is", "addon" in landing.lower())
+must("it links the addon download", "releases/latest" in landing)
+must("it tells you to set your realm", "sync.cmd" in landing)
+must("it names every realm being published",
+     all(r in landing for r in (cfg.get("realms") or [cfg["realm_slug"]])))
+# The failure this prevents is silent and expensive: correct reagent costs
+# with wrong sale prices look exactly like correct numbers.
+must("it warns that other realms get wrong gear prices",
+     "not listed" in prose and "authoritative" in prose)
+must("and that another region is wrong outright",
+     "another region" in prose.lower())
+
+# Required by Blizzard's API terms, and previously present only on the
+# dashboard - not on anything actually handed to another person.
+must("it identifies Blizzard as the source of the data",
+     "Blizzard Entertainment" in prose
+     and "Game Data API" in prose)
+must("and disclaims endorsement", "Not affiliated" in prose)
+
+# It is served from a free tier with a bandwidth budget, and the desktop pull
+# costs about twelve times what the addon does.
+must("it asks people not to schedule the heavy pull without asking",
+     "ask before" in prose)
+
+must("it runs no scripts", "<script" not in landing)
+must("it fetches nothing at load time",
+     ".css" not in landing and "cdn" not in landing.lower())
+# Written into every realm's folder AND copied to the site root, so relative
+# links would have to be correct at two depths at once.
+must("its links are absolute so the same file works at any depth",
+     'href="https://' in landing and 'href="./' not in landing)
 
 # ---- 2. what the published database contains -------------------------
 raw = gzip.decompress(open(os.path.join(site, W.PRICES_NAME), "rb").read())

@@ -15,7 +15,7 @@ set "TASK=wowcraft price sync"
 set "CMD=\"%~dp0sync.cmd\""
 if not "%REALM%"=="" set "CMD=\"%~dp0sync.cmd\" %REALM%"
 
-REM :35 past the hour. The prices are published at about :23 and the publisher
+REM :35 past the hour. The prices are published at about :20 and the publisher
 REM is routinely late, so fetching on the hour would usually collect the
 REM previous hour's numbers.
 schtasks /create /tn "%TASK%" /tr "%CMD%" /sc hourly /st 00:35 /f >nul

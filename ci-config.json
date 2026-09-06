@@ -6,7 +6,13 @@
   "locale": "en_GB",
   "realm_slug": "argent-dawn",
   "_realms": "Realms to scan and publish, each into its own folder on the site. The first is also published at the root, so anything already pointing at the bare URL keeps working. Commodity auctions are region-wide and fetched once per realm regardless, so the marginal cost of another realm is one API call and a few seconds - but it is worth adding, because 56% of crafted outputs are priced from the realm auction house and are simply wrong for anyone else. Slugs are lower case with hyphens.",
-  "realms": ["argent-dawn"],
+  "realms": [
+    "argent-dawn"
+  ],
+  "_site_url": "Where this site is served from. index.html is a landing page linking to each realm's folder, and the same file is copied to the site root as well as living inside every realm folder - so its links must be absolute, or they would have to be correct at two different depths at once. Left empty, it is derived from GITHUB_REPOSITORY when running in Actions.",
+  "site_url": "https://zethrel.github.io/wow-craft-margins/",
+  "_repo_url": "Where the landing page sends people for the addon download and the README. Also derived from GITHUB_REPOSITORY when empty.",
+  "repo_url": "https://github.com/Zethrel/wow-craft-margins",
   "_scope": "Empty lists = everything in the cached recipe set. The runner scans the lot because it costs four seconds and the published dashboard is nicer for having every expansion in the dropdown.",
   "professions": [],
   "skill_tiers": [],

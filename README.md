@@ -217,6 +217,19 @@ runs are free.
 
 ### Sharing it with other people
 
+**Send them the site URL.** `index.html` is a landing page, not the dashboard:
+what this is, the addon download, the four steps to get prices in game, the
+realms being published, and the caveat about other realms and other regions. It
+is 7 KB with no scripts and no external requests. The dashboard is still
+published as `dashboard.html` and linked from it — which is also the name `pull`
+fetches, so nothing about the pull path changed.
+
+`site_url` and `repo_url` in `ci-config.json` are where its links point. They
+have to be absolute: the same file is written into every realm's folder *and*
+copied to the site root, so relative links would have to be correct at two
+depths at once. Both fall back to `GITHUB_REPOSITORY` when empty, so a fork
+needs no edit.
+
 Someone who only wants prices in game needs **the addon folder and nothing
 else**. No Python, no scheduled task, no account, no configuration beyond their
 realm. Inside the addon folder are two batch files:
@@ -238,6 +251,21 @@ no HTTP, deliberately, so no addon can fetch anything — `PriceData.lua` has to
 be a real file before the client loads it. Nor can GitHub push: a remote server
 cannot write into somebody's filesystem, so the transfer has to be started
 locally. This is the same reason TradeSkillMaster ships a desktop application.
+
+**What this costs, and where it stops scaling.** Nobody you share with ever
+touches Blizzard — they fetch static files from Pages — so an extra user costs
+zero API calls. What it costs is bandwidth, and GitHub Pages has a *soft* limit
+of 100 GB/month:
+
+| Who | Per month | Fits in 100 GB |
+|---|---:|---:|
+| addon only (`sync-hourly`, hourly) | 0.47 GB | ~210 people |
+| dashboard in a browser (5 views/day) | 0.29 GB | ~340 people |
+| full `pull.cmd` (everything, hourly) | 7.54 GB | **~13 people** |
+
+The 8.2 MB price database is 75% of that last figure. So the addon is the thing
+to hand out freely; `pull.cmd` is for people you would actually help debug, and
+the landing page asks them to check first.
 
 **Every realm you share with needs publishing.** Commodity auctions are
 region-wide, but realm auctions are not, and that is where crafted gear is
