@@ -33,20 +33,62 @@ jobs:
         # Explicit, because the default shell on windows-latest is pwsh and
         # this loop is bash.
         shell: bash
+        # The failing checks go into annotations and the job summary, not just
+        # the log. On a public repo the run page shows those to anyone, while
+        # the log itself needs a GitHub sign-in - so a failure can be read
+        # (by a person or a sandboxed assistant) without logging in.
+        # `shell: bash` runs with -e and -o pipefail: every grep that may
+        # match nothing carries `|| true`, or a clean suite would end the loop.
         run: |
           failed=""
+          skips=""
+          out="$RUNNER_TEMP/suite.log"
+          # A markdown code fence, spelled in octal so no line of this script
+          # puts backticks in single quotes (shellcheck SC2016 via actionlint).
+          fence=$(printf '\140\140\140')
+          # Workflow-command escaping: without it a % in a check name eats
+          # characters and only the first line of the message survives.
+          esc() { sed -e 's/%/%25/g' -e 's/\r/%0D/g' | awk '{ printf "%s%s", (NR > 1 ? "%0A" : ""), $0 }'; }
           for f in test_*.py; do
             echo "::group::$f"
-            python "$f" || failed="$failed $f"
+            status=0
+            python "$f" > "$out" 2>&1 || status=$?
+            cat "$out"
             echo "::endgroup::"
+            skips="$skips$(grep '^SKIP  ' "$out" || true)"$'\n'
+            if [ "$status" -ne 0 ]; then
+              failed="$failed $f"
+              # The suite's own FAIL lines; a crash prints none, so fall back
+              # to the end of the output, where the traceback is.
+              detail=$(grep '^FAIL  ' "$out" | head -n 20 || true)
+              [ -n "$detail" ] || detail=$(tail -n 15 "$out")
+              echo "::error title=$f failed on ${{ matrix.os }}::$(printf '%s\n' "$detail" | esc)"
+              {
+                echo "### FAILED: $f (exit $status)"
+                echo "$fence"
+                printf '%s\n' "$detail"
+                echo "$fence"
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
           done
+          # Counted, because a suite that skipped still exits 0 and "all
+          # suites pass" is not evidence for code that never ran.
+          skips=$(printf '%s' "$skips" | grep -v '^$' || true)
+          if [ -n "$skips" ]; then
+            {
+              echo "### Skipped on ${{ matrix.os }}: $(printf '%s\n' "$skips" | wc -l | tr -d ' ')"
+              echo "$fence"
+              printf '%s\n' "$skips"
+              echo "$fence"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
           # Each suite prints its own PASS/FAIL lines; without this you have to
           # open every group to find out which one actually went red.
           if [ -n "$failed" ]; then
             echo "::error::failing suites on ${{ matrix.os }}:$failed"
             exit 1
           fi
-          echo "all suites pass"
+          echo "all suites pass" | tee -a "$GITHUB_STEP_SUMMARY"
 
   # Catches the two workflow bugs this repo has already shipped: a dispatch
   # input interpolated straight into a run: block (expression injection), and
