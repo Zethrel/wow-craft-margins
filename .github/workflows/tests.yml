@@ -33,10 +33,12 @@ jobs:
         # Explicit, because the default shell on windows-latest is pwsh and
         # this loop is bash.
         shell: bash
-        # The failing checks go into annotations and the job summary, not just
-        # the log. On a public repo the run page shows those to anyone, while
-        # the log itself needs a GitHub sign-in - so a failure can be read
-        # (by a person or a sandboxed assistant) without logging in.
+        # The failing checks go into annotations, not just the log. On a
+        # public repo the annotations are shown to anyone, while the log and
+        # the job summary need a GitHub sign-in (checked 2026-09-24) - so a
+        # failure can be read (by a person or a sandboxed assistant) without
+        # logging in. The summary repeats them, plus the skips, for anyone
+        # signed in.
         # `shell: bash` runs with -e and -o pipefail: every grep that may
         # match nothing carries `|| true`, or a clean suite would end the loop.
         run: |
