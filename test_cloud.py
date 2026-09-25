@@ -230,6 +230,20 @@ must("published schema is unchanged",
          "meta"})
 pub.close()
 
+# ---- 2a. the same database always exports to the same bytes ------------
+# `pull` matches files on their sha256. gzip stamps the current time into its
+# header by default, which gave an unchanged database a new hash on every
+# publish and made every pull fetch it again.
+same_a = os.path.join(tmp, "same-a.sqlite3.gz")
+same_b = os.path.join(tmp, "same-b.sqlite3.gz")
+W.export_prices_db(server_db, same_a)
+time.sleep(1.1)  # the gzip header's clock counts whole seconds
+W.export_prices_db(server_db, same_b)
+must("an unchanged database exports to identical bytes",
+     W._sha256(same_a) == W._sha256(same_b))
+must("and it still decompresses to a SQLite database",
+     gzip.decompress(open(same_a, "rb").read())[:16] == b"SQLite format 3\x00")
+
 # ---- 3. the committed seed -------------------------------------------
 seed = os.path.join(tmp, "seed.sqlite3.gz")
 W.export_prices_db(server_db, seed, W.SEED_TABLES)
@@ -286,6 +300,98 @@ with contextlib.redirect_stderr(log):
 must("unchanged files are not re-downloaded", "unchanged" in log.getvalue())
 must("unchanged files are not rewritten",
      os.path.getmtime(local_db) == before)
+
+# ---- 5a. a re-published database with the same prices ----------------
+# The second scan each hour sees the same Blizzard data and rewrites the
+# day's rows with it: new database bytes, same prices. That was 40% of all
+# database downloads, 8 MB each, for nothing.
+site_db = os.path.join(site, W.PRICES_NAME)
+site_manifest = os.path.join(site, W.MANIFEST_NAME)
+orig_db_bytes = open(site_db, "rb").read()
+orig_manifest = open(site_manifest, encoding="utf-8").read()
+
+
+def _republish(data_time=None, price_file=None):
+    """Re-export the server database with one harmless extra row, and point
+    the manifest at it - optionally with a new data_time or price-file hash."""
+    alt = os.path.join(tmp, "republished.sqlite3")
+    shutil.copyfile(server_db, alt)
+    c = sqlite3.connect(alt)
+    c.execute("INSERT OR REPLACE INTO meta(key, value) "
+              "VALUES ('republished_at', ?)", (str(time.time()),))
+    c.commit()
+    c.close()
+    W.export_prices_db(alt, site_db)
+    m = json.loads(orig_manifest)
+    m["files"][W.PRICES_NAME] = {"size": os.path.getsize(site_db),
+                                 "sha256": W._sha256(site_db)}
+    if data_time is not None:
+        m["data_time"] = data_time
+    if price_file is not None:
+        m["files"]["PriceData.lua"]["sha256"] = price_file
+    with open(site_manifest, "w", encoding="utf-8") as fh:
+        json.dump(m, fh)
+    return m
+
+
+def _pull_log():
+    out = io.StringIO()
+    with contextlib.redirect_stderr(out):
+        with contextlib.redirect_stdout(quiet):
+            rc = W.cmd_pull(url, local_cfg, local_db, local_dash)
+    return rc, out.getvalue()
+
+
+republished = _republish()
+must("the re-published database really has a new hash",
+     republished["files"][W.PRICES_NAME]["sha256"]
+     != json.loads(orig_manifest)["files"][W.PRICES_NAME]["sha256"])
+before = os.path.getmtime(local_db)
+rc, text = _pull_log()
+must("a pull with the same prices succeeds", rc == 0)
+must("the same prices re-published are not downloaded again",
+     os.path.getmtime(local_db) == before)
+must("and the log says why", "re-published with the same prices" in text)
+
+# New Blizzard data: the database has to come down.
+_republish(data_time=json.loads(orig_manifest)["data_time"] + 3600)
+rc, text = _pull_log()
+must("a new data time fetches the database",
+     os.path.getmtime(local_db) != before
+     and "downloading " + W.PRICES_NAME in text)
+
+# Realm auctions refresh on their own clock: new prices in PriceData.lua
+# under an unchanged data_time are still new prices.
+before = os.path.getmtime(local_db)
+_republish(data_time=json.loads(orig_manifest)["data_time"] + 3600,
+           price_file="0" * 64)
+rc, text = _pull_log()
+must("a new price file fetches the database even at the same data time",
+     "downloading " + W.PRICES_NAME in text)
+
+# A database deleted by hand comes back, same prices or not.
+_republish(data_time=json.loads(orig_manifest)["data_time"] + 3600,
+           price_file="0" * 64)
+os.remove(local_db)
+rc, text = _pull_log()
+must("a missing database is fetched even with the same prices",
+     os.path.exists(local_db) and "downloading " + W.PRICES_NAME in text)
+
+# --force still means everything.
+_republish(data_time=json.loads(orig_manifest)["data_time"] + 3600,
+           price_file="0" * 64)
+out = io.StringIO()
+with contextlib.redirect_stderr(out):
+    with contextlib.redirect_stdout(quiet):
+        W.cmd_pull(url, local_cfg, local_db, local_dash, force=True)
+must("--force fetches the database even with the same prices",
+     "downloading " + W.PRICES_NAME in out.getvalue())
+
+# Put the site back as the scan published it, for everything below.
+open(site_db, "wb").write(orig_db_bytes)
+open(site_manifest, "w", encoding="utf-8").write(orig_manifest)
+with contextlib.redirect_stdout(quiet):
+    W.cmd_pull(url, local_cfg, local_db, local_dash, force=True)
 
 # ---- 6. inventory survives ------------------------------------------
 # The one thing on this machine that exists nowhere else.
