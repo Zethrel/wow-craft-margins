@@ -4575,6 +4575,9 @@ def cmd_demo(out_path: str, batch: int, top: int) -> None:
 MANIFEST_NAME = "manifest.json"
 PRICES_NAME = "prices.sqlite3.gz"
 PULL_STATE = ".pull-state.json"
+# Recorded in PULL_STATE when the database is installed: which prices it came
+# with. No leading underscore, so `pull --force` clears it like the file hashes.
+PRICES_BASIS = "prices_basis"
 SEED_PATH = os.path.join("seed", "recipes.sqlite3.gz")
 
 # Tables a consumer has no use for. inventory is per-character and came off
@@ -4652,7 +4655,14 @@ def export_prices_db(src: str, dest: str,
             db.execute("VACUUM")
         finally:
             db.close()
-        with open(tmp, "rb") as fh, gzip.open(dest, "wb", 9) as out:
+        # Byte-identical output for an identical database. gzip.open stamps
+        # the current time into the header, so every publish used to get a
+        # new sha256 whether or not a single row had changed - and `pull`,
+        # which matches on that hash, fetched all 8 MB again each time. No
+        # stored name either, so the bytes depend on the contents alone.
+        with open(tmp, "rb") as fh, open(dest, "wb") as raw, \
+                gzip.GzipFile(filename="", mode="wb", compresslevel=9,
+                              fileobj=raw, mtime=0) as out:
             shutil.copyfileobj(fh, out)
     finally:
         if os.path.exists(tmp):
@@ -5501,6 +5511,14 @@ def cmd_pull(url: str, cfg: dict, db_path: str, out_path: str,
     Runs with no credentials and no Blizzard access at all - the scan already
     happened somewhere else. Files are matched by hash against the last pull,
     so the usual case costs one 400-byte manifest and nothing else.
+
+    The database is the exception to matching on its hash alone. Every scan
+    re-publishes it, including the second one each hour, which sees the same
+    Blizzard data again and rewrites the day's rows with it. Measured over 200
+    pulls, 40% of its 8 MB downloads came with no new prices at all. So it is
+    skipped while both the data time and the published PriceData.lua are what
+    the local copy was installed with. Anything else about it that changes
+    (item names, recipes) arrives with the next price update, within the hour.
     """
     base = url.rstrip("/") + "/"
     log(f"pulling from {base}")
@@ -5567,6 +5585,13 @@ def cmd_pull(url: str, cfg: dict, db_path: str, out_path: str,
         PRICES_NAME: db_path,
     }
 
+    # What prices this manifest carries. Both halves, because realm auctions
+    # refresh on their own clock: a new PriceData.lua under an unchanged
+    # data_time is still new prices, and the database has to follow it.
+    price_file = manifest.get("files", {}).get("PriceData.lua") or {}
+    basis = {"data_time": int(manifest.get("data_time") or 0),
+             "price_file": price_file.get("sha256", "")}
+
     changed = 0
     failed = 0
     for name, dest in targets.items():
@@ -5580,6 +5605,12 @@ def cmd_pull(url: str, cfg: dict, db_path: str, out_path: str,
         # deleting the addon file by hand should get it back, not skipped.
         if state.get(name) == entry["sha256"] and os.path.exists(dest):
             log(f"  {name} unchanged")
+            continue
+        if (name == PRICES_NAME and os.path.exists(dest)
+                and basis["data_time"] and basis["price_file"]
+                and state.get(PRICES_BASIS) == basis):
+            log(f"  {name} re-published with the same prices - keeping "
+                f"this copy ({entry['size'] // 1024} KB not downloaded)")
             continue
         log(f"  downloading {name} ({entry['size'] // 1024} KB)")
         try:
@@ -5603,6 +5634,8 @@ def cmd_pull(url: str, cfg: dict, db_path: str, out_path: str,
             failed += 1
             continue
         state[name] = entry["sha256"]
+        if name == PRICES_NAME:
+            state[PRICES_BASIS] = basis
         changed += 1
 
     try:
